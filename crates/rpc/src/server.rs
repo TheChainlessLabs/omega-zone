@@ -13,6 +13,7 @@ use axum::{
     response::IntoResponse,
     routing::{get, post},
 };
+use alloy_primitives::{B256, keccak256};
 use std::{
     sync::Arc,
     time::{Instant, SystemTime, UNIX_EPOCH},
@@ -36,6 +37,17 @@ use crate::{
 
 /// Maximum number of requests in a single JSON-RPC batch.
 pub(crate) const MAX_BATCH_SIZE: usize = 100;
+
+/// Compute the EIP-191 personal_sign hash for a given message digest.
+///
+/// `personal_sign` signs `keccak256("\x19Ethereum Signed Message:\n32" || digest)`.
+fn eip191_hash(digest: &B256) -> B256 {
+    let prefix = b"\x19Ethereum Signed Message:\n32";
+    let mut msg = Vec::with_capacity(prefix.len() + 32);
+    msg.extend_from_slice(prefix);
+    msg.extend_from_slice(digest.as_slice());
+    keccak256(&msg)
+}
 
 /// Shared state for the private RPC server.
 #[derive(Clone)]
@@ -232,6 +244,12 @@ pub(crate) async fn authenticate_token(
         TempoSignature::from_bytes(&token.signature).map_err(|_| AuthError::InvalidSignature)?;
     let caller = signature
         .recover_signer(&token.digest)
+        .or_else(|_| {
+            // Fallback: try EIP-191 personal_sign recovery.
+            // personal_sign prepends "\x19Ethereum Signed Message:\n32" before hashing.
+            let eip191_digest = eip191_hash(&token.digest);
+            signature.recover_signer(&eip191_digest)
+        })
         .map_err(|_| AuthError::InvalidSignature)?;
 
     if let TempoSignature::Keychain(keychain_signature) = &signature {

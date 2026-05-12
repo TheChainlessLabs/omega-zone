@@ -10,8 +10,8 @@ use crate::{
     l1_state::{L1StateCache, L1StateProvider, PolicyProvider, TempoStateReader},
     precompiles::{
         AES_GCM_DECRYPT_ADDRESS, AesGcmDecrypt, CHAUM_PEDERSEN_VERIFY_ADDRESS, ChaumPedersenVerify,
-        ZONE_TIP20_FACTORY_ADDRESS, ZONE_TIP403_PROXY_ADDRESS, ZoneTip20Token,
-        ZoneTip403ProxyRegistry, ZoneTokenFactory,
+        DARKPOOL_ADDRESS, DarkpoolOrderbook, ZONE_TIP20_FACTORY_ADDRESS, ZONE_TIP403_PROXY_ADDRESS,
+        ZoneTip20Token, ZoneTip403ProxyRegistry, ZoneTokenFactory,
     },
     tx_context::ZoneTxContext,
 };
@@ -98,6 +98,10 @@ impl ZoneEvmFactory {
                 Some(ZoneTip403ProxyRegistry::create(provider.clone()))
             });
         }
+
+        precompiles.apply_precompile(&DARKPOOL_ADDRESS, |_| {
+            Some(DarkpoolOrderbook::create(&cfg))
+        });
 
         // Override the TIP-20 precompile lookup so that all TIP-20 token
         // calls go through ZoneTip20Token. When a live policy provider is

@@ -747,6 +747,7 @@ deploy-zone name token="":
                       --http.api all \
                       --datadir "$DATADIR" \
                       --log.file.directory "$DATADIR/logs" \
+                      --sequencer \
                       --sequencer-key "$SEQUENCER_KEY"
 
 [group('zone')]

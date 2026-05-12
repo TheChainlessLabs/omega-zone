@@ -122,8 +122,7 @@ macro_rules! define_abi {
                     address to,
                     uint128 netAmount,
                     uint128 fee,
-                    bytes32 memo,
-                    uint64 depositNumber
+                    bytes32 memo
                 );
 
                 #[derive(Debug)]
