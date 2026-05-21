@@ -21,7 +21,7 @@ use revm::precompile::{PrecompileId, PrecompileOutput, PrecompileResult};
 use tempo_chainspec::hardfork::TempoHardfork;
 use tempo_precompiles::{
     DelegateCallNotAllowed, Precompile as TempoPrecompile,
-    storage::{Handler, Mapping, StorageCtx, evm::EvmPrecompileStorageProvider},
+    storage::{ContractStorage, Handler, Mapping, StorageCtx, evm::EvmPrecompileStorageProvider},
     tip20::{ITIP20, TIP20Token},
 };
 use tempo_precompiles_macros::{Storable, contract};
@@ -883,7 +883,14 @@ impl DarkpoolOrderbook {
                 );
 
                 StorageCtx::enter(&mut storage, || {
-                    Self::new().call(input.data, input.caller)
+                    let mut orderbook = Self::new();
+                    if !input.is_static {
+                        let initialized = try_storage!(orderbook.is_initialized());
+                        if !initialized {
+                            try_storage!(orderbook.initialize());
+                        }
+                    }
+                    orderbook.call(input.data, input.caller)
                 })
             },
         )
