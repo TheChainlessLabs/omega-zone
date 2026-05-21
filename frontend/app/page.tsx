@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useAccount } from "wagmi";
 import { WalletConnect } from "@/components/wallet-connect";
 import { Faucet } from "@/components/faucet";
@@ -14,9 +15,17 @@ export default function Home() {
     <div className="min-h-screen bg-zinc-50">
       <header className="border-b border-zinc-200 bg-white">
         <div className="max-w-3xl mx-auto px-6 h-16 flex items-center justify-between">
-          <h1 className="text-lg font-semibold text-zinc-900 tracking-tight">
-            Omega Zone
-          </h1>
+          <div className="flex items-center gap-4">
+            <h1 className="text-lg font-semibold text-zinc-900 tracking-tight">
+              Omega Zone
+            </h1>
+            <Link
+              href="/darkpool"
+              className="text-sm font-medium text-zinc-500 transition-colors hover:text-zinc-900"
+            >
+              Darkpool
+            </Link>
+          </div>
           <WalletConnect />
         </div>
       </header>
@@ -34,7 +43,7 @@ export default function Home() {
               <p className="font-medium mb-2">Tempo gas model</p>
               <ul className="list-disc pl-4 space-y-1 text-blue-700">
                 <li>Tempo has <strong>no native gas token</strong> — fees are paid in stablecoins (pathUSD)</li>
-                <li>MetaMask may show "insufficient balance" errors due to native balance checks</li>
+                <li>MetaMask may show &quot;insufficient balance&quot; errors due to native balance checks</li>
                 <li>We recommend <strong>Rabby</strong> or <strong>Rainbow</strong> which handle this correctly</li>
                 <li>The faucet provides both testnet USD and pathUSD for fees</li>
               </ul>

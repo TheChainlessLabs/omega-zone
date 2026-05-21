@@ -99,9 +99,7 @@ impl ZoneEvmFactory {
             });
         }
 
-        precompiles.apply_precompile(&DARKPOOL_ADDRESS, |_| {
-            Some(DarkpoolOrderbook::create(&cfg))
-        });
+        precompiles.apply_precompile(&DARKPOOL_ADDRESS, |_| Some(DarkpoolOrderbook::create(&cfg)));
 
         // Override the TIP-20 precompile lookup so that all TIP-20 token
         // calls go through ZoneTip20Token. When a live policy provider is

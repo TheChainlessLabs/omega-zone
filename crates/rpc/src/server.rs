@@ -5,6 +5,7 @@
 //!
 //! Supports both HTTP POST and WebSocket transports.
 
+use alloy_primitives::{B256, keccak256};
 use axum::{
     Router,
     body::Bytes,
@@ -13,7 +14,6 @@ use axum::{
     response::IntoResponse,
     routing::{get, post},
 };
-use alloy_primitives::{B256, keccak256};
 use std::{
     sync::Arc,
     time::{Instant, SystemTime, UNIX_EPOCH},

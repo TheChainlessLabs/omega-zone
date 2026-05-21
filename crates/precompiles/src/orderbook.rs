@@ -28,14 +28,25 @@ use tempo_precompiles_macros::{Storable, contract};
 
 /// Address for the darkpool orderbook precompile.
 pub const DARKPOOL_ADDRESS: Address = Address::new([
-    0x0B, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+    0x0B, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x01,
 ]);
 
 /// Minimum order quantity to prevent dust spam.
 pub const MIN_ORDER_AMOUNT: u128 = 100;
 
 alloy_sol_types::sol! {
+    #[derive(Debug)]
+    event OrderSubmitted(
+        uint128 indexed orderId,
+        address indexed maker,
+        address base,
+        address quote,
+        uint128 amount,
+        uint128 price,
+        bool isBid
+    );
+
     #[derive(Debug)]
     event OrderPlaced(
         uint128 indexed orderId,
@@ -52,6 +63,16 @@ alloy_sol_types::sol! {
         uint128 indexed orderId,
         address indexed maker,
         address indexed taker,
+        uint128 amountFilled,
+        uint128 price
+    );
+
+    #[derive(Debug)]
+    event OrderMatched(
+        uint128 indexed makerOrderId,
+        uint128 indexed takerOrderId,
+        address indexed maker,
+        address taker,
         uint128 amountFilled,
         uint128 price
     );
@@ -80,6 +101,7 @@ alloy_sol_types::sol! {
     function deposit(address token, uint128 amount) external;
     function withdraw(address token, uint128 amount) external;
     function balanceOf(address user, address token) external view returns (uint128);
+    function availableBalanceOf(address user, address token) external view returns (uint128);
     function pairKey(address base, address quote) external pure returns (bytes32);
     function createPair(address base) external returns (bytes32);
     function bestBid(address base) external view returns (uint128 price, uint128 quantity);
@@ -136,9 +158,7 @@ macro_rules! try_storage {
 /// Return a Solidity revert with the given custom error.
 macro_rules! revert {
     ($err:expr) => {
-        return Ok($crate::storage::StorageCtx.revert_output(
-            SolError::abi_encode(&$err).into(),
-        ))
+        return Ok($crate::storage::StorageCtx.revert_output(SolError::abi_encode(&$err).into()))
     };
 }
 
@@ -171,6 +191,77 @@ impl DarkpoolOrderbook {
 
     pub fn balance_of(&self, user: Address, token: Address) -> tempo_precompiles::Result<u128> {
         self.balances[user][token].read()
+    }
+
+    pub fn available_balance_of(
+        &self,
+        user: Address,
+        token: Address,
+    ) -> tempo_precompiles::Result<u128> {
+        let balance = self.balance_of(user, token)?;
+        let reserved = self.reserved_balance_of(user, token)?;
+        Ok(balance.saturating_sub(reserved))
+    }
+
+    fn reserved_balance_of(
+        &self,
+        user: Address,
+        token: Address,
+    ) -> tempo_precompiles::Result<u128> {
+        let mut reserved = 0u128;
+        let len = self.book_keys.len()?;
+
+        for i in 0..len {
+            let book_key = self.book_keys[i].read()?;
+            let book = self.books[book_key].read()?;
+            reserved = self.accumulate_reserved_side(
+                book.best_bid_id,
+                user,
+                token,
+                true,
+                book.quote,
+                reserved,
+            )?;
+            reserved = self.accumulate_reserved_side(
+                book.best_ask_id,
+                user,
+                token,
+                false,
+                book.base,
+                reserved,
+            )?;
+        }
+
+        Ok(reserved)
+    }
+
+    fn accumulate_reserved_side(
+        &self,
+        mut order_id: u128,
+        user: Address,
+        token: Address,
+        is_bid_side: bool,
+        reserved_token: Address,
+        mut reserved: u128,
+    ) -> tempo_precompiles::Result<u128> {
+        if token != reserved_token {
+            return Ok(reserved);
+        }
+
+        while order_id != 0 {
+            let order = self.orders[order_id].read()?;
+            if order.maker == user {
+                let amount = if is_bid_side {
+                    order.quantity.saturating_mul(order.price)
+                } else {
+                    order.quantity
+                };
+                reserved = reserved.saturating_add(amount);
+            }
+            order_id = order.next;
+        }
+
+        Ok(reserved)
     }
 
     fn set_balance(
@@ -243,25 +334,24 @@ impl DarkpoolOrderbook {
 
     pub fn deposit(&mut self, sender: Address, token: Address, amount: u128) -> PrecompileResult {
         let mut tip20 = try_storage!(TIP20Token::from_address(token));
-        try_storage!(tip20.system_transfer_from(
-            sender,
-            self.address,
-            U256::from(amount),
-        ));
+        try_storage!(tip20.system_transfer_from(sender, self.address, U256::from(amount),));
         try_storage!(self.increment_balance(sender, token, amount));
         Ok(StorageCtx.success_output(Bytes::new()))
     }
 
     pub fn withdraw(&mut self, sender: Address, token: Address, amount: u128) -> PrecompileResult {
-        let bal = try_storage!(self.balance_of(sender, token));
-        if bal < amount {
+        let available = try_storage!(self.available_balance_of(sender, token));
+        if available < amount {
             revert!(InsufficientBalance {});
         }
         try_storage!(self.decrement_balance(sender, token, amount));
         let mut tip20 = try_storage!(TIP20Token::from_address(token));
         try_storage!(tip20.transfer(
             self.address,
-            ITIP20::transferCall { to: sender, amount: U256::from(amount) },
+            ITIP20::transferCall {
+                to: sender,
+                amount: U256::from(amount)
+            },
         ));
         Ok(StorageCtx.success_output(Bytes::new()))
     }
@@ -302,24 +392,46 @@ impl DarkpoolOrderbook {
             try_storage!(self.increment_balance(sender, quote, escrow));
         } else {
             // Pull base tokens directly from user to ob.
-            try_storage!(tip20.system_transfer_from(
-                sender,
-                self.address,
-                U256::from(amount),
-            ));
+            try_storage!(tip20.system_transfer_from(sender, self.address, U256::from(amount),));
             try_storage!(self.increment_balance(sender, base, amount));
         }
 
+        let order_id = try_storage!(self.next_order_id_val());
+        try_storage!(self.increment_next_order_id());
+        try_storage!(self.emit_event(OrderSubmitted {
+            orderId: order_id,
+            maker: sender,
+            base,
+            quote,
+            amount,
+            price,
+            isBid: is_bid,
+        }));
+
         let mut remaining = amount;
         if is_bid {
-            try_storage!(self.cross_asks(book_key, sender, price, &mut remaining, base, quote));
+            try_storage!(self.cross_asks(
+                book_key,
+                order_id,
+                sender,
+                price,
+                &mut remaining,
+                base,
+                quote,
+            ));
         } else {
-            try_storage!(self.cross_bids(book_key, sender, price, &mut remaining, base, quote));
+            try_storage!(self.cross_bids(
+                book_key,
+                order_id,
+                sender,
+                price,
+                &mut remaining,
+                base,
+                quote,
+            ));
         }
 
         if remaining > 0 {
-            let order_id = try_storage!(self.next_order_id_val());
-            try_storage!(self.increment_next_order_id());
             let order = Order {
                 order_id,
                 maker: sender,
@@ -342,7 +454,7 @@ impl DarkpoolOrderbook {
             }));
             Ok(StorageCtx.success_output(U256::from(order_id).abi_encode().into()))
         } else {
-            Ok(StorageCtx.success_output(U256::ZERO.abi_encode().into()))
+            Ok(StorageCtx.success_output(U256::from(order_id).abi_encode().into()))
         }
     }
 
@@ -351,6 +463,7 @@ impl DarkpoolOrderbook {
     fn cross_asks(
         &mut self,
         book_key: B256,
+        taker_order_id: u128,
         taker: Address,
         bid_price: u128,
         remaining: &mut u128,
@@ -369,10 +482,6 @@ impl DarkpoolOrderbook {
             if ask.price > bid_price {
                 break;
             }
-            if ask.maker == taker {
-                break;
-            }
-
             let fill = (*remaining).min(ask.quantity);
             let quote_amount = U256::from(fill)
                 .checked_mul(U256::from(ask.price))
@@ -395,13 +504,23 @@ impl DarkpoolOrderbook {
                 amountFilled: fill,
                 price: ask.price,
             })?;
+            self.emit_event(OrderMatched {
+                makerOrderId: ask.order_id,
+                takerOrderId: taker_order_id,
+                maker: ask.maker,
+                taker,
+                amountFilled: fill,
+                price: ask.price,
+            })?;
 
             *remaining -= fill;
 
             if fill == ask.quantity {
                 self.remove_order(book_key, &ask)?;
             } else {
-                self.orders[book.best_ask_id].quantity.write(ask.quantity - fill)?;
+                self.orders[book.best_ask_id]
+                    .quantity
+                    .write(ask.quantity - fill)?;
             }
         }
         Ok(())
@@ -410,6 +529,7 @@ impl DarkpoolOrderbook {
     fn cross_bids(
         &mut self,
         book_key: B256,
+        taker_order_id: u128,
         taker: Address,
         ask_price: u128,
         remaining: &mut u128,
@@ -428,10 +548,6 @@ impl DarkpoolOrderbook {
             if bid.price < ask_price {
                 break;
             }
-            if bid.maker == taker {
-                break;
-            }
-
             let fill = (*remaining).min(bid.quantity);
             let quote_amount = U256::from(fill)
                 .checked_mul(U256::from(bid.price))
@@ -454,13 +570,23 @@ impl DarkpoolOrderbook {
                 amountFilled: fill,
                 price: bid.price,
             })?;
+            self.emit_event(OrderMatched {
+                makerOrderId: bid.order_id,
+                takerOrderId: taker_order_id,
+                maker: bid.maker,
+                taker,
+                amountFilled: fill,
+                price: bid.price,
+            })?;
 
             *remaining -= fill;
 
             if fill == bid.quantity {
                 self.remove_order(book_key, &bid)?;
             } else {
-                self.orders[book.best_bid_id].quantity.write(bid.quantity - fill)?;
+                self.orders[book.best_bid_id]
+                    .quantity
+                    .write(bid.quantity - fill)?;
             }
         }
         Ok(())
@@ -468,13 +594,13 @@ impl DarkpoolOrderbook {
 
     // ── linked-list ───────────────────────────────────────────────────────
 
-    fn insert_order(
-        &mut self,
-        book_key: B256,
-        mut order: Order,
-    ) -> tempo_precompiles::Result<()> {
+    fn insert_order(&mut self, book_key: B256, mut order: Order) -> tempo_precompiles::Result<()> {
         let book = self.books[book_key].read()?;
-        let head_id = if order.is_bid { book.best_bid_id } else { book.best_ask_id };
+        let head_id = if order.is_bid {
+            book.best_bid_id
+        } else {
+            book.best_ask_id
+        };
 
         if head_id == 0 {
             self.orders[order.order_id].write(order)?;
@@ -579,19 +705,7 @@ impl DarkpoolOrderbook {
             revert!(Unauthorized {});
         }
 
-        let book = try_storage!(self.books[order.book_key].read());
-        let refund_token = if order.is_bid { book.quote } else { book.base };
-        let refund_amount = if order.is_bid {
-            U256::from(order.quantity)
-                .checked_mul(U256::from(order.price))
-                .and_then(|v| v.try_into().ok())
-                .unwrap_or(0u128)
-        } else {
-            order.quantity
-        };
-
         try_storage!(self.remove_order(order.book_key, &order));
-        try_storage!(self.increment_balance(sender, refund_token, refund_amount));
 
         try_storage!(self.emit_event(OrderCancelled {
             orderId: order_id,
@@ -659,15 +773,10 @@ impl DarkpoolOrderbook {
         let quote = try_storage!(tip20.quote_token());
         let _book_key = try_storage!(self.validate_or_create_pair(base));
 
-        try_storage!(tip20.system_transfer_from(
-            sender,
-            self.address,
-            U256::from(amount),
-        ));
+        try_storage!(tip20.system_transfer_from(sender, self.address, U256::from(amount),));
         try_storage!(self.increment_balance(sender, base, amount));
 
-        let (filled, received) =
-            try_storage!(self.fill_bids_market(sender, base, quote, amount));
+        let (filled, received) = try_storage!(self.fill_bids_market(sender, base, quote, amount));
 
         if filled < amount {
             revert!(InsufficientLiquidity {});
@@ -735,7 +844,9 @@ impl DarkpoolOrderbook {
             if fill == ask.quantity {
                 self.remove_order(book_key, &ask)?;
             } else {
-                self.orders[book.best_ask_id].quantity.write(ask.quantity - fill)?;
+                self.orders[book.best_ask_id]
+                    .quantity
+                    .write(ask.quantity - fill)?;
             }
         }
 
@@ -793,7 +904,9 @@ impl DarkpoolOrderbook {
             if fill == bid.quantity {
                 self.remove_order(book_key, &bid)?;
             } else {
-                self.orders[book.best_bid_id].quantity.write(bid.quantity - fill)?;
+                self.orders[book.best_bid_id]
+                    .quantity
+                    .write(bid.quantity - fill)?;
             }
         }
 
@@ -829,13 +942,13 @@ impl DarkpoolOrderbook {
         let book_key = compute_book_key(base, quote);
         let book = try_storage!(self.books[book_key].read());
         if book.best_bid_id == 0 {
-            return Ok(StorageCtx.success_output(
-                (U256::ZERO, U256::ZERO).abi_encode().into(),
-            ));
+            return Ok(StorageCtx.success_output((U256::ZERO, U256::ZERO).abi_encode().into()));
         }
         let order = try_storage!(self.orders[book.best_bid_id].read());
         Ok(StorageCtx.success_output(
-            (U256::from(order.price), U256::from(order.quantity)).abi_encode().into(),
+            (U256::from(order.price), U256::from(order.quantity))
+                .abi_encode()
+                .into(),
         ))
     }
 
@@ -845,13 +958,13 @@ impl DarkpoolOrderbook {
         let book_key = compute_book_key(base, quote);
         let book = try_storage!(self.books[book_key].read());
         if book.best_ask_id == 0 {
-            return Ok(StorageCtx.success_output(
-                (U256::ZERO, U256::ZERO).abi_encode().into(),
-            ));
+            return Ok(StorageCtx.success_output((U256::ZERO, U256::ZERO).abi_encode().into()));
         }
         let order = try_storage!(self.orders[book.best_ask_id].read());
         Ok(StorageCtx.success_output(
-            (U256::from(order.price), U256::from(order.quantity)).abi_encode().into(),
+            (U256::from(order.price), U256::from(order.quantity))
+                .abi_encode()
+                .into(),
         ))
     }
 
@@ -882,9 +995,7 @@ impl DarkpoolOrderbook {
                     gas_params.clone(),
                 );
 
-                StorageCtx::enter(&mut storage, || {
-                    Self::new().call(input.data, input.caller)
-                })
+                StorageCtx::enter(&mut storage, || Self::new().call(input.data, input.caller))
             },
         )
     }
@@ -937,6 +1048,16 @@ impl TempoPrecompile for DarkpoolOrderbook {
                 let bal = try_storage!(self.balance_of(call.user, call.token));
                 Ok(StorageCtx.success_output(U256::from(bal).abi_encode().into()))
             }
+            s if s == availableBalanceOfCall::SELECTOR => {
+                let Ok(call) = availableBalanceOfCall::abi_decode(calldata) else {
+                    return Ok(StorageCtx.revert_output(Bytes::new()));
+                };
+                if call.user != msg_sender {
+                    revert!(Unauthorized {});
+                }
+                let bal = try_storage!(self.available_balance_of(call.user, call.token));
+                Ok(StorageCtx.success_output(U256::from(bal).abi_encode().into()))
+            }
             s if s == pairKeyCall::SELECTOR => {
                 let Ok(call) = pairKeyCall::abi_decode(calldata) else {
                     return Ok(StorageCtx.revert_output(Bytes::new()));
@@ -963,9 +1084,7 @@ impl TempoPrecompile for DarkpoolOrderbook {
                 self.best_ask(call.base)
             }
             s if s == MIN_ORDER_AMOUNTCall::SELECTOR => {
-                Ok(StorageCtx.success_output(
-                    U256::from(MIN_ORDER_AMOUNT).abi_encode().into(),
-                ))
+                Ok(StorageCtx.success_output(U256::from(MIN_ORDER_AMOUNT).abi_encode().into()))
             }
             s if s == marketBuyCall::SELECTOR => {
                 let Ok(call) = marketBuyCall::abi_decode(calldata) else {
@@ -996,6 +1115,6 @@ pub fn compute_book_key(base: Address, quote: Address) -> B256 {
 
 #[cfg(test)]
 pub(crate) const _DARKPOOL_ADDRESS_BYTES: [u8; 20] = [
-    0x0B, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+    0x0B, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x01,
 ];

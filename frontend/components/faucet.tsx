@@ -23,9 +23,6 @@ export function Faucet() {
     setResult(null);
 
     try {
-      const provider = (window as { ethereum?: unknown }).ethereum;
-      if (!provider) throw new Error("No wallet provider found");
-
       const rpcUrl =
         process.env.NEXT_PUBLIC_TEMPO_RPC || "https://rpc.moderato.tempo.xyz";
 

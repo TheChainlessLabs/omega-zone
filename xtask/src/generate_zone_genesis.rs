@@ -39,7 +39,7 @@ use tempo_precompiles::{
     tip403_registry::TIP403Registry,
 };
 use tempo_revm::{TempoBlockEnv, TempoTxEnv};
-use zone::precompiles::ZoneTokenFactory;
+use zone::precompiles::{DarkpoolOrderbook, ZoneTokenFactory};
 
 const TEMPO_STATE_ADDRESS: Address = address!("0x1c00000000000000000000000000000000000000");
 const ZONE_INBOX_ADDRESS: Address = address!("0x1c00000000000000000000000000000000000001");
@@ -132,6 +132,7 @@ impl GenerateZoneGenesis {
         initialize_stablecoin_dex(&mut evm)?;
         initialize_nonce_manager(&mut evm)?;
         initialize_account_keychain(&mut evm)?;
+        initialize_darkpool_orderbook(&mut evm)?;
 
         let tempo_state_bytecode = load_artifact(&self.specs_out, "TempoState")?;
         let tempo_state_args = (Bytes::from(header_rlp),).abi_encode_params();
@@ -603,5 +604,19 @@ fn initialize_account_keychain(evm: &mut TempoEvm<CacheDB<EmptyDB>>) -> eyre::Re
         || AccountKeychain::new().initialize(),
     )?;
     println!("Initialized AccountKeychain");
+    Ok(())
+}
+
+/// Initialize the DarkpoolOrderbook precompile so its account exists and can retain storage.
+fn initialize_darkpool_orderbook(evm: &mut TempoEvm<CacheDB<EmptyDB>>) -> eyre::Result<()> {
+    let ctx = evm.ctx_mut();
+    StorageCtx::enter_evm(
+        &mut ctx.journaled_state,
+        &ctx.block,
+        &ctx.cfg,
+        &ctx.tx,
+        || DarkpoolOrderbook::new().initialize(),
+    )?;
+    println!("Initialized DarkpoolOrderbook");
     Ok(())
 }

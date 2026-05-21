@@ -1,4 +1,5 @@
 import { http, createConfig, cookieStorage, createStorage } from "wagmi";
+import { tempoWallet } from "wagmi/connectors";
 import { defineChain } from "viem";
 import { tempoModerato } from "viem/chains";
 
@@ -18,6 +19,12 @@ export const tempoChain = tempoModerato;
 
 export const config = createConfig({
   chains: [tempoModerato, zoneChain],
+  connectors: [
+    tempoWallet({
+      name: "Tempo Wallet",
+    }),
+  ],
+  multiInjectedProviderDiscovery: false,
   transports: {
     [tempoModerato.id]: http(TEMPO_RPC),
     [zoneChain.id]: http(ZONE_RPC),

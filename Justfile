@@ -149,6 +149,19 @@ create-zone name token="":
         --initial-token "$ZONE_TOKEN_L1" \
         --sequencer "$SEQUENCER_ADDR" \
         --private-key "$PK"
+    GENESIS_JSON="$OUTPUT/genesis.json"
+    TMP_GENESIS="$(mktemp)"
+    jq '.config += {
+        t0Time: 0,
+        t1Time: 0,
+        t1aTime: 0,
+        t1bTime: 0,
+        t1cTime: 0,
+        t2Time: 0,
+        t3Time: 0,
+        t4Time: 0
+    }' "$GENESIS_JSON" > "$TMP_GENESIS"
+    mv "$TMP_GENESIS" "$GENESIS_JSON"
     echo "Zone '{{name}}' created. Artifacts in $OUTPUT/"
 
 [group('zone')]
@@ -239,6 +252,7 @@ zone-up name reset="false" profile="dev" args="":
                       --http \
                       --http.addr 0.0.0.0 \
                       --http.port {{zone_http_port}} \
+                      --http.corsdomain "*" \
                       --http.api all \
                       --datadir "$DATADIR" \
                       --log.file.directory "$DATADIR/logs" \
@@ -688,6 +702,19 @@ deploy-zone name token="":
         --initial-token "$ZONE_TOKEN_L1" \
         --sequencer "$SEQUENCER_ADDR" \
         --private-key "$SEQUENCER_KEY"
+    GENESIS_JSON="$OUTPUT/genesis.json"
+    TMP_GENESIS="$(mktemp)"
+    jq '.config += {
+        t0Time: 0,
+        t1Time: 0,
+        t1aTime: 0,
+        t1bTime: 0,
+        t1cTime: 0,
+        t2Time: 0,
+        t3Time: 0,
+        t4Time: 0
+    }' "$GENESIS_JSON" > "$TMP_GENESIS"
+    mv "$TMP_GENESIS" "$GENESIS_JSON"
     echo ""
 
     # Save sequencer key into zone.json for later use
@@ -744,6 +771,7 @@ deploy-zone name token="":
                       --http \
                       --http.addr 0.0.0.0 \
                       --http.port {{zone_http_port}} \
+                      --http.corsdomain "*" \
                       --http.api all \
                       --datadir "$DATADIR" \
                       --log.file.directory "$DATADIR/logs" \
