@@ -566,6 +566,50 @@ impl ZoneRpcApi for ProxyZoneRpc {
         })
     }
 
+    fn zone_get_my_orders(
+        &self,
+        _query: crate::darkpool::HistoryQuery,
+        _auth: AuthContext,
+    ) -> BoxFut<'_> {
+        Box::pin(async move {
+            Err(JsonRpcError::internal(
+                "zone-specific methods are not supported by the proxy backend",
+            ))
+        })
+    }
+
+    fn zone_get_my_fills(
+        &self,
+        _query: crate::darkpool::HistoryQuery,
+        _auth: AuthContext,
+    ) -> BoxFut<'_> {
+        Box::pin(async move {
+            Err(JsonRpcError::internal(
+                "zone-specific methods are not supported by the proxy backend",
+            ))
+        })
+    }
+
+    fn zone_get_my_transfers(
+        &self,
+        _query: crate::darkpool::TransferQuery,
+        _auth: AuthContext,
+    ) -> BoxFut<'_> {
+        Box::pin(async move {
+            Err(JsonRpcError::internal(
+                "zone-specific methods are not supported by the proxy backend",
+            ))
+        })
+    }
+
+    fn zone_get_order(&self, _order_id: u128, _auth: AuthContext) -> BoxFut<'_> {
+        Box::pin(async move {
+            Err(JsonRpcError::internal(
+                "zone-specific methods are not supported by the proxy backend",
+            ))
+        })
+    }
+
     fn zone_get_withdrawal_status(
         &self,
         _query: crate::types::WithdrawalStatusQuery,

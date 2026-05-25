@@ -14,6 +14,7 @@ use tracing::warn;
 
 use crate::{
     auth::AuthContext,
+    darkpool::{HistoryQuery, TransferQuery},
     subscription::BoxWsSubscriptionFut,
     types::{
         BoxEyreFut, BoxFut, JsonRpcError, JsonRpcRequest, JsonRpcResponse, MarketPair, MethodTier,
@@ -231,6 +232,21 @@ pub trait ZoneRpcApi: Send + Sync + 'static {
         auth: AuthContext,
     ) -> BoxFut<'_>;
 
+    /// `zone_getMyOrders(query)` — returns the authenticated caller's
+    /// darkpool order history.
+    fn zone_get_my_orders(&self, query: HistoryQuery, auth: AuthContext) -> BoxFut<'_>;
+
+    /// `zone_getMyFills(query)` — returns the authenticated caller's darkpool
+    /// fill history.
+    fn zone_get_my_fills(&self, query: HistoryQuery, auth: AuthContext) -> BoxFut<'_>;
+
+    /// `zone_getMyTransfers(query)` — returns the authenticated caller's
+    /// TIP-20 transfer history.
+    fn zone_get_my_transfers(&self, query: TransferQuery, auth: AuthContext) -> BoxFut<'_>;
+
+    /// `zone_getOrder(orderId)` — returns a single owner-scoped darkpool order.
+    fn zone_get_order(&self, order_id: u128, auth: AuthContext) -> BoxFut<'_>;
+
     /// `zone_getWithdrawalStatus(txHashOrWithdrawalIndex)` — returns lifecycle
     /// status of the caller's own withdrawal, joining zone L2 outbox events with
     /// L1 portal settlement events. Returns `null` if the withdrawal does not
@@ -409,6 +425,10 @@ pub async fn dispatch(
         ),
         "zone_getTopOfBook" => handle_zone_get_top_of_book(id, raw, auth, api).await,
         "zone_getMidpointHistory" => handle_zone_get_midpoint_history(id, raw, auth, api).await,
+        "zone_getMyOrders" => handle_zone_get_my_orders(id, raw, auth, api).await,
+        "zone_getMyFills" => handle_zone_get_my_fills(id, raw, auth, api).await,
+        "zone_getMyTransfers" => handle_zone_get_my_transfers(id, raw, auth, api).await,
+        "zone_getOrder" => handle_zone_get_order(id, raw, auth, api).await,
         "zone_getWithdrawalStatus" => handle_zone_get_withdrawal_status(id, raw, auth, api).await,
         _ => {
             // Method is whitelisted but not yet implemented via direct API
@@ -939,6 +959,121 @@ async fn handle_zone_get_midpoint_history(
     )
 }
 
+/// Handle `zone_getMyOrders(query)`.
+async fn handle_zone_get_my_orders(
+    id: Value,
+    raw: &str,
+    auth: &AuthContext,
+    api: &dyn ZoneRpcApi,
+) -> JsonRpcResponse {
+    let query = match parse_history_query(raw, &id) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    api_result(
+        id,
+        "zone_getMyOrders",
+        api.zone_get_my_orders(query, auth.clone()).await,
+    )
+}
+
+/// Handle `zone_getMyFills(query)`.
+async fn handle_zone_get_my_fills(
+    id: Value,
+    raw: &str,
+    auth: &AuthContext,
+    api: &dyn ZoneRpcApi,
+) -> JsonRpcResponse {
+    let query = match parse_history_query(raw, &id) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    api_result(
+        id,
+        "zone_getMyFills",
+        api.zone_get_my_fills(query, auth.clone()).await,
+    )
+}
+
+/// Handle `zone_getMyTransfers(query)`.
+async fn handle_zone_get_my_transfers(
+    id: Value,
+    raw: &str,
+    auth: &AuthContext,
+    api: &dyn ZoneRpcApi,
+) -> JsonRpcResponse {
+    let query = match parse_transfer_query(raw, &id) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    api_result(
+        id,
+        "zone_getMyTransfers",
+        api.zone_get_my_transfers(query, auth.clone()).await,
+    )
+}
+
+/// Handle `zone_getOrder(orderId)`.
+async fn handle_zone_get_order(
+    id: Value,
+    raw: &str,
+    auth: &AuthContext,
+    api: &dyn ZoneRpcApi,
+) -> JsonRpcResponse {
+    let (order_id_hex,) = match parse_params::<(String,)>(raw, &id, "expected [orderId]") {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let order_id = match alloy_primitives::U128::from_str(&order_id_hex) {
+        Ok(v) => v.to::<u128>(),
+        Err(_) => {
+            return JsonRpcResponse::error(
+                id,
+                JsonRpcError::invalid_params("orderId must be a hex quantity"),
+            );
+        }
+    };
+    api_result(
+        id,
+        "zone_getOrder",
+        api.zone_get_order(order_id, auth.clone()).await,
+    )
+}
+
+#[allow(clippy::result_large_err)]
+fn parse_history_query(raw: &str, id: &Value) -> Result<HistoryQuery, JsonRpcResponse> {
+    let parsed: Vec<Option<HistoryQuery>> = serde_json::from_str(raw).map_err(|_| {
+        JsonRpcResponse::error(
+            id.clone(),
+            JsonRpcError::invalid_params("expected [query?]"),
+        )
+    })?;
+    if parsed.len() > 1 {
+        return Err(JsonRpcResponse::error(
+            id.clone(),
+            JsonRpcError::invalid_params("expected [query?]"),
+        ));
+    }
+    Ok(parsed.into_iter().next().flatten().unwrap_or_default())
+}
+
+#[allow(clippy::result_large_err)]
+fn parse_transfer_query(raw: &str, id: &Value) -> Result<TransferQuery, JsonRpcResponse> {
+    let parsed: Vec<Option<TransferQuery>> = serde_json::from_str(raw).map_err(|_| {
+        JsonRpcResponse::error(
+            id.clone(),
+            JsonRpcError::invalid_params("expected [query?]"),
+        )
+    })?;
+    if parsed.len() > 1 {
+        return Err(JsonRpcResponse::error(
+            id.clone(),
+            JsonRpcError::invalid_params("expected [query?]"),
+        ));
+    }
+    Ok(parsed.into_iter().next().flatten().unwrap_or_default())
+}
+
 /// Handle `zone_getDepositStatus(tempoBlockNumber)`.
 async fn handle_zone_get_deposit_status(
     id: Value,
@@ -1191,6 +1326,52 @@ mod tests {
             })
         }
 
+        fn zone_get_my_orders(
+            &self,
+            query: crate::darkpool::HistoryQuery,
+            auth: AuthContext,
+        ) -> BoxFut<'_> {
+            Box::pin(async move {
+                crate::darkpool::require_owner(query.account, &auth.caller)?;
+                to_raw(&crate::darkpool::Page::<crate::darkpool::OrderEntry> {
+                    items: vec![],
+                    next_cursor: None,
+                })
+            })
+        }
+
+        fn zone_get_my_fills(
+            &self,
+            query: crate::darkpool::HistoryQuery,
+            auth: AuthContext,
+        ) -> BoxFut<'_> {
+            Box::pin(async move {
+                crate::darkpool::require_owner(query.account, &auth.caller)?;
+                to_raw(&crate::darkpool::Page::<crate::darkpool::FillEntry> {
+                    items: vec![],
+                    next_cursor: None,
+                })
+            })
+        }
+
+        fn zone_get_my_transfers(
+            &self,
+            query: crate::darkpool::TransferQuery,
+            auth: AuthContext,
+        ) -> BoxFut<'_> {
+            Box::pin(async move {
+                crate::darkpool::require_owner(query.account, &auth.caller)?;
+                to_raw(&crate::darkpool::Page::<crate::darkpool::TransferEntry> {
+                    items: vec![],
+                    next_cursor: None,
+                })
+            })
+        }
+
+        fn zone_get_order(&self, _order_id: u128, _auth: AuthContext) -> BoxFut<'_> {
+            Box::pin(async { Ok(crate::types::raw_null()) })
+        }
+
         fn zone_get_withdrawal_status(
             &self,
             query: WithdrawalStatusQuery,
@@ -1375,6 +1556,116 @@ mod tests {
             api.last_midpoint_cursor.lock().unwrap().as_deref(),
             Some("cur-1"),
         );
+    }
+
+    #[tokio::test]
+    async fn zone_get_my_orders_defaults_to_caller() {
+        let api = MockZoneRpcApi::default();
+        let resp = dispatch(&request("zone_getMyOrders", json!([])), &auth(), &api).await;
+
+        assert!(resp.error.is_none(), "no-args call must succeed");
+        let body: serde_json::Value =
+            serde_json::from_str(resp.result.as_ref().unwrap().get()).unwrap();
+        assert!(body["items"].as_array().unwrap().is_empty());
+        assert!(body["nextCursor"].is_null());
+    }
+
+    #[tokio::test]
+    async fn zone_get_my_orders_accepts_matching_account() {
+        let api = MockZoneRpcApi::default();
+        let resp = dispatch(
+            &request(
+                "zone_getMyOrders",
+                json!([{ "account": format!("{:#x}", Address::repeat_byte(0xaa)) }]),
+            ),
+            &auth(),
+            &api,
+        )
+        .await;
+        assert!(resp.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn zone_get_my_orders_rejects_foreign_account() {
+        let api = MockZoneRpcApi::default();
+        let foreign = Address::repeat_byte(0xbb);
+        let resp = dispatch(
+            &request(
+                "zone_getMyOrders",
+                json!([{ "account": format!("{:#x}", foreign) }]),
+            ),
+            &auth(),
+            &api,
+        )
+        .await;
+        assert!(resp.result.is_none(), "foreign-account query must fail");
+        let err = resp.error.expect("should reject foreign account");
+        assert_eq!(err.code, -32004);
+        assert_eq!(err.message, "Account mismatch");
+    }
+
+    #[tokio::test]
+    async fn zone_get_my_fills_rejects_foreign_account() {
+        let api = MockZoneRpcApi::default();
+        let foreign = Address::repeat_byte(0xcc);
+        let resp = dispatch(
+            &request(
+                "zone_getMyFills",
+                json!([{ "account": format!("{:#x}", foreign) }]),
+            ),
+            &auth(),
+            &api,
+        )
+        .await;
+        let err = resp.error.expect("should reject foreign account");
+        assert_eq!(err.code, -32004);
+    }
+
+    #[tokio::test]
+    async fn zone_get_my_transfers_rejects_foreign_account() {
+        let api = MockZoneRpcApi::default();
+        let foreign = Address::repeat_byte(0xdd);
+        let resp = dispatch(
+            &request(
+                "zone_getMyTransfers",
+                json!([{ "account": format!("{:#x}", foreign) }]),
+            ),
+            &auth(),
+            &api,
+        )
+        .await;
+        let err = resp.error.expect("should reject foreign account");
+        assert_eq!(err.code, -32004);
+    }
+
+    #[tokio::test]
+    async fn zone_get_order_accepts_hex_id() {
+        let api = MockZoneRpcApi::default();
+        let resp = dispatch(&request("zone_getOrder", json!(["0x2a"])), &auth(), &api).await;
+        assert!(resp.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn zone_get_order_rejects_numeric_id() {
+        let api = MockZoneRpcApi::default();
+        let resp = dispatch(&request("zone_getOrder", json!([42])), &auth(), &api).await;
+        let err = resp.error.expect("numeric id should be rejected");
+        assert_eq!(err.code, -32602);
+    }
+
+    #[tokio::test]
+    async fn zone_get_order_rejects_missing_param() {
+        let api = MockZoneRpcApi::default();
+        let resp = dispatch(&request("zone_getOrder", json!([])), &auth(), &api).await;
+        let err = resp.error.expect("missing param should be rejected");
+        assert_eq!(err.code, -32602);
+    }
+
+    #[tokio::test]
+    async fn zone_get_my_orders_rejects_garbage_cursor() {
+        let err = crate::darkpool::Cursor::decode("not-a-cursor")
+            .expect_err("garbage cursor should be rejected");
+        assert_eq!(err.code, -32602);
     }
 
     #[tokio::test]

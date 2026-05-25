@@ -312,6 +312,10 @@ impl ZoneRpcApi for MockZoneRpcApi {
         })
     }
 
+    stub!(zone_get_my_orders, _a: zone_rpc::darkpool::HistoryQuery, _b: zone_rpc::auth::AuthContext);
+    stub!(zone_get_my_fills, _a: zone_rpc::darkpool::HistoryQuery, _b: zone_rpc::auth::AuthContext);
+    stub!(zone_get_my_transfers, _a: zone_rpc::darkpool::TransferQuery, _b: zone_rpc::auth::AuthContext);
+    stub!(zone_get_order, _a: u128, _b: zone_rpc::auth::AuthContext);
     stub!(zone_get_withdrawal_status, _a: zone_rpc::types::WithdrawalStatusQuery, _b: zone_rpc::auth::AuthContext);
 }
 

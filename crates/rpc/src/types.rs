@@ -621,7 +621,11 @@ pub fn classify_method(method: &str) -> Option<MethodTier> {
         | "zone_searchBatch"
         | "zone_getMarketConfig"
         | "zone_getTopOfBook"
-        | "zone_getMidpointHistory" => Some(MethodTier::Public),
+        | "zone_getMidpointHistory"
+        | "zone_getMyOrders"
+        | "zone_getMyFills"
+        | "zone_getMyTransfers"
+        | "zone_getOrder" => Some(MethodTier::Public),
 
         // Fetch-then-check: public but redacted based on caller identity
         "eth_getTransactionByHash"
