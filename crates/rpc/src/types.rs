@@ -2,7 +2,7 @@
 
 use std::{future::Future, pin::Pin};
 
-use alloy_primitives::{Address, B256, U64, U256};
+use alloy_primitives::{Address, B256, U64, U128, U256};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, value::RawValue};
 
@@ -257,6 +257,142 @@ pub enum DepositState {
     Failed,
 }
 
+/// Canonical market token metadata returned by `zone_getMarketConfig`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarketToken {
+    /// The token contract address.
+    pub address: Address,
+    /// Canonical display symbol.
+    pub symbol: String,
+    /// TIP-20 decimals.
+    pub decimals: u8,
+}
+
+/// Order action supported by a market.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum MarketAction {
+    /// Taker buy at the best available ask price.
+    MarketBuy,
+    /// Taker sell at the best available bid price.
+    MarketSell,
+    /// Resting buy order at a fixed limit price.
+    LimitBid,
+    /// Resting sell order at a fixed limit price.
+    LimitAsk,
+}
+
+/// Per-pair market entry returned by `zone_getMarketConfig`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarketEntry {
+    /// Display label `"<base>/<quote>"`.
+    pub pair: String,
+    /// Base token metadata.
+    pub base: MarketToken,
+    /// Quote token metadata.
+    pub quote: MarketToken,
+    /// Minimum order quantity in base-token units.
+    pub min_order_amount: U128,
+    /// Human-readable description of the price representation.
+    pub price_unit: String,
+    /// Order actions the darkpool supports for this pair.
+    pub allowed_actions: Vec<MarketAction>,
+}
+
+/// Response payload for `zone_getMarketConfig`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarketConfigResponse {
+    /// The darkpool orderbook contract address.
+    pub darkpool: Address,
+    /// Markets currently exposed to the frontend.
+    pub markets: Vec<MarketEntry>,
+}
+
+/// Pair selector accepted by market RPCs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarketPair {
+    /// Base token address.
+    pub base: Address,
+    /// Quote token address.
+    pub quote: Address,
+}
+
+/// Aggregate price/quantity level at one side of the book.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrderLevel {
+    /// Price in raw integer units.
+    pub price: U128,
+    /// Aggregate resting quantity at this price level.
+    pub quantity: U128,
+}
+
+/// Response payload for `zone_getTopOfBook`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TopOfBookResponse {
+    /// Display label for the pair.
+    pub pair: String,
+    /// Base token address.
+    pub base: Address,
+    /// Quote token address.
+    pub quote: Address,
+    /// Best resting bid, or `null` when the book has no bids.
+    pub bid: Option<OrderLevel>,
+    /// Best resting ask, or `null` when the book has no asks.
+    pub ask: Option<OrderLevel>,
+    /// Arithmetic midpoint when both sides exist.
+    pub midpoint: Option<U128>,
+    /// Spread when both sides exist.
+    pub spread: Option<U128>,
+    /// Zone L2 block number used to read the book.
+    pub as_of_block: U64,
+}
+
+/// History availability tag returned by `zone_getMidpointHistory`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryAvailability {
+    /// Whether the backend currently emits midpoint samples.
+    pub enabled: bool,
+    /// Human-readable rationale when disabled.
+    pub reason: String,
+}
+
+/// Single midpoint sample.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MidpointSample {
+    /// Bucket end timestamp.
+    pub timestamp: U64,
+    /// Midpoint price for the bucket in raw integer units.
+    pub midpoint: U128,
+}
+
+/// Response payload for `zone_getMidpointHistory`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MidpointHistoryResponse {
+    /// Display label for the pair.
+    pub pair: String,
+    /// Base token address.
+    pub base: Address,
+    /// Quote token address.
+    pub quote: Address,
+    /// Bucket interval echoed from the request.
+    pub interval: String,
+    /// Aggregated samples.
+    pub samples: Vec<MidpointSample>,
+    /// Cursor for paginating older samples.
+    pub next_cursor: Option<String>,
+    /// Backend availability flag.
+    pub history: HistoryAvailability,
+}
+
 /// Query parameter for `zone_getWithdrawalStatus`.
 ///
 /// Callers identify a withdrawal either by the zone L2 transaction hash that
@@ -482,7 +618,10 @@ pub fn classify_method(method: &str) -> Option<MethodTier> {
         | "zone_getWithdrawalStatus"
         | "zone_listBatches"
         | "zone_getBatch"
-        | "zone_searchBatch" => Some(MethodTier::Public),
+        | "zone_searchBatch"
+        | "zone_getMarketConfig"
+        | "zone_getTopOfBook"
+        | "zone_getMidpointHistory" => Some(MethodTier::Public),
 
         // Fetch-then-check: public but redacted based on caller identity
         "eth_getTransactionByHash"
@@ -554,4 +693,95 @@ pub fn to_raw<T: serde::Serialize>(value: &T) -> Result<Box<RawValue>, JsonRpcEr
 /// Shorthand for wrapping any `Display` error into a [`JsonRpcError::internal`].
 pub fn internal(e: impl std::fmt::Display) -> JsonRpcError {
     JsonRpcError::internal(e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn alpha_market_entry() -> MarketEntry {
+        MarketEntry {
+            pair: "OALPHA/PATH.USD".to_string(),
+            base: MarketToken {
+                address: "0x20C000000000000000000000518dDADD37eD1d28"
+                    .parse()
+                    .unwrap(),
+                symbol: "OALPHA".to_string(),
+                decimals: 6,
+            },
+            quote: MarketToken {
+                address: "0x20C0000000000000000000000000000000000000"
+                    .parse()
+                    .unwrap(),
+                symbol: "PATH.USD".to_string(),
+                decimals: 6,
+            },
+            min_order_amount: U128::from(100u128),
+            price_unit: "raw integer; quote = baseAmount * price".to_string(),
+            allowed_actions: vec![
+                MarketAction::MarketBuy,
+                MarketAction::MarketSell,
+                MarketAction::LimitBid,
+                MarketAction::LimitAsk,
+            ],
+        }
+    }
+
+    #[test]
+    fn market_config_serializes_canonical_alpha_addresses() {
+        let response = MarketConfigResponse {
+            darkpool: "0x0B00000000000000000000000000000000000001"
+                .parse()
+                .unwrap(),
+            markets: vec![alpha_market_entry()],
+        };
+
+        let value = serde_json::to_value(&response).unwrap();
+        let market = &value["markets"][0];
+        assert_eq!(
+            value["darkpool"],
+            "0x0b00000000000000000000000000000000000001"
+        );
+        assert_eq!(market["pair"], "OALPHA/PATH.USD");
+        assert_eq!(
+            market["base"]["address"],
+            "0x20c000000000000000000000518ddadd37ed1d28"
+        );
+        assert_eq!(
+            market["allowedActions"],
+            json!(["marketBuy", "marketSell", "limitBid", "limitAsk"])
+        );
+    }
+
+    #[test]
+    fn market_pair_deserializes_from_object() {
+        let raw = json!({
+            "base":  "0x20C000000000000000000000518dDADD37eD1d28",
+            "quote": "0x20C0000000000000000000000000000000000000",
+        });
+        let pair: MarketPair = serde_json::from_value(raw).unwrap();
+        assert_eq!(
+            pair.base,
+            "0x20C000000000000000000000518dDADD37eD1d28"
+                .parse::<Address>()
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn new_market_methods_are_in_the_public_allowlist() {
+        assert!(matches!(
+            classify_method("zone_getMarketConfig"),
+            Some(MethodTier::Public)
+        ));
+        assert!(matches!(
+            classify_method("zone_getTopOfBook"),
+            Some(MethodTier::Public)
+        ));
+        assert!(matches!(
+            classify_method("zone_getMidpointHistory"),
+            Some(MethodTier::Public)
+        ));
+    }
 }
