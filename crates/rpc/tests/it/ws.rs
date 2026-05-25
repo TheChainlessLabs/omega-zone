@@ -260,6 +260,57 @@ impl ZoneRpcApi for MockZoneRpcApi {
             }))
         })
     }
+
+    fn zone_get_market_config(&self, _auth: zone_rpc::auth::AuthContext) -> BoxFut<'_> {
+        Box::pin(async move {
+            zone_rpc::types::to_raw(&serde_json::json!({
+                "darkpool": format!("{:#x}", Address::ZERO),
+                "markets": [],
+            }))
+        })
+    }
+
+    fn zone_get_top_of_book(
+        &self,
+        base: Address,
+        quote: Address,
+        _auth: zone_rpc::auth::AuthContext,
+    ) -> BoxFut<'_> {
+        Box::pin(async move {
+            zone_rpc::types::to_raw(&serde_json::json!({
+                "pair": "MOCK/MOCK",
+                "base": base,
+                "quote": quote,
+                "bid": null,
+                "ask": null,
+                "midpoint": null,
+                "spread": null,
+                "asOfBlock": "0x0",
+            }))
+        })
+    }
+
+    fn zone_get_midpoint_history(
+        &self,
+        base: Address,
+        quote: Address,
+        interval: String,
+        _limit: u32,
+        _cursor: Option<String>,
+        _auth: zone_rpc::auth::AuthContext,
+    ) -> BoxFut<'_> {
+        Box::pin(async move {
+            zone_rpc::types::to_raw(&serde_json::json!({
+                "pair": "MOCK/MOCK",
+                "base": base,
+                "quote": quote,
+                "interval": interval,
+                "samples": [],
+                "nextCursor": null,
+                "history": { "enabled": false, "reason": "mock" },
+            }))
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------

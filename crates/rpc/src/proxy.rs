@@ -500,6 +500,43 @@ impl ZoneRpcApi for ProxyZoneRpc {
             ))
         })
     }
+
+    fn zone_get_market_config(&self, _auth: AuthContext) -> BoxFut<'_> {
+        Box::pin(async move {
+            Err(JsonRpcError::internal(
+                "zone-specific methods are not supported by the proxy backend",
+            ))
+        })
+    }
+
+    fn zone_get_top_of_book(
+        &self,
+        _base: Address,
+        _quote: Address,
+        _auth: AuthContext,
+    ) -> BoxFut<'_> {
+        Box::pin(async move {
+            Err(JsonRpcError::internal(
+                "zone-specific methods are not supported by the proxy backend",
+            ))
+        })
+    }
+
+    fn zone_get_midpoint_history(
+        &self,
+        _base: Address,
+        _quote: Address,
+        _interval: String,
+        _limit: u32,
+        _cursor: Option<String>,
+        _auth: AuthContext,
+    ) -> BoxFut<'_> {
+        Box::pin(async move {
+            Err(JsonRpcError::internal(
+                "zone-specific methods are not supported by the proxy backend",
+            ))
+        })
+    }
 }
 
 #[cfg(test)]

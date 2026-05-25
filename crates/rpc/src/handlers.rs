@@ -16,7 +16,7 @@ use crate::{
     auth::AuthContext,
     subscription::BoxWsSubscriptionFut,
     types::{
-        BoxEyreFut, BoxFut, JsonRpcError, JsonRpcRequest, JsonRpcResponse, MethodTier,
+        BoxEyreFut, BoxFut, JsonRpcError, JsonRpcRequest, JsonRpcResponse, MarketPair, MethodTier,
         classify_method,
     },
 };
@@ -189,6 +189,30 @@ pub trait ZoneRpcApi: Send + Sync + 'static {
     /// `zone_getDepositStatus(tempoBlockNumber)` — returns per-caller deposit
     /// processing state for a Tempo L1 block.
     fn zone_get_deposit_status(&self, tempo_block_number: u64, auth: AuthContext) -> BoxFut<'_>;
+
+    /// `zone_getMarketConfig()` — returns canonical market metadata
+    /// (pair, base/quote token info, min order amount, price-unit semantics,
+    /// allowed actions) for every market the darkpool currently exposes.
+    fn zone_get_market_config(&self, auth: AuthContext) -> BoxFut<'_>;
+
+    /// `zone_getTopOfBook(pair)` — returns the aggregate best bid/ask and
+    /// midpoint for a given market pair. Aggregate-only: never exposes
+    /// individual order owners or counterparties.
+    fn zone_get_top_of_book(&self, base: Address, quote: Address, auth: AuthContext) -> BoxFut<'_>;
+
+    /// `zone_getMidpointHistory(pair, interval, limit, cursor?)` — returns
+    /// aggregate midpoint samples for charting. Implementations may return an
+    /// empty sample set with `history.enabled = false` when historical
+    /// aggregation is not yet wired up for a given launch.
+    fn zone_get_midpoint_history(
+        &self,
+        base: Address,
+        quote: Address,
+        interval: String,
+        limit: u32,
+        cursor: Option<String>,
+        auth: AuthContext,
+    ) -> BoxFut<'_>;
 }
 
 /// Deserialize JSON-RPC params, returning an error response on failure.
@@ -342,6 +366,13 @@ pub async fn dispatch(
             api.zone_get_zone_info(auth.clone()).await,
         ),
         "zone_getDepositStatus" => handle_zone_get_deposit_status(id, raw, auth, api).await,
+        "zone_getMarketConfig" => api_result(
+            id,
+            "zone_getMarketConfig",
+            api.zone_get_market_config(auth.clone()).await,
+        ),
+        "zone_getTopOfBook" => handle_zone_get_top_of_book(id, raw, auth, api).await,
+        "zone_getMidpointHistory" => handle_zone_get_midpoint_history(id, raw, auth, api).await,
         _ => {
             // Method is whitelisted but not yet implemented via direct API
             JsonRpcResponse::error(
@@ -724,6 +755,70 @@ async fn handle_uninstall_filter(
     )
 }
 
+/// Handle `zone_getTopOfBook(pair)`.
+async fn handle_zone_get_top_of_book(
+    id: Value,
+    raw: &str,
+    auth: &AuthContext,
+    api: &dyn ZoneRpcApi,
+) -> JsonRpcResponse {
+    let (pair,) = match parse_params::<(MarketPair,)>(raw, &id, "expected [{base, quote}]") {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+
+    api_result(
+        id,
+        "zone_getTopOfBook",
+        api.zone_get_top_of_book(pair.base, pair.quote, auth.clone())
+            .await,
+    )
+}
+
+/// Default sample cap when the caller omits `limit`. Matches what a reasonable
+/// chart query would request and bounds the implementation's pagination work.
+const DEFAULT_MIDPOINT_HISTORY_LIMIT: u32 = 500;
+/// Hard ceiling on per-call samples so a malformed `limit` cannot force the
+/// implementation to scan the full history table.
+const MAX_MIDPOINT_HISTORY_LIMIT: u32 = 5_000;
+
+/// Params for `zone_getMidpointHistory`: `[{base, quote}, interval, limit?, cursor?]`.
+#[derive(serde::Deserialize)]
+struct MidpointHistoryParams(
+    MarketPair,
+    String,
+    #[serde(default)] Option<u32>,
+    #[serde(default)] Option<String>,
+);
+
+/// Handle `zone_getMidpointHistory(pair, interval, limit?, cursor?)`.
+async fn handle_zone_get_midpoint_history(
+    id: Value,
+    raw: &str,
+    auth: &AuthContext,
+    api: &dyn ZoneRpcApi,
+) -> JsonRpcResponse {
+    let MidpointHistoryParams(pair, interval, limit, cursor) = match parse_params(
+        raw,
+        &id,
+        "expected [{base, quote}, interval, limit?, cursor?]",
+    ) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+
+    let limit = limit
+        .unwrap_or(DEFAULT_MIDPOINT_HISTORY_LIMIT)
+        .min(MAX_MIDPOINT_HISTORY_LIMIT);
+
+    api_result(
+        id,
+        "zone_getMidpointHistory",
+        api.zone_get_midpoint_history(pair.base, pair.quote, interval, limit, cursor, auth.clone())
+            .await,
+    )
+}
+
 /// Handle `zone_getDepositStatus(tempoBlockNumber)`.
 async fn handle_zone_get_deposit_status(
     id: Value,
@@ -775,12 +870,16 @@ mod tests {
 
     struct MockZoneRpcApi {
         last_tempo_block_number: AtomicU64,
+        last_midpoint_limit: AtomicU64,
+        last_midpoint_cursor: std::sync::Mutex<Option<String>>,
     }
 
     impl Default for MockZoneRpcApi {
         fn default() -> Self {
             Self {
                 last_tempo_block_number: AtomicU64::new(0),
+                last_midpoint_limit: AtomicU64::new(0),
+                last_midpoint_cursor: std::sync::Mutex::new(None),
             }
         }
     }
@@ -857,6 +956,63 @@ mod tests {
                 }))
             })
         }
+
+        fn zone_get_market_config(&self, _auth: AuthContext) -> BoxFut<'_> {
+            Box::pin(async move {
+                to_raw(&json!({
+                    "darkpool": format!("{:#x}", Address::repeat_byte(0xdd)),
+                    "markets": [],
+                }))
+            })
+        }
+
+        fn zone_get_top_of_book(
+            &self,
+            base: Address,
+            quote: Address,
+            _auth: AuthContext,
+        ) -> BoxFut<'_> {
+            Box::pin(async move {
+                to_raw(&json!({
+                    "pair": "MOCK/MOCK",
+                    "base": base,
+                    "quote": quote,
+                    "bid": null,
+                    "ask": null,
+                    "midpoint": null,
+                    "spread": null,
+                    "asOfBlock": "0x0",
+                }))
+            })
+        }
+
+        fn zone_get_midpoint_history(
+            &self,
+            base: Address,
+            quote: Address,
+            interval: String,
+            limit: u32,
+            cursor: Option<String>,
+            _auth: AuthContext,
+        ) -> BoxFut<'_> {
+            self.last_midpoint_limit
+                .store(limit as u64, Ordering::Relaxed);
+            *self.last_midpoint_cursor.lock().unwrap() = cursor;
+            Box::pin(async move {
+                to_raw(&json!({
+                    "pair": "MOCK/MOCK",
+                    "base": base,
+                    "quote": quote,
+                    "interval": interval,
+                    "samples": [],
+                    "nextCursor": null,
+                    "history": {
+                        "enabled": false,
+                        "reason": "mock",
+                    },
+                }))
+            })
+        }
     }
 
     fn auth() -> AuthContext {
@@ -924,6 +1080,108 @@ mod tests {
         .await;
         assert!(resp.error.is_none());
         assert_eq!(api.last_tempo_block_number.load(Ordering::Relaxed), 42);
+    }
+
+    #[tokio::test]
+    async fn dispatches_zone_get_market_config() {
+        let api = MockZoneRpcApi::default();
+        let resp = dispatch(&request("zone_getMarketConfig", json!([])), &auth(), &api).await;
+
+        assert!(resp.error.is_none());
+        let body: serde_json::Value =
+            serde_json::from_str(resp.result.as_ref().unwrap().get()).unwrap();
+        assert_eq!(
+            body["darkpool"],
+            format!("{:#x}", Address::repeat_byte(0xdd))
+        );
+        assert!(body["markets"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn dispatches_zone_get_top_of_book_with_pair_object() {
+        let api = MockZoneRpcApi::default();
+        let base = format!("{:#x}", Address::repeat_byte(0x11));
+        let quote = format!("{:#x}", Address::repeat_byte(0x22));
+
+        let resp = dispatch(
+            &request("zone_getTopOfBook", json!([{"base": base, "quote": quote}])),
+            &auth(),
+            &api,
+        )
+        .await;
+
+        assert!(resp.error.is_none(), "{:?}", resp.error);
+        let body: serde_json::Value =
+            serde_json::from_str(resp.result.as_ref().unwrap().get()).unwrap();
+        assert_eq!(body["base"], base);
+        assert_eq!(body["quote"], quote);
+        assert!(body["bid"].is_null());
+        assert!(body["ask"].is_null());
+    }
+
+    #[tokio::test]
+    async fn rejects_zone_get_top_of_book_missing_pair() {
+        let api = MockZoneRpcApi::default();
+        let resp = dispatch(&request("zone_getTopOfBook", json!([])), &auth(), &api).await;
+
+        assert!(resp.result.is_none());
+        let err = resp.error.expect("missing pair must error");
+        assert_eq!(err.code, -32602);
+        assert_eq!(err.message, "expected [{base, quote}]");
+    }
+
+    #[tokio::test]
+    async fn dispatches_zone_get_midpoint_history_defaults_limit_when_omitted() {
+        let api = MockZoneRpcApi::default();
+        let base = format!("{:#x}", Address::repeat_byte(0x11));
+        let quote = format!("{:#x}", Address::repeat_byte(0x22));
+
+        let resp = dispatch(
+            &request(
+                "zone_getMidpointHistory",
+                json!([{"base": base, "quote": quote}, "1m"]),
+            ),
+            &auth(),
+            &api,
+        )
+        .await;
+        assert!(resp.error.is_none(), "{:?}", resp.error);
+        assert_eq!(
+            api.last_midpoint_limit.load(Ordering::Relaxed),
+            DEFAULT_MIDPOINT_HISTORY_LIMIT as u64,
+        );
+        assert!(api.last_midpoint_cursor.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn dispatches_zone_get_midpoint_history_caps_limit() {
+        let api = MockZoneRpcApi::default();
+        let base = format!("{:#x}", Address::repeat_byte(0x11));
+        let quote = format!("{:#x}", Address::repeat_byte(0x22));
+
+        let resp = dispatch(
+            &request(
+                "zone_getMidpointHistory",
+                json!([
+                    {"base": base, "quote": quote},
+                    "1m",
+                    MAX_MIDPOINT_HISTORY_LIMIT + 99,
+                    "cur-1",
+                ]),
+            ),
+            &auth(),
+            &api,
+        )
+        .await;
+        assert!(resp.error.is_none(), "{:?}", resp.error);
+        assert_eq!(
+            api.last_midpoint_limit.load(Ordering::Relaxed),
+            MAX_MIDPOINT_HISTORY_LIMIT as u64,
+        );
+        assert_eq!(
+            api.last_midpoint_cursor.lock().unwrap().as_deref(),
+            Some("cur-1"),
+        );
     }
 
     #[tokio::test]

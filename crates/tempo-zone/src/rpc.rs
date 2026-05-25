@@ -12,7 +12,7 @@ use std::{
 };
 
 use alloy_network::{ReceiptResponse, TransactionResponse};
-use alloy_primitives::{Address, B256, Bloom, Bytes, U64, U256};
+use alloy_primitives::{Address, B256, Bloom, Bytes, U64, U128, U256};
 use alloy_provider::{DynProvider, Provider, ProviderBuilder};
 use alloy_rpc_types_eth::{
     Block, BlockId, BlockNumberOrTag, BlockTransactions, Filter, FilterChanges, FilterId,
@@ -44,21 +44,49 @@ use tokio::{
     sync::Mutex,
     time::{MissedTickBehavior, interval},
 };
+use zone_precompiles::DARKPOOL_ADDRESS;
 
 use crate::abi::{
-    TEMPO_STATE_ADDRESS, ZONE_INBOX_ADDRESS, ZONE_TOKEN_ADDRESS, ZoneInbox, ZonePortal,
+    DarkpoolReader, TEMPO_STATE_ADDRESS, ZONE_INBOX_ADDRESS, ZONE_TOKEN_ADDRESS, ZoneInbox,
+    ZonePortal,
 };
 use zone_rpc::{
     auth::AuthContext,
     types::{
         AuthorizationTokenInfoResponse, BoxEyreFut, BoxFut, DepositKind, DepositState,
-        DepositStatusEntry, DepositStatusResponse, JsonRpcError, ZoneInfoResponse, internal,
-        raw_null, raw_zero, to_raw,
+        DepositStatusEntry, DepositStatusResponse, HistoryAvailability, JsonRpcError, MarketAction,
+        MarketConfigResponse, MarketEntry, MarketToken, MidpointHistoryResponse, OrderLevel,
+        TopOfBookResponse, ZoneInfoResponse, internal, raw_null, raw_zero, to_raw,
     },
 };
 
 type RpcBlock = Block<alloy_rpc_types_eth::Transaction<TempoTxEnvelope>, TempoHeaderResponse>;
 const FILTER_OWNER_PRUNE_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Canonical alpha-launch market constants.
+///
+/// The darkpool's `bestBid(base)` / `bestAsk(base)` reads take only a base
+/// address and implicitly resolve the quote via the base token's
+/// `quoteToken()`. To keep response labels and on-chain reads in sync, the
+/// alpha private RPC exposes exactly one pair — OALPHA/PATH.USD — and rejects
+/// any other base/quote combination rather than risk returning a different
+/// book mislabeled as the requested pair.
+mod alpha {
+    use alloy_primitives::{Address, address};
+
+    /// Canonical alpha base token (OALPHA).
+    pub(super) const BASE: Address = address!("0x20C000000000000000000000518dDADD37eD1d28");
+    /// Canonical alpha quote token (PATH.USD).
+    pub(super) const QUOTE: Address = address!("0x20C0000000000000000000000000000000000000");
+    /// Display symbol for the base token shown to the frontend.
+    pub(super) const BASE_SYMBOL: &str = "OALPHA";
+    /// Display symbol for the quote token shown to the frontend.
+    pub(super) const QUOTE_SYMBOL: &str = "PATH.USD";
+    /// Token decimals — both alpha tokens are 6-decimal TIP-20s.
+    pub(super) const DECIMALS: u8 = 6;
+    /// Frontend display label `"<base>/<quote>"`.
+    pub(super) const PAIR_LABEL: &str = "OALPHA/PATH.USD";
+}
 
 fn filter_not_found_error() -> JsonRpcError {
     JsonRpcError::invalid_params("filter not found")
@@ -960,6 +988,88 @@ where
             })
         })
     }
+
+    fn zone_get_market_config(&self, _auth: AuthContext) -> BoxFut<'_> {
+        Box::pin(async move { to_raw(&canonical_alpha_market_config()) })
+    }
+
+    fn zone_get_top_of_book(
+        &self,
+        base: Address,
+        quote: Address,
+        _auth: AuthContext,
+    ) -> BoxFut<'_> {
+        Box::pin(async move {
+            ensure_canonical_pair(base, quote)?;
+
+            let darkpool = DarkpoolReader::new(DARKPOOL_ADDRESS, &self.zone_provider);
+            let best_bid = darkpool.bestBid(base).call().await.map_err(internal)?;
+            let best_ask = darkpool.bestAsk(base).call().await.map_err(internal)?;
+            let as_of_block = self
+                .zone_provider
+                .get_block_number()
+                .await
+                .map_err(internal)?;
+
+            let bid = level_from_response(best_bid.price, best_bid.quantity);
+            let ask = level_from_response(best_ask.price, best_ask.quantity);
+            let (midpoint, spread) = match (&bid, &ask) {
+                (Some(b), Some(a)) => (
+                    Some(U128::from(
+                        (b.price.saturating_add(a.price)) / U128::from(2),
+                    )),
+                    Some(U128::from(a.price.saturating_sub(b.price))),
+                ),
+                _ => (None, None),
+            };
+
+            to_raw(&TopOfBookResponse {
+                pair: alpha::PAIR_LABEL.to_string(),
+                base,
+                quote,
+                bid,
+                ask,
+                midpoint,
+                spread,
+                as_of_block: U64::from(as_of_block),
+            })
+        })
+    }
+
+    fn zone_get_midpoint_history(
+        &self,
+        base: Address,
+        quote: Address,
+        interval: String,
+        _limit: u32,
+        _cursor: Option<String>,
+        _auth: AuthContext,
+    ) -> BoxFut<'_> {
+        Box::pin(async move {
+            ensure_canonical_pair(base, quote)?;
+
+            // Alpha launches without a midpoint aggregator: the sequencer does
+            // not durably record per-bucket midpoints, and synthesizing them
+            // client-side would leak fill-level activity. Return an empty,
+            // explicitly-disabled response so the frontend keeps the chart
+            // hidden instead of inventing data.
+            to_raw(&MidpointHistoryResponse {
+                pair: alpha::PAIR_LABEL.to_string(),
+                base,
+                quote,
+                interval,
+                samples: Vec::new(),
+                next_cursor: None,
+                history: HistoryAvailability {
+                    enabled: false,
+                    reason: "midpoint history aggregation is not yet enabled for alpha; \
+                             frontends should keep the chart disabled and use \
+                             zone_getTopOfBook for live aggregate values"
+                        .to_string(),
+                },
+            })
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1029,6 +1139,73 @@ fn redact_ws_header(header: &mut TempoHeaderResponse) {
 fn redact_block(block: &mut RpcBlock) {
     redact_tempo_header(&mut block.header.inner);
     block.transactions = BlockTransactions::Hashes(Vec::new());
+}
+
+/// Build an [`OrderLevel`] from a `bestBid`/`bestAsk` precompile response.
+///
+/// Treats `(0, 0)` as "empty side" and returns `None`, matching the precompile
+/// convention. Any partial zero (e.g. `(price=0, quantity!=0)`) is treated as
+/// empty as well, since a zero price is not a valid resting order.
+fn level_from_response(price: u128, quantity: u128) -> Option<OrderLevel> {
+    if price == 0 || quantity == 0 {
+        return None;
+    }
+    Some(OrderLevel {
+        price: U128::from(price),
+        quantity: U128::from(quantity),
+    })
+}
+
+/// Reject any base/quote combination that is not the canonical alpha pair.
+///
+/// The darkpool's `bestBid(base)` / `bestAsk(base)` reads ignore the quote
+/// argument entirely — the precompile resolves it through the base token's
+/// own `quoteToken()`. Accepting an arbitrary quote would therefore let a
+/// caller request `OALPHA/OTHER` and receive the genuine `OALPHA/PATH.USD`
+/// book mislabeled with the wrong quote. Rejecting unsupported pairs at the
+/// RPC boundary keeps the response label and the underlying book in sync.
+fn ensure_canonical_pair(base: Address, quote: Address) -> Result<(), JsonRpcError> {
+    if base == alpha::BASE && quote == alpha::QUOTE {
+        Ok(())
+    } else {
+        Err(JsonRpcError::invalid_params(
+            "unsupported pair; this build only exposes OALPHA/PATH.USD",
+        ))
+    }
+}
+
+/// Build the canonical `zone_getMarketConfig` response.
+///
+/// Alpha exposes exactly one market — OALPHA/PATH.USD — with display symbols
+/// and 6-decimal precision hardcoded to the protocol-level values rather than
+/// derived from on-chain TIP-20 reads. Hardcoding keeps the response available
+/// even when the L2 deployment has not yet replayed and matches the canonical
+/// alpha launch spec.
+fn canonical_alpha_market_config() -> MarketConfigResponse {
+    MarketConfigResponse {
+        darkpool: DARKPOOL_ADDRESS,
+        markets: vec![MarketEntry {
+            pair: alpha::PAIR_LABEL.to_string(),
+            base: MarketToken {
+                address: alpha::BASE,
+                symbol: alpha::BASE_SYMBOL.to_string(),
+                decimals: alpha::DECIMALS,
+            },
+            quote: MarketToken {
+                address: alpha::QUOTE,
+                symbol: alpha::QUOTE_SYMBOL.to_string(),
+                decimals: alpha::DECIMALS,
+            },
+            min_order_amount: U128::from(zone_precompiles::orderbook::MIN_ORDER_AMOUNT),
+            price_unit: "raw integer; quote = baseAmount * price".to_string(),
+            allowed_actions: vec![
+                MarketAction::MarketBuy,
+                MarketAction::MarketSell,
+                MarketAction::LimitBid,
+                MarketAction::LimitAsk,
+            ],
+        }],
+    }
 }
 
 #[cfg(test)]
@@ -1108,5 +1285,88 @@ mod tests {
         let stale_ids = stale_filter_owner_ids(Vec::new(), &HashSet::new());
 
         assert!(stale_ids.is_empty());
+    }
+
+    #[test]
+    fn level_from_response_treats_zero_as_empty_side() {
+        assert!(level_from_response(0, 0).is_none());
+        assert!(level_from_response(0, 100).is_none());
+        assert!(level_from_response(100, 0).is_none());
+
+        let level = level_from_response(1_000_000, 250_000).expect("level should be present");
+        assert_eq!(level.price, U128::from(1_000_000u128));
+        assert_eq!(level.quantity, U128::from(250_000u128));
+    }
+
+    #[test]
+    fn ensure_canonical_pair_accepts_alpha_pair() {
+        assert!(ensure_canonical_pair(alpha::BASE, alpha::QUOTE).is_ok());
+    }
+
+    #[test]
+    fn ensure_canonical_pair_rejects_swapped_pair() {
+        let err = ensure_canonical_pair(alpha::QUOTE, alpha::BASE)
+            .expect_err("swapped pair must be rejected");
+        assert_eq!(err.code, -32602);
+        assert_eq!(
+            err.message,
+            "unsupported pair; this build only exposes OALPHA/PATH.USD"
+        );
+    }
+
+    #[test]
+    fn ensure_canonical_pair_rejects_wrong_base() {
+        let err = ensure_canonical_pair(Address::repeat_byte(0x42), alpha::QUOTE)
+            .expect_err("wrong base must be rejected");
+        assert_eq!(err.code, -32602);
+    }
+
+    #[test]
+    fn ensure_canonical_pair_rejects_wrong_quote() {
+        let err = ensure_canonical_pair(alpha::BASE, Address::repeat_byte(0x42))
+            .expect_err("wrong quote must be rejected");
+        assert_eq!(err.code, -32602);
+    }
+
+    #[test]
+    fn canonical_alpha_market_config_returns_only_the_alpha_pair() {
+        let config = canonical_alpha_market_config();
+        assert_eq!(config.darkpool, DARKPOOL_ADDRESS);
+        assert_eq!(config.markets.len(), 1);
+
+        let market = &config.markets[0];
+        assert_eq!(market.pair, "OALPHA/PATH.USD");
+        assert_eq!(market.base.address, alpha::BASE);
+        assert_eq!(market.base.symbol, "OALPHA");
+        assert_eq!(market.base.decimals, 6);
+        assert_eq!(market.quote.address, alpha::QUOTE);
+        assert_eq!(market.quote.symbol, "PATH.USD");
+        assert_eq!(market.quote.decimals, 6);
+        assert_eq!(
+            market.min_order_amount,
+            U128::from(zone_precompiles::orderbook::MIN_ORDER_AMOUNT)
+        );
+        assert_eq!(market.price_unit, "raw integer; quote = baseAmount * price");
+        assert_eq!(
+            market.allowed_actions,
+            vec![
+                MarketAction::MarketBuy,
+                MarketAction::MarketSell,
+                MarketAction::LimitBid,
+                MarketAction::LimitAsk,
+            ]
+        );
+    }
+
+    #[test]
+    fn canonical_alpha_addresses_match_task_constants() {
+        assert_eq!(
+            format!("{:#x}", alpha::BASE),
+            "0x20c000000000000000000000518ddadd37ed1d28"
+        );
+        assert_eq!(
+            format!("{:#x}", alpha::QUOTE),
+            "0x20c0000000000000000000000000000000000000"
+        );
     }
 }
