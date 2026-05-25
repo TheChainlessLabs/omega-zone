@@ -12,7 +12,7 @@ use std::{
     time::Duration,
 };
 
-use alloy_consensus::{BlockHeader, Transaction as ConsensusTransaction};
+use alloy_consensus::{BlockHeader, Transaction as _, TxReceipt};
 use alloy_network::{ReceiptResponse, TransactionResponse};
 use alloy_primitives::{Address, B256, Bloom, Bytes, U64, U256};
 use alloy_provider::{DynProvider, Provider, ProviderBuilder};
@@ -48,15 +48,17 @@ use tokio::{
 };
 
 use crate::abi::{
-    TEMPO_STATE_ADDRESS, ZONE_INBOX_ADDRESS, ZONE_TOKEN_ADDRESS, ZoneInbox, ZonePortal,
+    TEMPO_STATE_ADDRESS, ZONE_INBOX_ADDRESS, ZONE_OUTBOX_ADDRESS, ZONE_TOKEN_ADDRESS, ZoneInbox,
+    ZoneOutbox, ZonePortal,
 };
 use zone_rpc::{
     auth::AuthContext,
     types::{
         AuthorizationTokenInfoResponse, BatchListResponse, BatchStatus, BatchSummary, BoxEyreFut,
         BoxFut, DepositKind, DepositState, DepositStatusEntry, DepositStatusResponse, JsonRpcError,
-        LIST_BATCHES_DEFAULT_LIMIT, LIST_BATCHES_MAX_LIMIT, ListBatchesParams, ZoneInfoResponse,
-        internal, raw_null, raw_zero, to_raw,
+        LIST_BATCHES_DEFAULT_LIMIT, LIST_BATCHES_MAX_LIMIT, ListBatchesParams, WithdrawalState,
+        WithdrawalStatusQuery, WithdrawalStatusResponse, ZoneInfoResponse, internal, raw_null,
+        raw_zero, to_raw,
     },
 };
 
@@ -303,7 +305,7 @@ impl<Api: EthApiTypes + 'static> TempoZoneRpc<Api> {
             .map_err(internal)
     }
 
-    /// Read the portal's `withdrawalBatchIndex` — the highest batch number
+    /// Read the portal's `withdrawalBatchIndex`, the highest batch number
     /// currently observable on L1.
     async fn latest_batch_number(&self) -> Result<u64, JsonRpcError> {
         if self.config.zone_portal.is_zero() {
@@ -317,9 +319,6 @@ impl<Api: EthApiTypes + 'static> TempoZoneRpc<Api> {
     }
 
     /// Fetch a single `BatchSubmitted` log by indexed `withdrawalBatchIndex`.
-    ///
-    /// Topic-filtered get_logs over the whole portal history. Returns `None`
-    /// when no event matches (e.g. the batch hasn't been submitted yet).
     async fn fetch_batch_log(
         &self,
         batch_number: u64,
@@ -336,11 +335,7 @@ impl<Api: EthApiTypes + 'static> TempoZoneRpc<Api> {
         Ok(logs.into_iter().next())
     }
 
-    /// Fetch every `BatchSubmitted` log for the inclusive range `[start, end]`
-    /// in a single `eth_getLogs` round-trip.
-    ///
-    /// The returned vector is sorted in ascending `withdrawalBatchIndex` order;
-    /// the caller is responsible for reversing if descending order is needed.
+    /// Fetch `BatchSubmitted` logs for inclusive batch range `[start, end]`.
     async fn fetch_batch_logs_in_range(
         &self,
         start: u64,
@@ -363,14 +358,8 @@ impl<Api: EthApiTypes + 'static> TempoZoneRpc<Api> {
         Ok(logs)
     }
 
-    /// Resolve a `BatchSubmitted` log into the public, aggregate-only
-    /// [`BatchSummary`] returned by the explorer methods.
-    ///
-    /// **Privacy:** every field of the returned summary is portal-level state
-    /// or a hash of portal-level state. No per-user, per-order or
-    /// per-counterparty data is read or returned by this code path. The L1
-    /// transaction calldata is decoded only to recover the public
-    /// `tempoBlockNumber` and `blockTransition` portal arguments.
+    /// Resolve a `BatchSubmitted` log into the public, aggregate-only summary
+    /// returned by the explorer methods.
     async fn build_batch_summary(
         &self,
         log: alloy_rpc_types_eth::Log,
@@ -438,6 +427,287 @@ impl<Api: EthApiTypes + 'static> TempoZoneRpc<Api> {
             zone_block_to_number,
             sealed_at,
         ))
+    }
+
+    /// Find the `WithdrawalRequested` event matching `query`, scoped to the
+    /// authenticated caller. Returns `Ok(None)` when the withdrawal does not
+    /// exist or is not owned by the caller — callers must treat both cases
+    /// identically to avoid leaking existence to non-owners.
+    async fn find_withdrawal_requested(
+        &self,
+        query: WithdrawalStatusQuery,
+        caller: Address,
+    ) -> Result<Option<WithdrawalRequestedRecord>, JsonRpcError> {
+        let logs = match query {
+            WithdrawalStatusQuery::TxHash(tx_hash) => {
+                let receipt = self
+                    .zone_provider
+                    .get_transaction_receipt(tx_hash)
+                    .await
+                    .map_err(internal)?;
+                let Some(receipt) = receipt else {
+                    return Ok(None);
+                };
+                receipt
+                    .inner
+                    .inner
+                    .logs()
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+            }
+            WithdrawalStatusQuery::WithdrawalIndex(idx) => {
+                let filter = Filter::new()
+                    .address(ZONE_OUTBOX_ADDRESS)
+                    .from_block(0)
+                    .event_signature(ZoneOutbox::WithdrawalRequested::SIGNATURE_HASH)
+                    .topic1(B256::from(U256::from(idx)));
+                self.zone_provider
+                    .get_logs(&filter)
+                    .await
+                    .map_err(internal)?
+            }
+        };
+
+        for log in logs {
+            if log.address() != ZONE_OUTBOX_ADDRESS {
+                continue;
+            }
+            if log.topics().first().copied()
+                != Some(ZoneOutbox::WithdrawalRequested::SIGNATURE_HASH)
+            {
+                continue;
+            }
+            let event = ZoneOutbox::WithdrawalRequested::decode_log(&log.inner)
+                .map_err(internal)?
+                .data;
+            if event.sender != caller {
+                continue;
+            }
+            let Some(zone_tx_hash) = log.transaction_hash else {
+                continue;
+            };
+            let Some(zone_block_number) = log.block_number else {
+                continue;
+            };
+            return Ok(Some(WithdrawalRequestedRecord {
+                withdrawal_index: event.withdrawalIndex,
+                token: event.token,
+                to: event.to,
+                amount: event.amount,
+                fee: event.fee,
+                memo: event.memo,
+                gas_limit: event.gasLimit,
+                fallback_recipient: event.fallbackRecipient,
+                callback_data: event.data.clone(),
+                zone_tx_hash,
+                zone_block_number,
+            }));
+        }
+        Ok(None)
+    }
+
+    /// Find the L2 `BatchFinalized` event sealing the zone block that contains
+    /// the withdrawal. Returns `None` if the batch has not yet been sealed
+    /// (still pending) or if the block sealed no withdrawals.
+    async fn find_batch_finalized_for_block(
+        &self,
+        zone_block_number: u64,
+    ) -> Result<Option<BatchFinalizedRecord>, JsonRpcError> {
+        let filter = Filter::new()
+            .address(ZONE_OUTBOX_ADDRESS)
+            .from_block(zone_block_number)
+            .to_block(zone_block_number)
+            .event_signature(ZoneOutbox::BatchFinalized::SIGNATURE_HASH);
+        let logs = self
+            .zone_provider
+            .get_logs(&filter)
+            .await
+            .map_err(internal)?;
+
+        for log in logs {
+            let event = ZoneOutbox::BatchFinalized::decode_log(&log.inner)
+                .map_err(internal)?
+                .data;
+            if event.withdrawalQueueHash.is_zero() {
+                continue;
+            }
+            return Ok(Some(BatchFinalizedRecord {
+                withdrawal_batch_index: event.withdrawalBatchIndex,
+                withdrawal_queue_hash: event.withdrawalQueueHash,
+            }));
+        }
+        Ok(None)
+    }
+
+    /// Find the L1 `BatchSubmitted` event matching the zone-side batch index.
+    ///
+    /// The L1 portal increments its own `withdrawalBatchIndex` once per
+    /// `submitBatch` call, so it tracks the L2 outbox batch index 1:1. Filter
+    /// by indexed topic1 to skip an unbounded scan.
+    async fn find_l1_batch_submitted(
+        &self,
+        withdrawal_batch_index: u64,
+        expected_queue_hash: B256,
+    ) -> Result<Option<BatchSubmittedRecord>, JsonRpcError> {
+        if self.config.zone_portal.is_zero() {
+            return Ok(None);
+        }
+
+        let filter = Filter::new()
+            .address(self.config.zone_portal)
+            .from_block(0)
+            .event_signature(ZonePortal::BatchSubmitted::SIGNATURE_HASH)
+            .topic1(B256::from(U256::from(withdrawal_batch_index)));
+        let logs = self.l1_provider.get_logs(&filter).await.map_err(internal)?;
+
+        for log in logs {
+            let event = ZonePortal::BatchSubmitted::decode_log(&log.inner)
+                .map_err(internal)?
+                .data;
+            if event.withdrawalQueueHash != expected_queue_hash {
+                continue;
+            }
+            let Some(l1_tx_hash) = log.transaction_hash else {
+                continue;
+            };
+            let Some(l1_block_number) = log.block_number else {
+                continue;
+            };
+            return Ok(Some(BatchSubmittedRecord {
+                l1_tx_hash,
+                l1_block_number,
+            }));
+        }
+        Ok(None)
+    }
+
+    /// Scan L1 from `from_block` for the `WithdrawalProcessed` event that
+    /// settles this withdrawal.
+    ///
+    /// Matching by `(to, token, amount)` alone is ambiguous when the caller
+    /// has multiple identical-shape withdrawals to the same recipient. To
+    /// disambiguate, every candidate's L1 transaction is fetched and the
+    /// `processWithdrawal(withdrawal, ...)` calldata is decoded; the inner
+    /// `Withdrawal` struct is then compared field-by-field — including the
+    /// authenticated `senderTag = keccak256(sender || zoneTxHash)` — against
+    /// the originating zone request.
+    ///
+    /// Returns:
+    /// - [`TerminalLookup::NotFound`]    — no candidate's calldata matches.
+    /// - [`TerminalLookup::Single`]      — exactly one candidate matches; for
+    ///   `callbackSuccess == false` an in-tx `BounceBack` probe disambiguates
+    ///   `bounced` vs. `failed`.
+    /// - [`TerminalLookup::Ambiguous`]   — more than one candidate matches.
+    ///   The caller must keep the public status at `submitted` rather than
+    ///   guess which terminal tx is correct.
+    async fn find_l1_withdrawal_terminal(
+        &self,
+        withdrawal: &WithdrawalRequestedRecord,
+        expected_sender_tag: B256,
+        from_block: u64,
+    ) -> Result<TerminalLookup, JsonRpcError> {
+        if self.config.zone_portal.is_zero() {
+            return Ok(TerminalLookup::NotFound);
+        }
+
+        let filter = Filter::new()
+            .address(self.config.zone_portal)
+            .from_block(from_block)
+            .event_signature(ZonePortal::WithdrawalProcessed::SIGNATURE_HASH)
+            .topic1(B256::left_padding_from(withdrawal.to.as_slice()));
+        let logs = self.l1_provider.get_logs(&filter).await.map_err(internal)?;
+
+        let mut candidates: Vec<CandidateTerminal> = Vec::new();
+        for log in logs {
+            let event = ZonePortal::WithdrawalProcessed::decode_log(&log.inner)
+                .map_err(internal)?
+                .data;
+            if event.token != withdrawal.token || event.amount != withdrawal.amount {
+                continue;
+            }
+            let Some(l1_tx_hash) = log.transaction_hash else {
+                continue;
+            };
+
+            // Decode the full `processWithdrawal` payload from the L1 tx's
+            // calldata so we can compare every field against the originating
+            // zone request, not just the `(to, token, amount)` triple the
+            // event exposes.
+            let Some(tx) = self
+                .l1_provider
+                .get_transaction_by_hash(l1_tx_hash)
+                .await
+                .map_err(internal)?
+            else {
+                continue;
+            };
+            let call = match ZonePortal::processWithdrawalCall::abi_decode(tx.input().as_ref()) {
+                Ok(call) => call,
+                Err(_) => continue,
+            };
+            if !withdrawal_matches(&call.withdrawal, withdrawal, expected_sender_tag) {
+                continue;
+            }
+            candidates.push(CandidateTerminal {
+                l1_tx_hash,
+                callback_success: event.callbackSuccess,
+            });
+        }
+
+        match classify_terminal_candidates(candidates) {
+            TerminalCandidateOutcome::NotFound => Ok(TerminalLookup::NotFound),
+            TerminalCandidateOutcome::Ambiguous => Ok(TerminalLookup::Ambiguous),
+            TerminalCandidateOutcome::Single(candidate) => {
+                let bounced = if candidate.callback_success {
+                    false
+                } else {
+                    self.bounce_back_in_tx(candidate.l1_tx_hash, withdrawal)
+                        .await?
+                };
+                Ok(TerminalLookup::Single(TerminalWithdrawalEvent {
+                    l1_tx_hash: candidate.l1_tx_hash,
+                    callback_success: candidate.callback_success,
+                    bounced,
+                }))
+            }
+        }
+    }
+
+    /// Returns `true` if the given L1 transaction contains a `BounceBack`
+    /// event for `withdrawal.fallback_recipient` with the same `(token, amount)`.
+    async fn bounce_back_in_tx(
+        &self,
+        l1_tx_hash: B256,
+        withdrawal: &WithdrawalRequestedRecord,
+    ) -> Result<bool, JsonRpcError> {
+        let receipt = self
+            .l1_provider
+            .get_transaction_receipt(l1_tx_hash)
+            .await
+            .map_err(internal)?;
+        let Some(receipt) = receipt else {
+            return Ok(false);
+        };
+        let logs = receipt.inner.inner.logs();
+        for log in logs {
+            if log.address() != self.config.zone_portal {
+                continue;
+            }
+            if log.topics().first().copied() != Some(ZonePortal::BounceBack::SIGNATURE_HASH) {
+                continue;
+            }
+            let event = ZonePortal::BounceBack::decode_log(&log.inner)
+                .map_err(internal)?
+                .data;
+            if event.fallbackRecipient == withdrawal.fallback_recipient
+                && event.token == withdrawal.token
+                && event.amount == withdrawal.amount
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     async fn terminal_event_for_deposit(
@@ -1009,98 +1279,6 @@ where
         })
     }
 
-    fn zone_get_deposit_status(&self, tempo_block_number: u64, auth: AuthContext) -> BoxFut<'_> {
-        Box::pin(async move {
-            let zone_processed_through = self
-                .tempo_state
-                .tempoBlockNumber()
-                .call()
-                .await
-                .map_err(internal)?;
-            let portal_deposits = self.portal_deposits_for_block(tempo_block_number).await?;
-
-            let mut deposits = Vec::new();
-            for deposit in portal_deposits {
-                match deposit {
-                    PortalDepositRecord::Regular {
-                        deposit_hash,
-                        sender,
-                        recipient,
-                        token,
-                        amount,
-                        memo,
-                    } => {
-                        if sender != auth.caller && recipient != auth.caller {
-                            continue;
-                        }
-
-                        let terminal = self.terminal_event_for_deposit(deposit_hash).await?;
-                        let status = regular_deposit_status(terminal)?;
-
-                        deposits.push(DepositStatusEntry {
-                            deposit_hash,
-                            kind: DepositKind::Regular,
-                            token,
-                            sender,
-                            recipient: Some(recipient),
-                            amount: U256::from(amount),
-                            memo: Some(memo),
-                            status,
-                        });
-                    }
-                    PortalDepositRecord::Encrypted {
-                        deposit_hash,
-                        sender,
-                        token,
-                        amount,
-                    } => {
-                        let terminal = self.terminal_event_for_deposit(deposit_hash).await?;
-
-                        let include = match (&terminal, sender == auth.caller) {
-                            (_, true) => true,
-                            (
-                                Some(TerminalDepositEvent::EncryptedProcessed {
-                                    recipient, ..
-                                }),
-                                false,
-                            ) => *recipient == auth.caller,
-                            _ => false,
-                        };
-
-                        if !include {
-                            continue;
-                        }
-
-                        let (recipient, memo, status) = encrypted_deposit_details(terminal)?;
-
-                        deposits.push(DepositStatusEntry {
-                            deposit_hash,
-                            kind: DepositKind::Encrypted,
-                            token,
-                            sender,
-                            recipient,
-                            amount: U256::from(amount),
-                            memo,
-                            status,
-                        });
-                    }
-                }
-            }
-
-            let processed = zone_processed_through >= tempo_block_number
-                && deposits
-                    .iter()
-                    .all(|deposit| deposit.status != DepositState::Pending);
-
-            to_raw(&DepositStatusResponse {
-                tempo_block_number: U64::from(tempo_block_number),
-                zone_processed_through: U64::from(zone_processed_through),
-                processed,
-                deposits,
-            })
-        })
-    }
-
     fn zone_list_batches(&self, params: ListBatchesParams, _auth: AuthContext) -> BoxFut<'_> {
         Box::pin(async move {
             let limit = params
@@ -1109,9 +1287,6 @@ where
                 .min(LIST_BATCHES_MAX_LIMIT)
                 .max(1);
 
-            // Anchor `end` at the latest portal batch number unless the caller
-            // is paginating with an explicit cursor. Cursor is exclusive — the
-            // first page from cursor=N returns batches strictly older than N.
             let latest = self.latest_batch_number().await?;
             if latest == 0 {
                 return to_raw(&BatchListResponse {
@@ -1221,6 +1396,273 @@ where
             }
         })
     }
+
+    fn zone_get_withdrawal_status(
+        &self,
+        query: WithdrawalStatusQuery,
+        auth: AuthContext,
+    ) -> BoxFut<'_> {
+        Box::pin(async move {
+            // Step 1: resolve the WithdrawalRequested event scoped to the caller.
+            //
+            // The function returns `Ok(None)` both when the withdrawal does not
+            // exist *and* when it exists but belongs to a different account, so
+            // a non-owner cannot distinguish the two cases via this RPC.
+            let Some(withdrawal) = self.find_withdrawal_requested(query, auth.caller).await? else {
+                return Ok(raw_null());
+            };
+
+            let mut response = WithdrawalStatusResponse {
+                withdrawal_index: U64::from(withdrawal.withdrawal_index),
+                zone_tx_hash: withdrawal.zone_tx_hash,
+                status: WithdrawalState::Pending,
+                token: withdrawal.token,
+                amount: U256::from(withdrawal.amount),
+                to: withdrawal.to,
+                fallback_recipient: withdrawal.fallback_recipient,
+                memo: withdrawal.memo,
+                zone_block_number: U64::from(withdrawal.zone_block_number),
+                withdrawal_batch_index: None,
+                portal_slot: None,
+                l1_submit_batch_tx_hash: None,
+                l1_process_withdrawal_tx_hash: None,
+                callback_success: None,
+                error: None,
+            };
+
+            // Step 2: check whether the zone outbox sealed the batch.
+            let Some(batch_finalized) = self
+                .find_batch_finalized_for_block(withdrawal.zone_block_number)
+                .await?
+            else {
+                return to_raw(&response);
+            };
+            response.withdrawal_batch_index =
+                Some(U64::from(batch_finalized.withdrawal_batch_index));
+            response.status = WithdrawalState::Batched;
+
+            // Step 3: check whether the batch landed on L1.
+            let Some(batch_submitted) = self
+                .find_l1_batch_submitted(
+                    batch_finalized.withdrawal_batch_index,
+                    batch_finalized.withdrawal_queue_hash,
+                )
+                .await?
+            else {
+                return to_raw(&response);
+            };
+            response.l1_submit_batch_tx_hash = Some(batch_submitted.l1_tx_hash);
+            response.status = WithdrawalState::Submitted;
+
+            // Step 4: check whether the L1 portal processed this withdrawal.
+            //
+            // `expected_sender_tag` binds the L1-side `Withdrawal.senderTag`
+            // back to `(auth.caller, zone_tx_hash)`. Combined with the rest of
+            // the calldata comparison this rules out look-alike withdrawals
+            // belonging to the same caller in adjacent batches.
+            let expected_sender_tag =
+                crate::abi::Withdrawal::sender_tag(auth.caller, withdrawal.zone_tx_hash);
+            let terminal = self
+                .find_l1_withdrawal_terminal(
+                    &withdrawal,
+                    expected_sender_tag,
+                    batch_submitted.l1_block_number,
+                )
+                .await?;
+            match terminal {
+                TerminalLookup::NotFound => return to_raw(&response),
+                TerminalLookup::Ambiguous => {
+                    // Multiple `processWithdrawal` calldata payloads matched
+                    // the zone request. Returning either would be a guess, so
+                    // keep the public status at `submitted` and surface the
+                    // ambiguity via a stable, non-sensitive error code.
+                    response.error = Some("ambiguous_terminal_match".to_string());
+                    return to_raw(&response);
+                }
+                TerminalLookup::Single(terminal) => {
+                    response.l1_process_withdrawal_tx_hash = Some(terminal.l1_tx_hash);
+                    response.callback_success = Some(terminal.callback_success);
+                    response.status = withdrawal_status_from_terminal(terminal);
+                    if response.status == WithdrawalState::Failed {
+                        response.error = Some("withdrawal callback reverted on L1".to_string());
+                    } else if response.status == WithdrawalState::Bounced {
+                        response.error =
+                            Some("withdrawal bounced to fallback recipient on L1".to_string());
+                    }
+                }
+            }
+
+            to_raw(&response)
+        })
+    }
+
+    fn zone_get_deposit_status(&self, tempo_block_number: u64, auth: AuthContext) -> BoxFut<'_> {
+        Box::pin(async move {
+            let zone_processed_through = self
+                .tempo_state
+                .tempoBlockNumber()
+                .call()
+                .await
+                .map_err(internal)?;
+            let portal_deposits = self.portal_deposits_for_block(tempo_block_number).await?;
+
+            let mut deposits = Vec::new();
+            for deposit in portal_deposits {
+                match deposit {
+                    PortalDepositRecord::Regular {
+                        deposit_hash,
+                        sender,
+                        recipient,
+                        token,
+                        amount,
+                        memo,
+                    } => {
+                        if sender != auth.caller && recipient != auth.caller {
+                            continue;
+                        }
+
+                        let terminal = self.terminal_event_for_deposit(deposit_hash).await?;
+                        let status = regular_deposit_status(terminal)?;
+
+                        deposits.push(DepositStatusEntry {
+                            deposit_hash,
+                            kind: DepositKind::Regular,
+                            token,
+                            sender,
+                            recipient: Some(recipient),
+                            amount: U256::from(amount),
+                            memo: Some(memo),
+                            status,
+                        });
+                    }
+                    PortalDepositRecord::Encrypted {
+                        deposit_hash,
+                        sender,
+                        token,
+                        amount,
+                    } => {
+                        let terminal = self.terminal_event_for_deposit(deposit_hash).await?;
+
+                        let include = match (&terminal, sender == auth.caller) {
+                            (_, true) => true,
+                            (
+                                Some(TerminalDepositEvent::EncryptedProcessed {
+                                    recipient, ..
+                                }),
+                                false,
+                            ) => *recipient == auth.caller,
+                            _ => false,
+                        };
+
+                        if !include {
+                            continue;
+                        }
+
+                        let (recipient, memo, status) = encrypted_deposit_details(terminal)?;
+
+                        deposits.push(DepositStatusEntry {
+                            deposit_hash,
+                            kind: DepositKind::Encrypted,
+                            token,
+                            sender,
+                            recipient,
+                            amount: U256::from(amount),
+                            memo,
+                            status,
+                        });
+                    }
+                }
+            }
+
+            let processed = zone_processed_through >= tempo_block_number
+                && deposits
+                    .iter()
+                    .all(|deposit| deposit.status != DepositState::Pending);
+
+            to_raw(&DepositStatusResponse {
+                tempo_block_number: U64::from(tempo_block_number),
+                zone_processed_through: U64::from(zone_processed_through),
+                processed,
+                deposits,
+            })
+        })
+    }
+}
+
+/// Zone-side data extracted from a `WithdrawalRequested` event plus its
+/// transaction context. The `sender` is intentionally omitted: an instance of
+/// this record only exists once the caller's identity has been confirmed to
+/// match the event's sender inside [`find_withdrawal_requested`], so further
+/// code paths must not re-derive ownership decisions from it.
+///
+/// The non-indexed fields (`fee`, `gas_limit`, `callback_data`, …) are kept so
+/// the L1 terminal lookup can compare the full `processWithdrawal` calldata
+/// payload against the original request, rather than the ambiguous
+/// `(to, token, amount)` triple.
+#[derive(Debug, Clone)]
+struct WithdrawalRequestedRecord {
+    withdrawal_index: u64,
+    token: Address,
+    to: Address,
+    amount: u128,
+    fee: u128,
+    memo: B256,
+    gas_limit: u64,
+    fallback_recipient: Address,
+    callback_data: Bytes,
+    zone_tx_hash: B256,
+    zone_block_number: u64,
+}
+
+/// L2 outbox batch-seal data for the zone block containing the withdrawal.
+#[derive(Debug, Clone, Copy)]
+struct BatchFinalizedRecord {
+    withdrawal_batch_index: u64,
+    withdrawal_queue_hash: B256,
+}
+
+/// L1 portal `BatchSubmitted` data for the matching withdrawal batch.
+#[derive(Debug, Clone, Copy)]
+struct BatchSubmittedRecord {
+    l1_tx_hash: B256,
+    l1_block_number: u64,
+}
+
+/// Terminal L1 settlement outcome for a single withdrawal.
+#[derive(Debug, Clone, Copy)]
+struct TerminalWithdrawalEvent {
+    l1_tx_hash: B256,
+    callback_success: bool,
+    /// `true` when a `BounceBack` was emitted alongside the `WithdrawalProcessed`
+    /// in the same L1 transaction.
+    bounced: bool,
+}
+
+/// One settled-withdrawal candidate that passed every layer of disambiguation
+/// (indexed-`to` filter, shallow `(token, amount)` event-field check, and
+/// full `processWithdrawal` calldata equality via [`withdrawal_matches`]).
+///
+/// Reaching this struct means the candidate is *eligible* to be the terminal
+/// event; [`classify_terminal_candidates`] decides whether it is actually
+/// reportable based on how many other candidates also reached this point.
+#[derive(Debug, Clone)]
+struct CandidateTerminal {
+    l1_tx_hash: B256,
+    callback_success: bool,
+}
+
+/// Outcome of the L1 terminal lookup after exact-calldata disambiguation.
+#[derive(Debug)]
+enum TerminalLookup {
+    /// No `WithdrawalProcessed` log decoded to a `processWithdrawal` payload
+    /// matching the zone-side request.
+    NotFound,
+    /// Exactly one candidate matched the full payload.
+    Single(TerminalWithdrawalEvent),
+    /// More than one candidate matched. Reporting any of them would be a
+    /// guess, so the caller should keep the public status at `submitted` and
+    /// surface this state via a non-sensitive error code.
+    Ambiguous,
 }
 
 /// Classification of a `zone_searchBatch` query string.
@@ -1272,11 +1714,7 @@ fn log_batch_index(log: &alloy_rpc_types_eth::Log) -> Option<u64> {
 }
 
 /// Pure mapping: `BatchSubmitted` event + decoded `submitBatch` calldata +
-/// timing data → aggregate-only [`BatchSummary`].
-///
-/// This intentionally takes only portal-level inputs so the response cannot
-/// accidentally leak per-user data, even if a future refactor wires it
-/// through additional code paths.
+/// timing data to aggregate-only [`BatchSummary`].
 fn map_batch_summary(
     event: &ZonePortal::BatchSubmitted,
     call: &ZonePortal::submitBatchCall,
@@ -1329,6 +1767,72 @@ enum TerminalDepositEvent {
     RegularProcessed,
     EncryptedProcessed { recipient: Address, memo: B256 },
     EncryptedFailed,
+}
+
+/// Map a terminal L1 settlement event to the corresponding `WithdrawalState`.
+///
+/// - `callbackSuccess == true` → `Processed` (callback succeeded or absent).
+/// - `callbackSuccess == false` and `BounceBack` emitted in same tx → `Bounced`.
+/// - `callbackSuccess == false` and no `BounceBack` → `Failed`.
+fn withdrawal_status_from_terminal(terminal: TerminalWithdrawalEvent) -> WithdrawalState {
+    if terminal.callback_success {
+        WithdrawalState::Processed
+    } else if terminal.bounced {
+        WithdrawalState::Bounced
+    } else {
+        WithdrawalState::Failed
+    }
+}
+
+/// Returns `true` when an L1 `Withdrawal` payload decoded from a
+/// `processWithdrawal` calldata exactly matches the originating zone
+/// `WithdrawalRequested` event.
+///
+/// `expected_sender_tag` must equal `keccak256(sender || zoneTxHash)` for the
+/// authenticated caller — the L1 sender tag is the only way to bind the
+/// settlement payload back to a specific zone transaction without trusting
+/// the recipient/token/amount triple alone.
+///
+/// `encryptedSender` is intentionally NOT compared: the sequencer attaches
+/// it only at `finalizeWithdrawalBatch` time and the zone event does not
+/// carry it. The remaining fields are sufficient to make a collision require
+/// two byte-identical withdrawals from the same caller, in the same zone tx,
+/// settled into different L1 batches — which is the corner case the caller's
+/// [`TerminalLookup::Ambiguous`] branch handles.
+fn withdrawal_matches(
+    l1_withdrawal: &crate::abi::Withdrawal,
+    requested: &WithdrawalRequestedRecord,
+    expected_sender_tag: B256,
+) -> bool {
+    l1_withdrawal.token == requested.token
+        && l1_withdrawal.senderTag == expected_sender_tag
+        && l1_withdrawal.to == requested.to
+        && l1_withdrawal.amount == requested.amount
+        && l1_withdrawal.fee == requested.fee
+        && l1_withdrawal.memo == requested.memo
+        && l1_withdrawal.gasLimit == requested.gas_limit
+        && l1_withdrawal.fallbackRecipient == requested.fallback_recipient
+        && l1_withdrawal.callbackData == requested.callback_data
+}
+
+/// Output of the count-based classification step in
+/// [`find_l1_withdrawal_terminal`]. Pulled out as a standalone enum so the
+/// 0/1/N → outcome mapping can be tested without spinning up a provider.
+#[derive(Debug)]
+enum TerminalCandidateOutcome<T> {
+    NotFound,
+    Single(T),
+    Ambiguous,
+}
+
+/// Decide between `NotFound` / `Single(_)` / `Ambiguous` based purely on the
+/// number of already-filtered candidates.
+fn classify_terminal_candidates<T>(mut candidates: Vec<T>) -> TerminalCandidateOutcome<T> {
+    match candidates.len() {
+        0 => TerminalCandidateOutcome::NotFound,
+        1 => TerminalCandidateOutcome::Single(candidates.remove(0)),
+        _ => TerminalCandidateOutcome::Ambiguous,
+    }
 }
 
 fn regular_deposit_status(
@@ -1431,30 +1935,163 @@ mod tests {
     }
 
     #[test]
-    fn stale_filter_owner_ids_removes_only_inactive_entries() {
-        let active_ids = HashSet::from([
-            FilterId::Str("0xactive".to_string()),
-            FilterId::Str("0xkeep".to_string()),
-        ]);
-        let owner_ids = vec![
-            FilterId::Str("0xactive".to_string()),
-            FilterId::Str("0xstale".to_string()),
-            FilterId::Str("0xkeep".to_string()),
-        ];
-
-        let stale_ids = stale_filter_owner_ids(owner_ids, &active_ids);
-
-        assert_eq!(stale_ids, vec![FilterId::Str("0xstale".to_string())]);
+    fn withdrawal_status_maps_callback_success_to_processed() {
+        let terminal = TerminalWithdrawalEvent {
+            l1_tx_hash: B256::repeat_byte(0x11),
+            callback_success: true,
+            bounced: false,
+        };
+        assert_eq!(
+            withdrawal_status_from_terminal(terminal),
+            WithdrawalState::Processed
+        );
     }
 
     #[test]
-    fn stale_filter_owner_ids_is_noop_for_empty_owner_set() {
-        let stale_ids = stale_filter_owner_ids(Vec::new(), &HashSet::new());
-
-        assert!(stale_ids.is_empty());
+    fn withdrawal_status_maps_callback_failure_with_bounce_to_bounced() {
+        let terminal = TerminalWithdrawalEvent {
+            l1_tx_hash: B256::repeat_byte(0x22),
+            callback_success: false,
+            bounced: true,
+        };
+        assert_eq!(
+            withdrawal_status_from_terminal(terminal),
+            WithdrawalState::Bounced
+        );
     }
 
-    fn sample_event(batch: u64) -> ZonePortal::BatchSubmitted {
+    #[test]
+    fn withdrawal_status_maps_callback_failure_without_bounce_to_failed() {
+        let terminal = TerminalWithdrawalEvent {
+            l1_tx_hash: B256::repeat_byte(0x33),
+            callback_success: false,
+            bounced: false,
+        };
+        assert_eq!(
+            withdrawal_status_from_terminal(terminal),
+            WithdrawalState::Failed
+        );
+    }
+
+    /// Build a paired `(WithdrawalRequestedRecord, L1 Withdrawal, sender_tag)`
+    /// fixture where every field of the L1 payload is consistent with the
+    /// zone-side record. Tests then mutate one field at a time to assert that
+    /// [`withdrawal_matches`] rejects mismatches.
+    fn matching_withdrawal_fixture() -> (
+        WithdrawalRequestedRecord,
+        crate::abi::Withdrawal,
+        B256, // expected_sender_tag
+    ) {
+        let sender = Address::repeat_byte(0xaa);
+        let zone_tx_hash = B256::repeat_byte(0x77);
+        let sender_tag = crate::abi::Withdrawal::sender_tag(sender, zone_tx_hash);
+
+        let requested = WithdrawalRequestedRecord {
+            withdrawal_index: 1,
+            token: Address::repeat_byte(0x10),
+            to: Address::repeat_byte(0x20),
+            amount: 1_000_000,
+            fee: 250,
+            memo: B256::repeat_byte(0x33),
+            gas_limit: 50_000,
+            fallback_recipient: Address::repeat_byte(0x40),
+            callback_data: Bytes::from(vec![0xde, 0xad, 0xbe, 0xef]),
+            zone_tx_hash,
+            zone_block_number: 42,
+        };
+
+        let l1_withdrawal = crate::abi::Withdrawal {
+            token: requested.token,
+            senderTag: sender_tag,
+            to: requested.to,
+            amount: requested.amount,
+            fee: requested.fee,
+            memo: requested.memo,
+            gasLimit: requested.gas_limit,
+            fallbackRecipient: requested.fallback_recipient,
+            callbackData: requested.callback_data.clone(),
+            encryptedSender: Bytes::from(vec![0x01, 0x02]),
+        };
+
+        (requested, l1_withdrawal, sender_tag)
+    }
+
+    #[test]
+    fn withdrawal_matches_accepts_identical_payload() {
+        let (requested, l1_withdrawal, sender_tag) = matching_withdrawal_fixture();
+        assert!(withdrawal_matches(&l1_withdrawal, &requested, sender_tag));
+    }
+
+    #[test]
+    fn withdrawal_matches_rejects_wrong_sender_tag() {
+        let (requested, l1_withdrawal, _sender_tag) = matching_withdrawal_fixture();
+        let other_caller = Address::repeat_byte(0xbb);
+        let other_tag = crate::abi::Withdrawal::sender_tag(other_caller, requested.zone_tx_hash);
+        assert!(!withdrawal_matches(&l1_withdrawal, &requested, other_tag));
+    }
+
+    #[test]
+    fn withdrawal_matches_rejects_per_field_divergence() {
+        let (requested, base, sender_tag) = matching_withdrawal_fixture();
+
+        let mut diff_token = base.clone();
+        diff_token.token = Address::repeat_byte(0x11);
+        assert!(!withdrawal_matches(&diff_token, &requested, sender_tag));
+
+        let mut diff_to = base.clone();
+        diff_to.to = Address::repeat_byte(0x21);
+        assert!(!withdrawal_matches(&diff_to, &requested, sender_tag));
+
+        let mut diff_amount = base.clone();
+        diff_amount.amount = base.amount + 1;
+        assert!(!withdrawal_matches(&diff_amount, &requested, sender_tag));
+
+        let mut diff_fee = base.clone();
+        diff_fee.fee = base.fee + 1;
+        assert!(!withdrawal_matches(&diff_fee, &requested, sender_tag));
+
+        let mut diff_memo = base.clone();
+        diff_memo.memo = B256::repeat_byte(0x44);
+        assert!(!withdrawal_matches(&diff_memo, &requested, sender_tag));
+
+        let mut diff_gas = base.clone();
+        diff_gas.gasLimit = base.gasLimit + 1;
+        assert!(!withdrawal_matches(&diff_gas, &requested, sender_tag));
+
+        let mut diff_fallback = base.clone();
+        diff_fallback.fallbackRecipient = Address::repeat_byte(0x41);
+        assert!(!withdrawal_matches(&diff_fallback, &requested, sender_tag));
+
+        let mut diff_callback = base.clone();
+        diff_callback.callbackData = Bytes::from(vec![0xff]);
+        assert!(!withdrawal_matches(&diff_callback, &requested, sender_tag));
+    }
+
+    #[test]
+    fn classify_terminal_candidates_routes_empty_to_not_found() {
+        let out: TerminalCandidateOutcome<u32> = classify_terminal_candidates(Vec::new());
+        assert!(matches!(out, TerminalCandidateOutcome::NotFound));
+    }
+
+    #[test]
+    fn classify_terminal_candidates_routes_singleton_to_single() {
+        let out = classify_terminal_candidates(vec![42u32]);
+        match out {
+            TerminalCandidateOutcome::Single(v) => assert_eq!(v, 42),
+            other => panic!("expected Single, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_terminal_candidates_routes_two_plus_to_ambiguous() {
+        let out = classify_terminal_candidates(vec![1u32, 2u32]);
+        assert!(matches!(out, TerminalCandidateOutcome::Ambiguous));
+
+        let out = classify_terminal_candidates(vec![1u32, 2u32, 3u32]);
+        assert!(matches!(out, TerminalCandidateOutcome::Ambiguous));
+    }
+
+    fn sample_batch_event(batch: u64) -> ZonePortal::BatchSubmitted {
         ZonePortal::BatchSubmitted {
             withdrawalBatchIndex: batch,
             nextProcessedDepositQueueHash: B256::repeat_byte(0x11),
@@ -1464,7 +2101,7 @@ mod tests {
         }
     }
 
-    fn sample_call(tempo_block: u64) -> ZonePortal::submitBatchCall {
+    fn sample_batch_call(tempo_block: u64) -> ZonePortal::submitBatchCall {
         ZonePortal::submitBatchCall {
             tempoBlockNumber: tempo_block,
             recentTempoBlockNumber: 0,
@@ -1486,8 +2123,8 @@ mod tests {
 
     #[test]
     fn map_batch_summary_uses_event_and_call_fields() {
-        let event = sample_event(42);
-        let call = sample_call(1_000);
+        let event = sample_batch_event(42);
+        let call = sample_batch_call(1_000);
         let settlement_tx = B256::repeat_byte(0x55);
 
         let summary = map_batch_summary(
@@ -1516,12 +2153,8 @@ mod tests {
 
     #[test]
     fn map_batch_summary_emits_aggregate_only_fields() {
-        // Privacy regression test — the summary must never carry per-user
-        // identifiers or per-fill data. Inspect the serialized JSON to confirm
-        // no owner-leaking field names appear (defensive against future struct
-        // additions).
-        let event = sample_event(7);
-        let call = sample_call(50);
+        let event = sample_batch_event(7);
+        let call = sample_batch_call(50);
         let summary = map_batch_summary(
             &event,
             &call,
@@ -1552,7 +2185,6 @@ mod tests {
             );
         }
 
-        // Order/fill counts are reserved for higher layers and must default to 0.
         assert_eq!(summary.order_count, U64::ZERO);
         assert_eq!(summary.fill_count, U64::ZERO);
         assert!(summary.aggregate_pairs.is_empty());
@@ -1571,7 +2203,6 @@ mod tests {
 
     #[test]
     fn log_batch_index_round_trips_through_topic() {
-        // Build a synthetic log with topic1 == padded uint64(123).
         let topics = vec![
             ZonePortal::BatchSubmitted::SIGNATURE_HASH,
             batch_number_topic(123),
@@ -1613,8 +2244,31 @@ mod tests {
     #[test]
     fn classify_batch_query_rejects_garbage() {
         assert_eq!(classify_batch_query("not-a-batch"), BatchQuery::Invalid);
-        // 31-byte hex — neither a tx hash nor a u64.
         let too_short = format!("0x{}", "11".repeat(31));
         assert_eq!(classify_batch_query(&too_short), BatchQuery::Invalid);
+    }
+
+    #[test]
+    fn stale_filter_owner_ids_removes_only_inactive_entries() {
+        let active_ids = HashSet::from([
+            FilterId::Str("0xactive".to_string()),
+            FilterId::Str("0xkeep".to_string()),
+        ]);
+        let owner_ids = vec![
+            FilterId::Str("0xactive".to_string()),
+            FilterId::Str("0xstale".to_string()),
+            FilterId::Str("0xkeep".to_string()),
+        ];
+
+        let stale_ids = stale_filter_owner_ids(owner_ids, &active_ids);
+
+        assert_eq!(stale_ids, vec![FilterId::Str("0xstale".to_string())]);
+    }
+
+    #[test]
+    fn stale_filter_owner_ids_is_noop_for_empty_owner_set() {
+        let stale_ids = stale_filter_owner_ids(Vec::new(), &HashSet::new());
+
+        assert!(stale_ids.is_empty());
     }
 }

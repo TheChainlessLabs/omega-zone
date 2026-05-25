@@ -140,6 +140,24 @@ impl JsonRpcError {
         }
     }
 
+    /// Unsupported account-management method (-32004).
+    ///
+    /// Returned for JSON-RPC methods that assume the node owns the caller's
+    /// signing key (e.g. `eth_sendTransaction`). The private zone RPC never
+    /// holds caller keys — clients must sign the transaction locally and
+    /// submit it via `eth_sendRawTransaction` or `eth_sendRawTransactionSync`.
+    pub fn unsupported_account_method(method: &str) -> Self {
+        Self {
+            code: -32004,
+            message: format!(
+                "{method} is not supported: the private zone RPC does not hold \
+                 caller signing keys. Sign the transaction client-side and \
+                 submit it via eth_sendRawTransaction or eth_sendRawTransactionSync."
+            ),
+            data: None,
+        }
+    }
+
     /// Parse error — invalid JSON (-32700).
     pub fn parse_error(msg: impl Into<String>) -> Self {
         Self {
@@ -239,36 +257,102 @@ pub enum DepositState {
     Failed,
 }
 
+/// Query parameter for `zone_getWithdrawalStatus`.
+///
+/// Callers identify a withdrawal either by the zone L2 transaction hash that
+/// emitted `WithdrawalRequested` or by the global withdrawal index assigned by
+/// the outbox.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WithdrawalStatusQuery {
+    /// The zone L2 transaction hash that emitted `WithdrawalRequested`.
+    TxHash(B256),
+    /// The global withdrawal index assigned by `ZoneOutbox.requestWithdrawal`.
+    WithdrawalIndex(u64),
+}
+
+/// Lifecycle state returned by `zone_getWithdrawalStatus`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WithdrawalState {
+    /// `WithdrawalRequested` emitted on L2, no `BatchFinalized` yet.
+    Pending,
+    /// `BatchFinalized` emitted on L2, batch has not landed on L1.
+    Batched,
+    /// `BatchSubmitted` emitted on L1, withdrawal not yet processed.
+    Submitted,
+    /// `WithdrawalProcessed` emitted on L1 with `callbackSuccess = true`.
+    Processed,
+    /// `WithdrawalProcessed` emitted on L1 with `callbackSuccess = false`
+    /// but no accompanying `BounceBack`.
+    Failed,
+    /// `BounceBack` emitted on L1 — funds returned to `fallbackRecipient`.
+    Bounced,
+}
+
+/// Response payload for `zone_getWithdrawalStatus`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WithdrawalStatusResponse {
+    /// Global withdrawal index from `ZoneOutbox.WithdrawalRequested.withdrawalIndex`.
+    pub withdrawal_index: U64,
+    /// Zone L2 transaction hash that emitted `WithdrawalRequested`.
+    pub zone_tx_hash: B256,
+    /// Current lifecycle state.
+    pub status: WithdrawalState,
+    /// Token being withdrawn.
+    pub token: Address,
+    /// Withdrawn amount.
+    pub amount: U256,
+    /// L1 recipient of the withdrawal.
+    pub to: Address,
+    /// L1 fallback recipient used if the callback reverts.
+    pub fallback_recipient: Address,
+    /// Memo attached to the withdrawal.
+    pub memo: B256,
+    /// Zone L2 block number containing the `WithdrawalRequested` event.
+    pub zone_block_number: U64,
+    /// Zone-side `withdrawalBatchIndex` from `BatchFinalized`, if the batch was sealed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub withdrawal_batch_index: Option<U64>,
+    /// L1 portal queue slot assigned to this batch, if it has landed on L1.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub portal_slot: Option<U64>,
+    /// L1 transaction hash of the `submitBatch` that landed the batch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub l1_submit_batch_tx_hash: Option<B256>,
+    /// L1 transaction hash of the `processWithdrawal` that settled this withdrawal.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub l1_process_withdrawal_tx_hash: Option<B256>,
+    /// Whether the L1 callback executed without reverting, when applicable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub callback_success: Option<bool>,
+    /// Human-readable error description for terminal failure states.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 /// Settlement state of a sequencer batch returned by the batch explorer methods.
 ///
 /// The batch explorer methods (`zone_listBatches`, `zone_getBatch`,
 /// `zone_searchBatch`) only return public, aggregate-only batch metadata. They
-/// never include per-user data — that is the responsibility of the private,
-/// caller-scoped methods such as `zone_getDepositStatus`.
+/// never include per-user data; caller-scoped data belongs in private methods
+/// such as `zone_getDepositStatus` and `zone_getWithdrawalStatus`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum BatchStatus {
-    /// Batch was sealed by the sequencer but no `BatchSubmitted` event has been
-    /// observed on L1 yet. Reserved — listing endpoints only surface batches
-    /// already on L1, so this value is not emitted today.
+    /// Batch was sealed by the sequencer but no L1 `BatchSubmitted` event has
+    /// been observed yet. Reserved; listing endpoints only surface L1 batches.
     Pending,
-    /// `BatchSubmitted` was observed on L1 (the verifier accepted the proof and
-    /// the portal state advanced). For v1 — where the verifier accepts an empty
-    /// proof — this is the terminal happy-path state.
+    /// `BatchSubmitted` was observed on L1.
     Submitted,
-    /// Reserved for future use once meaningful proof verification is enforced
-    /// on L1. Not emitted today.
+    /// Reserved for future use once meaningful proof verification is enforced.
     Verified,
-    /// L1 settlement attempt failed (tx reverted or otherwise rejected).
-    /// Reserved — the current explorer reads only events emitted on success,
-    /// so this value is not emitted today.
+    /// L1 settlement attempt failed. Reserved; current explorer reads only
+    /// successful events.
     Failed,
 }
 
 /// Aggregate per-token settled volume for a batch.
-///
-/// Sums withdrawal amounts that the L1 portal exposed via aggregate hash-chain
-/// events. Never includes per-sender or per-recipient information.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BatchAggregateVolume {
@@ -280,10 +364,9 @@ pub struct BatchAggregateVolume {
 
 /// Aggregate-only summary of a single sequencer batch.
 ///
-/// **Privacy:** This response is intentionally caller-agnostic. It MUST NOT
-/// include owner-linked fields (user addresses, per-order ids, per-fill data,
-/// counterparty information). Anything that would distinguish one caller's
-/// experience from another's belongs in a private, scoped RPC method.
+/// **Privacy:** This response is intentionally caller-agnostic. It must not
+/// include owner-linked fields, per-order ids, per-fill data, or counterparty
+/// information.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BatchSummary {
@@ -295,45 +378,33 @@ pub struct BatchSummary {
     /// Last zone L2 block included in the batch, if resolvable.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub zone_block_to: Option<U64>,
-    /// Tempo L1 block number anchored by `submitBatch`'s `tempoBlockNumber`
-    /// argument (decoded from the L1 calldata).
+    /// Tempo L1 block number anchored by `submitBatch`.
     pub tempo_block_number: U64,
-    /// Withdrawal queue hash for this batch — the cryptographic anchor that
-    /// commits the batch's aggregated withdrawal set.
+    /// Withdrawal queue hash for this batch.
     pub root: B256,
-    /// Portal `blockHash` value before this batch was applied.
+    /// Portal `blockHash` before this batch was applied.
     pub prev_block_hash: B256,
-    /// Portal `blockHash` value after this batch was applied.
+    /// Portal `blockHash` after this batch was applied.
     pub next_block_hash: B256,
-    /// Settlement state. See [`BatchStatus`].
+    /// Settlement state.
     pub status: BatchStatus,
     /// Zone block timestamp at `zone_block_to`, when resolvable.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sealed_at: Option<U64>,
-    /// L1 block timestamp at `tempo_block_number` of the `BatchSubmitted` event.
+    /// L1 block timestamp of the `BatchSubmitted` event.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub settled_at: Option<U64>,
-    /// Aggregate count of orders included in the batch.
-    ///
-    /// "Order" granularity is not directly tracked on-chain at the zone layer;
-    /// today this surfaces the on-chain withdrawal count (which is a safe
-    /// public aggregate). Set to `0x0` when no withdrawals settle in the batch.
+    /// Aggregate order count. Reserved for higher-layer indexing; zero today.
     pub order_count: U64,
-    /// Aggregate count of fills. Reserved for future use once an explicit Fill
-    /// concept is plumbed through; the zone layer does not track fills today.
+    /// Aggregate fill count. Reserved for higher-layer indexing; zero today.
     pub fill_count: U64,
-    /// Aggregate trading pair tags settled in the batch. The zone layer does
-    /// not have pair semantics, so this is always empty here; higher-layer
-    /// services may populate it before exposing to the explorer UI.
+    /// Aggregate trading pair tags settled in the batch.
     pub aggregate_pairs: Vec<String>,
-    /// Aggregate per-token volume settled by the batch. Empty in v1 — the
-    /// portal exposes only the withdrawal hash chain, not a per-token sum.
+    /// Aggregate per-token volume settled by the batch.
     pub aggregate_volume: Vec<BatchAggregateVolume>,
-    /// L1 transaction hash that emitted `BatchSubmitted` for this batch.
+    /// L1 transaction hash that emitted `BatchSubmitted`.
     pub settlement_tx_hash: B256,
-    /// Reference to the settlement proof (e.g. `tee:<attestation-id>`), when
-    /// known. `None` in v1 because the verifier accepts an empty proof and no
-    /// attestation is recorded.
+    /// Reference to the settlement proof, when known.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proof_ref: Option<String>,
 }
@@ -342,12 +413,10 @@ pub struct BatchSummary {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ListBatchesParams {
-    /// Maximum number of summaries to return. Server caps at
-    /// [`LIST_BATCHES_MAX_LIMIT`]; defaults to [`LIST_BATCHES_DEFAULT_LIMIT`].
+    /// Maximum number of summaries to return.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
-    /// Batch number to page from — the server returns batches strictly older
-    /// than `cursor`. Omit to start from the newest batch.
+    /// Exclusive cursor batch number. Omit to start from the newest batch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor: Option<U64>,
 }
@@ -364,8 +433,7 @@ pub const LIST_BATCHES_MAX_LIMIT: u32 = 100;
 pub struct BatchListResponse {
     /// Returned batches in descending `batchNumber` order.
     pub batches: Vec<BatchSummary>,
-    /// Cursor for the next page. Pass this as `cursor` in the next call.
-    /// `None` when no older batches remain.
+    /// Cursor for the next page.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<U64>,
 }
@@ -379,6 +447,10 @@ pub enum MethodTier {
     Restricted,
     /// Disabled on the private RPC.
     Disabled,
+    /// The method assumes the node owns a caller signing key, which the
+    /// private zone RPC never does. Returns a clear pointer to the
+    /// `eth_sendRawTransaction` path.
+    UnsupportedAccountManagement,
 }
 
 /// Classify a JSON-RPC method into its access tier.
@@ -407,6 +479,7 @@ pub fn classify_method(method: &str) -> Option<MethodTier> {
         | "zone_getAuthorizationTokenInfo"
         | "zone_getZoneInfo"
         | "zone_getDepositStatus"
+        | "zone_getWithdrawalStatus"
         | "zone_listBatches"
         | "zone_getBatch"
         | "zone_searchBatch" => Some(MethodTier::Public),
@@ -427,11 +500,17 @@ pub fn classify_method(method: &str) -> Option<MethodTier> {
         // Transaction submission: public (caller sends their own txs)
         "eth_sendRawTransaction" | "eth_sendRawTransactionSync" => Some(MethodTier::Public),
 
+        // Unsupported account-management methods — the node never holds caller
+        // signing keys, so these always fail. Dispatch intercepts them with a
+        // dedicated error message pointing wallets at `eth_sendRawTransaction`.
+        "eth_sendTransaction" | "eth_signTransaction" => {
+            Some(MethodTier::UnsupportedAccountManagement)
+        }
+
         // Sequencer-only — raw state inspection and full block data bypass privacy scoping
         "eth_getCode"
         | "eth_getStorageAt"
         | "eth_getBlockReceipts"
-        | "eth_sendTransaction"
         | "debug_traceTransaction"
         | "debug_traceBlockByNumber"
         | "debug_traceBlockByHash"
