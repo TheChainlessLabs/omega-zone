@@ -529,6 +529,8 @@ impl ZoneTestNode {
             zone_poll_interval: std::time::Duration::from_secs(1),
             batch_interval: std::time::Duration::from_secs(60),
             withdrawal_poll_interval: std::time::Duration::from_secs(5),
+            // Integration tests rely on a permissive verifier accepting empty proofs.
+            proof_provider: std::sync::Arc::new(zone::EmptyLegacyProofProvider),
         });
 
         // Don't use .dev() — it spawns a LocalMiner that conflicts with ZoneEngine.
@@ -2249,6 +2251,9 @@ pub(crate) async fn spawn_sequencer(
         zone_rpc_url: zone.http_url().to_string(),
         zone_poll_interval: Duration::from_millis(500),
         batch_interval: Duration::from_millis(500),
+        // Integration tests run against a permissive in-process verifier that
+        // accepts empty proofs; mirror that with the legacy provider.
+        proof_provider: std::sync::Arc::new(zone::EmptyLegacyProofProvider),
     };
 
     zone::spawn_zone_sequencer(config, sequencer_signer).await

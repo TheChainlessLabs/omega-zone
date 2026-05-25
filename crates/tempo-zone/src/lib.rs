@@ -21,6 +21,7 @@ mod node;
 pub mod nonce_keys;
 pub mod payload;
 pub mod precompiles;
+pub mod proof;
 pub mod rpc;
 mod rpc_client;
 pub mod sequencer;
@@ -37,6 +38,12 @@ pub use l1::{
 pub use l1_state::{L1StateCache, PolicyCache, PolicyProvider};
 pub use node::{ZoneExecutorBuilder, ZoneNode, ZonePrivateRpcConfig, ZoneSequencerAddOnsConfig};
 pub use payload::{ZonePayloadAttributes, ZonePayloadTypes};
+pub use proof::{
+    BatchProofProvider, BatchPublicInputs, EmptyLegacyProofProvider, FailFastProofProvider,
+    PendingTeeAttestationProvider, PendingTeeProviderConfig, ProofBackend, ProofProviderError,
+    SharedProofProvider, StaticTeeProofProvider, TeeAttestation, TeeAttestationFormat,
+    TeeProofPayload, TeeVerifierConfig,
+};
 pub(crate) use rpc_client::rpc_connection_config;
 pub use sequencer::{ZoneSequencerConfig, ZoneSequencerHandle, spawn_zone_sequencer};
 pub use withdrawals::{SharedWithdrawalStore, WithdrawalProcessorConfig, WithdrawalStore};

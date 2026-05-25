@@ -73,7 +73,7 @@ use tracing::{debug, info};
 type ZoneNetworkPrimitives = BasicNetworkPrimitives<TempoPrimitives, TempoTxEnvelope>;
 
 /// Configuration for the sequencer background tasks
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ZoneSequencerAddOnsConfig {
     /// Sequencer private key signer for signing L1 transactions.
     pub sequencer_signer: PrivateKeySigner,
@@ -85,6 +85,23 @@ pub struct ZoneSequencerAddOnsConfig {
     pub batch_interval: Duration,
     /// How often the withdrawal processor polls the L1 queue.
     pub withdrawal_poll_interval: Duration,
+    /// Builds the `(verifierConfig, proof)` payload for each batch — see
+    /// [`crate::proof`] for the available backends. Defaults to fail-fast so a
+    /// node without an explicit choice cannot accidentally spam L1.
+    pub proof_provider: crate::proof::SharedProofProvider,
+}
+
+impl std::fmt::Debug for ZoneSequencerAddOnsConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ZoneSequencerAddOnsConfig")
+            .field("sequencer_signer", &self.sequencer_signer.address())
+            .field("zone_id", &self.zone_id)
+            .field("zone_poll_interval", &self.zone_poll_interval)
+            .field("batch_interval", &self.batch_interval)
+            .field("withdrawal_poll_interval", &self.withdrawal_poll_interval)
+            .field("proof_provider", &self.proof_provider.name())
+            .finish()
+    }
 }
 
 /// Configuration for the Zone private RPC server extension.
@@ -557,7 +574,12 @@ where
             .http_url()
             .expect("HTTP RPC server must be enabled for sequencer mode");
 
-        info!(target: "reth::cli", %sequencer_addr, "Starting sequencer background tasks");
+        info!(
+            target: "reth::cli",
+            %sequencer_addr,
+            proof_backend = config.proof_provider.name(),
+            "Starting sequencer background tasks"
+        );
         let sequencer_config = ZoneSequencerConfig {
             portal_address,
             l1_rpc_url,
@@ -569,6 +591,7 @@ where
             zone_rpc_url,
             zone_poll_interval: config.zone_poll_interval,
             batch_interval: config.batch_interval,
+            proof_provider: config.proof_provider.clone(),
         };
         let seq_handle = spawn_zone_sequencer(sequencer_config, config.sequencer_signer).await;
         info!(target: "reth::cli", "Sequencer tasks spawned");
