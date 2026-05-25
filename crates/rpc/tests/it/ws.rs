@@ -261,52 +261,62 @@ impl ZoneRpcApi for MockZoneRpcApi {
         })
     }
 
-    fn zone_get_my_orders(
-        &self,
-        _query: zone_rpc::darkpool::HistoryQuery,
-        _auth: zone_rpc::auth::AuthContext,
-    ) -> BoxFut<'_> {
-        Box::pin(async {
-            zone_rpc::types::to_raw(
-                &zone_rpc::darkpool::Page::<zone_rpc::darkpool::OrderEntry> {
-                    items: vec![],
-                    next_cursor: None,
-                },
-            )
+    fn zone_get_market_config(&self, _auth: zone_rpc::auth::AuthContext) -> BoxFut<'_> {
+        Box::pin(async move {
+            zone_rpc::types::to_raw(&serde_json::json!({
+                "darkpool": format!("{:#x}", Address::ZERO),
+                "markets": [],
+            }))
         })
     }
 
-    fn zone_get_my_fills(
+    fn zone_get_top_of_book(
         &self,
-        _query: zone_rpc::darkpool::HistoryQuery,
+        base: Address,
+        quote: Address,
         _auth: zone_rpc::auth::AuthContext,
     ) -> BoxFut<'_> {
-        Box::pin(async {
-            zone_rpc::types::to_raw(&zone_rpc::darkpool::Page::<zone_rpc::darkpool::FillEntry> {
-                items: vec![],
-                next_cursor: None,
-            })
+        Box::pin(async move {
+            zone_rpc::types::to_raw(&serde_json::json!({
+                "pair": "MOCK/MOCK",
+                "base": base,
+                "quote": quote,
+                "bid": null,
+                "ask": null,
+                "midpoint": null,
+                "spread": null,
+                "asOfBlock": "0x0",
+            }))
         })
     }
 
-    fn zone_get_my_transfers(
+    fn zone_get_midpoint_history(
         &self,
-        _query: zone_rpc::darkpool::TransferQuery,
+        base: Address,
+        quote: Address,
+        interval: String,
+        _limit: u32,
+        _cursor: Option<String>,
         _auth: zone_rpc::auth::AuthContext,
     ) -> BoxFut<'_> {
-        Box::pin(async {
-            zone_rpc::types::to_raw(
-                &zone_rpc::darkpool::Page::<zone_rpc::darkpool::TransferEntry> {
-                    items: vec![],
-                    next_cursor: None,
-                },
-            )
+        Box::pin(async move {
+            zone_rpc::types::to_raw(&serde_json::json!({
+                "pair": "MOCK/MOCK",
+                "base": base,
+                "quote": quote,
+                "interval": interval,
+                "samples": [],
+                "nextCursor": null,
+                "history": { "enabled": false, "reason": "mock" },
+            }))
         })
     }
 
-    fn zone_get_order(&self, _order_id: u128, _auth: zone_rpc::auth::AuthContext) -> BoxFut<'_> {
-        Box::pin(async { Ok(zone_rpc::types::raw_null()) })
-    }
+    stub!(zone_get_my_orders, _a: zone_rpc::darkpool::HistoryQuery, _b: zone_rpc::auth::AuthContext);
+    stub!(zone_get_my_fills, _a: zone_rpc::darkpool::HistoryQuery, _b: zone_rpc::auth::AuthContext);
+    stub!(zone_get_my_transfers, _a: zone_rpc::darkpool::TransferQuery, _b: zone_rpc::auth::AuthContext);
+    stub!(zone_get_order, _a: u128, _b: zone_rpc::auth::AuthContext);
+    stub!(zone_get_withdrawal_status, _a: zone_rpc::types::WithdrawalStatusQuery, _b: zone_rpc::auth::AuthContext);
 }
 
 // ---------------------------------------------------------------------------
