@@ -883,13 +883,18 @@ The connection is terminated when the authorization token expires. For keychain-
 
 ### Zone-Specific Methods
 
-The zone exposes three methods under the `zone_` namespace:
+The zone exposes the following methods under the `zone_` namespace:
 
 | Method | Access | Description |
 |--------|--------|-------------|
 | `zone_getAuthorizationTokenInfo` | Any authenticated | Returns the authenticated account address and token expiry |
 | `zone_getZoneInfo` | Any authenticated | Returns `zoneId`, `zoneTokens`, `sequencer`, `chainId` |
 | `zone_getDepositStatus(tempoBlockNumber)` | Scoped | Returns deposit processing status for the given Tempo block, filtered to deposits where the caller is the sender or recipient |
+| `zone_listBatches(params)` | Aggregate-only | Paginates the public batch history (newest first). `params` is `{ limit?, cursor? }`; `limit` defaults to 20 and is capped at 100. |
+| `zone_getBatch(batchNumber)` | Aggregate-only | Returns the public summary for a single batch by its portal `withdrawalBatchIndex`, or `null` when the batch is not yet on L1. |
+| `zone_searchBatch(query)` | Aggregate-only | Resolves a batch by decimal/hex batch number or by 32-byte L1 settlement tx hash. Returns the same shape as `zone_getBatch`. |
+
+The three batch-explorer methods (`zone_listBatches`, `zone_getBatch`, `zone_searchBatch`) are **aggregate-only**: they never return owner-linked fields (sender, recipient, counterparty, order id, fill id, etc.). All fields are derived from the L1 `ZonePortal.BatchSubmitted` event, the decoded L1 `submitBatch` calldata (`tempoBlockNumber`, `blockTransition`), and zone-block lookups by hash. Owner-linked activity belongs behind the existing scoped methods (`zone_getDepositStatus`, `eth_getTransactionByHash`, etc.).
 
 There are no state-changing methods via authorization token. Withdrawals require a signed transaction submitted via `eth_sendRawTransaction`.
 

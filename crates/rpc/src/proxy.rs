@@ -501,6 +501,34 @@ impl ZoneRpcApi for ProxyZoneRpc {
         })
     }
 
+    fn zone_list_batches(
+        &self,
+        _params: crate::types::ListBatchesParams,
+        _auth: AuthContext,
+    ) -> BoxFut<'_> {
+        Box::pin(async move {
+            Err(JsonRpcError::internal(
+                "zone-specific methods are not supported by the proxy backend",
+            ))
+        })
+    }
+
+    fn zone_get_batch(&self, _batch_number: u64, _auth: AuthContext) -> BoxFut<'_> {
+        Box::pin(async move {
+            Err(JsonRpcError::internal(
+                "zone-specific methods are not supported by the proxy backend",
+            ))
+        })
+    }
+
+    fn zone_search_batch(&self, _query: String, _auth: AuthContext) -> BoxFut<'_> {
+        Box::pin(async move {
+            Err(JsonRpcError::internal(
+                "zone-specific methods are not supported by the proxy backend",
+            ))
+        })
+    }
+
     fn zone_get_market_config(&self, _auth: AuthContext) -> BoxFut<'_> {
         Box::pin(async move {
             Err(JsonRpcError::internal(
@@ -529,6 +557,18 @@ impl ZoneRpcApi for ProxyZoneRpc {
         _interval: String,
         _limit: u32,
         _cursor: Option<String>,
+        _auth: AuthContext,
+    ) -> BoxFut<'_> {
+        Box::pin(async move {
+            Err(JsonRpcError::internal(
+                "zone-specific methods are not supported by the proxy backend",
+            ))
+        })
+    }
+
+    fn zone_get_withdrawal_status(
+        &self,
+        _query: crate::types::WithdrawalStatusQuery,
         _auth: AuthContext,
     ) -> BoxFut<'_> {
         Box::pin(async move {

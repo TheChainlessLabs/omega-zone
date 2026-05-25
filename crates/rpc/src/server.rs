@@ -405,6 +405,7 @@ mod tests {
         stub!(zone_get_market_config, _c: crate::auth::AuthContext);
         stub!(zone_get_top_of_book, _a: alloy_primitives::Address, _b: alloy_primitives::Address, _c: crate::auth::AuthContext);
         stub!(zone_get_midpoint_history, _a: alloy_primitives::Address, _b: alloy_primitives::Address, _c: String, _d: u32, _e: Option<String>, _f: crate::auth::AuthContext);
+        stub!(zone_get_withdrawal_status, _a: crate::types::WithdrawalStatusQuery, _c: crate::auth::AuthContext);
     }
 
     fn test_config() -> PrivateRpcConfig {

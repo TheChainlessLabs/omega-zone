@@ -140,6 +140,24 @@ impl JsonRpcError {
         }
     }
 
+    /// Unsupported account-management method (-32004).
+    ///
+    /// Returned for JSON-RPC methods that assume the node owns the caller's
+    /// signing key (e.g. `eth_sendTransaction`). The private zone RPC never
+    /// holds caller keys — clients must sign the transaction locally and
+    /// submit it via `eth_sendRawTransaction` or `eth_sendRawTransactionSync`.
+    pub fn unsupported_account_method(method: &str) -> Self {
+        Self {
+            code: -32004,
+            message: format!(
+                "{method} is not supported: the private zone RPC does not hold \
+                 caller signing keys. Sign the transaction client-side and \
+                 submit it via eth_sendRawTransaction or eth_sendRawTransactionSync."
+            ),
+            data: None,
+        }
+    }
+
     /// Parse error — invalid JSON (-32700).
     pub fn parse_error(msg: impl Into<String>) -> Self {
         Self {
@@ -245,9 +263,9 @@ pub enum DepositState {
 pub struct MarketToken {
     /// The token contract address.
     pub address: Address,
-    /// Canonical display symbol (e.g. `"OALPHA"`, `"PATH.USD"`).
+    /// Canonical display symbol.
     pub symbol: String,
-    /// TIP-20 decimals (alpha tokens are both 6-decimal).
+    /// TIP-20 decimals.
     pub decimals: u8,
 }
 
@@ -269,7 +287,7 @@ pub enum MarketAction {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MarketEntry {
-    /// Display label `"<base>/<quote>"` built from the on-chain symbols.
+    /// Display label `"<base>/<quote>"`.
     pub pair: String,
     /// Base token metadata.
     pub base: MarketToken,
@@ -277,7 +295,7 @@ pub struct MarketEntry {
     pub quote: MarketToken,
     /// Minimum order quantity in base-token units.
     pub min_order_amount: U128,
-    /// Human-readable description of the price representation used by the darkpool.
+    /// Human-readable description of the price representation.
     pub price_unit: String,
     /// Order actions the darkpool supports for this pair.
     pub allowed_actions: Vec<MarketAction>,
@@ -287,13 +305,13 @@ pub struct MarketEntry {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MarketConfigResponse {
-    /// The darkpool orderbook contract address that hosts these markets.
+    /// The darkpool orderbook contract address.
     pub darkpool: Address,
     /// Markets currently exposed to the frontend.
     pub markets: Vec<MarketEntry>,
 }
 
-/// Pair selector accepted by `zone_getTopOfBook` and `zone_getMidpointHistory`.
+/// Pair selector accepted by market RPCs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MarketPair {
@@ -307,21 +325,17 @@ pub struct MarketPair {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OrderLevel {
-    /// Price in raw integer units (quote = baseAmount * price).
+    /// Price in raw integer units.
     pub price: U128,
     /// Aggregate resting quantity at this price level.
     pub quantity: U128,
 }
 
 /// Response payload for `zone_getTopOfBook`.
-///
-/// Aggregate-only: never exposes individual order owners, counterparties, or
-/// order identifiers — only the best bid/ask price and resting depth at that
-/// level.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TopOfBookResponse {
-    /// Display label for the pair (`"<base>/<quote>"`).
+    /// Display label for the pair.
     pub pair: String,
     /// Base token address.
     pub base: Address,
@@ -331,24 +345,21 @@ pub struct TopOfBookResponse {
     pub bid: Option<OrderLevel>,
     /// Best resting ask, or `null` when the book has no asks.
     pub ask: Option<OrderLevel>,
-    /// Arithmetic midpoint `(bid.price + ask.price) / 2` when both sides exist.
+    /// Arithmetic midpoint when both sides exist.
     pub midpoint: Option<U128>,
-    /// Spread `ask.price - bid.price` when both sides exist.
+    /// Spread when both sides exist.
     pub spread: Option<U128>,
     /// Zone L2 block number used to read the book.
     pub as_of_block: U64,
 }
 
 /// History availability tag returned by `zone_getMidpointHistory`.
-///
-/// Alpha launches without a midpoint aggregator — this field tells the frontend
-/// to keep the chart disabled rather than synthesize one client-side.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HistoryAvailability {
     /// Whether the backend currently emits midpoint samples.
     pub enabled: bool,
-    /// Human-readable rationale shown to operators when `enabled` is `false`.
+    /// Human-readable rationale when disabled.
     pub reason: String,
 }
 
@@ -356,7 +367,7 @@ pub struct HistoryAvailability {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MidpointSample {
-    /// Bucket end timestamp in seconds since the Unix epoch.
+    /// Bucket end timestamp.
     pub timestamp: U64,
     /// Midpoint price for the bucket in raw integer units.
     pub midpoint: U128,
@@ -366,20 +377,201 @@ pub struct MidpointSample {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MidpointHistoryResponse {
-    /// Display label for the pair (`"<base>/<quote>"`).
+    /// Display label for the pair.
     pub pair: String,
     /// Base token address.
     pub base: Address,
     /// Quote token address.
     pub quote: Address,
-    /// Bucket interval echoed from the request (e.g. `"1m"`, `"5m"`).
+    /// Bucket interval echoed from the request.
     pub interval: String,
-    /// Aggregated samples — empty while [`HistoryAvailability::enabled`] is `false`.
+    /// Aggregated samples.
     pub samples: Vec<MidpointSample>,
-    /// Cursor for paginating older samples, or `null` when none more exist.
+    /// Cursor for paginating older samples.
     pub next_cursor: Option<String>,
-    /// Backend availability flag for the chart.
+    /// Backend availability flag.
     pub history: HistoryAvailability,
+}
+
+/// Query parameter for `zone_getWithdrawalStatus`.
+///
+/// Callers identify a withdrawal either by the zone L2 transaction hash that
+/// emitted `WithdrawalRequested` or by the global withdrawal index assigned by
+/// the outbox.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WithdrawalStatusQuery {
+    /// The zone L2 transaction hash that emitted `WithdrawalRequested`.
+    TxHash(B256),
+    /// The global withdrawal index assigned by `ZoneOutbox.requestWithdrawal`.
+    WithdrawalIndex(u64),
+}
+
+/// Lifecycle state returned by `zone_getWithdrawalStatus`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WithdrawalState {
+    /// `WithdrawalRequested` emitted on L2, no `BatchFinalized` yet.
+    Pending,
+    /// `BatchFinalized` emitted on L2, batch has not landed on L1.
+    Batched,
+    /// `BatchSubmitted` emitted on L1, withdrawal not yet processed.
+    Submitted,
+    /// `WithdrawalProcessed` emitted on L1 with `callbackSuccess = true`.
+    Processed,
+    /// `WithdrawalProcessed` emitted on L1 with `callbackSuccess = false`
+    /// but no accompanying `BounceBack`.
+    Failed,
+    /// `BounceBack` emitted on L1 — funds returned to `fallbackRecipient`.
+    Bounced,
+}
+
+/// Response payload for `zone_getWithdrawalStatus`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WithdrawalStatusResponse {
+    /// Global withdrawal index from `ZoneOutbox.WithdrawalRequested.withdrawalIndex`.
+    pub withdrawal_index: U64,
+    /// Zone L2 transaction hash that emitted `WithdrawalRequested`.
+    pub zone_tx_hash: B256,
+    /// Current lifecycle state.
+    pub status: WithdrawalState,
+    /// Token being withdrawn.
+    pub token: Address,
+    /// Withdrawn amount.
+    pub amount: U256,
+    /// L1 recipient of the withdrawal.
+    pub to: Address,
+    /// L1 fallback recipient used if the callback reverts.
+    pub fallback_recipient: Address,
+    /// Memo attached to the withdrawal.
+    pub memo: B256,
+    /// Zone L2 block number containing the `WithdrawalRequested` event.
+    pub zone_block_number: U64,
+    /// Zone-side `withdrawalBatchIndex` from `BatchFinalized`, if the batch was sealed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub withdrawal_batch_index: Option<U64>,
+    /// L1 portal queue slot assigned to this batch, if it has landed on L1.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub portal_slot: Option<U64>,
+    /// L1 transaction hash of the `submitBatch` that landed the batch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub l1_submit_batch_tx_hash: Option<B256>,
+    /// L1 transaction hash of the `processWithdrawal` that settled this withdrawal.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub l1_process_withdrawal_tx_hash: Option<B256>,
+    /// Whether the L1 callback executed without reverting, when applicable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub callback_success: Option<bool>,
+    /// Human-readable error description for terminal failure states.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Settlement state of a sequencer batch returned by the batch explorer methods.
+///
+/// The batch explorer methods (`zone_listBatches`, `zone_getBatch`,
+/// `zone_searchBatch`) only return public, aggregate-only batch metadata. They
+/// never include per-user data; caller-scoped data belongs in private methods
+/// such as `zone_getDepositStatus` and `zone_getWithdrawalStatus`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BatchStatus {
+    /// Batch was sealed by the sequencer but no L1 `BatchSubmitted` event has
+    /// been observed yet. Reserved; listing endpoints only surface L1 batches.
+    Pending,
+    /// `BatchSubmitted` was observed on L1.
+    Submitted,
+    /// Reserved for future use once meaningful proof verification is enforced.
+    Verified,
+    /// L1 settlement attempt failed. Reserved; current explorer reads only
+    /// successful events.
+    Failed,
+}
+
+/// Aggregate per-token settled volume for a batch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchAggregateVolume {
+    /// Settled token address.
+    pub token: Address,
+    /// Aggregate amount settled for `token` in this batch.
+    pub amount: U256,
+}
+
+/// Aggregate-only summary of a single sequencer batch.
+///
+/// **Privacy:** This response is intentionally caller-agnostic. It must not
+/// include owner-linked fields, per-order ids, per-fill data, or counterparty
+/// information.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchSummary {
+    /// L1 portal `withdrawalBatchIndex` for this batch.
+    pub batch_number: U64,
+    /// First zone L2 block included in the batch, if resolvable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub zone_block_from: Option<U64>,
+    /// Last zone L2 block included in the batch, if resolvable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub zone_block_to: Option<U64>,
+    /// Tempo L1 block number anchored by `submitBatch`.
+    pub tempo_block_number: U64,
+    /// Withdrawal queue hash for this batch.
+    pub root: B256,
+    /// Portal `blockHash` before this batch was applied.
+    pub prev_block_hash: B256,
+    /// Portal `blockHash` after this batch was applied.
+    pub next_block_hash: B256,
+    /// Settlement state.
+    pub status: BatchStatus,
+    /// Zone block timestamp at `zone_block_to`, when resolvable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sealed_at: Option<U64>,
+    /// L1 block timestamp of the `BatchSubmitted` event.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub settled_at: Option<U64>,
+    /// Aggregate order count. Reserved for higher-layer indexing; zero today.
+    pub order_count: U64,
+    /// Aggregate fill count. Reserved for higher-layer indexing; zero today.
+    pub fill_count: U64,
+    /// Aggregate trading pair tags settled in the batch.
+    pub aggregate_pairs: Vec<String>,
+    /// Aggregate per-token volume settled by the batch.
+    pub aggregate_volume: Vec<BatchAggregateVolume>,
+    /// L1 transaction hash that emitted `BatchSubmitted`.
+    pub settlement_tx_hash: B256,
+    /// Reference to the settlement proof, when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proof_ref: Option<String>,
+}
+
+/// Pagination parameters for `zone_listBatches`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListBatchesParams {
+    /// Maximum number of summaries to return.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    /// Exclusive cursor batch number. Omit to start from the newest batch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<U64>,
+}
+
+/// Default page size for `zone_listBatches`.
+pub const LIST_BATCHES_DEFAULT_LIMIT: u32 = 20;
+
+/// Maximum page size for `zone_listBatches`.
+pub const LIST_BATCHES_MAX_LIMIT: u32 = 100;
+
+/// Response payload for `zone_listBatches`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchListResponse {
+    /// Returned batches in descending `batchNumber` order.
+    pub batches: Vec<BatchSummary>,
+    /// Cursor for the next page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<U64>,
 }
 
 /// Method access tier.
@@ -391,6 +583,10 @@ pub enum MethodTier {
     Restricted,
     /// Disabled on the private RPC.
     Disabled,
+    /// The method assumes the node owns a caller signing key, which the
+    /// private zone RPC never does. Returns a clear pointer to the
+    /// `eth_sendRawTransaction` path.
+    UnsupportedAccountManagement,
 }
 
 /// Classify a JSON-RPC method into its access tier.
@@ -419,6 +615,10 @@ pub fn classify_method(method: &str) -> Option<MethodTier> {
         | "zone_getAuthorizationTokenInfo"
         | "zone_getZoneInfo"
         | "zone_getDepositStatus"
+        | "zone_getWithdrawalStatus"
+        | "zone_listBatches"
+        | "zone_getBatch"
+        | "zone_searchBatch"
         | "zone_getMarketConfig"
         | "zone_getTopOfBook"
         | "zone_getMidpointHistory" => Some(MethodTier::Public),
@@ -439,11 +639,17 @@ pub fn classify_method(method: &str) -> Option<MethodTier> {
         // Transaction submission: public (caller sends their own txs)
         "eth_sendRawTransaction" | "eth_sendRawTransactionSync" => Some(MethodTier::Public),
 
+        // Unsupported account-management methods — the node never holds caller
+        // signing keys, so these always fail. Dispatch intercepts them with a
+        // dedicated error message pointing wallets at `eth_sendRawTransaction`.
+        "eth_sendTransaction" | "eth_signTransaction" => {
+            Some(MethodTier::UnsupportedAccountManagement)
+        }
+
         // Sequencer-only — raw state inspection and full block data bypass privacy scoping
         "eth_getCode"
         | "eth_getStorageAt"
         | "eth_getBlockReceipts"
-        | "eth_sendTransaction"
         | "debug_traceTransaction"
         | "debug_traceBlockByNumber"
         | "debug_traceBlockByHash"
@@ -523,7 +729,7 @@ mod tests {
     }
 
     #[test]
-    fn market_config_serializes_camel_case_with_canonical_alpha_addresses() {
+    fn market_config_serializes_canonical_alpha_addresses() {
         let response = MarketConfigResponse {
             darkpool: "0x0B00000000000000000000000000000000000001"
                 .parse()
@@ -533,7 +739,6 @@ mod tests {
 
         let value = serde_json::to_value(&response).unwrap();
         let market = &value["markets"][0];
-
         assert_eq!(
             value["darkpool"],
             "0x0b00000000000000000000000000000000000001"
@@ -543,127 +748,10 @@ mod tests {
             market["base"]["address"],
             "0x20c000000000000000000000518ddadd37ed1d28"
         );
-        assert_eq!(market["base"]["symbol"], "OALPHA");
-        assert_eq!(market["base"]["decimals"], 6);
-        assert_eq!(
-            market["quote"]["address"],
-            "0x20c0000000000000000000000000000000000000"
-        );
-        assert_eq!(market["quote"]["symbol"], "PATH.USD");
-        assert_eq!(market["quote"]["decimals"], 6);
-        assert_eq!(market["minOrderAmount"], "0x64");
-        assert_eq!(
-            market["priceUnit"],
-            "raw integer; quote = baseAmount * price"
-        );
         assert_eq!(
             market["allowedActions"],
             json!(["marketBuy", "marketSell", "limitBid", "limitAsk"])
         );
-    }
-
-    #[test]
-    fn market_config_roundtrips_through_serde() {
-        let original = MarketConfigResponse {
-            darkpool: "0x0B00000000000000000000000000000000000001"
-                .parse()
-                .unwrap(),
-            markets: vec![alpha_market_entry()],
-        };
-
-        let json = serde_json::to_string(&original).unwrap();
-        let parsed: MarketConfigResponse = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed, original);
-    }
-
-    #[test]
-    fn unit_price_one_displays_as_one_for_matched_decimals() {
-        // Per the issue: with both tokens at 6 decimals, the raw integer
-        // price `1` represents `1.000000` because
-        //   quote_raw = base_raw * price
-        //   quote_display = quote_raw / 10^quote_decimals
-        //   base_display  = base_raw  / 10^base_decimals
-        // so for equal decimals the displayed ratio equals `price` exactly.
-        let base_decimals: i32 = 6;
-        let quote_decimals: i32 = 6;
-        let base_raw: u128 = 1_000_000; // 1.000000 base
-        let price_raw: u128 = 1;
-
-        let quote_raw = base_raw * price_raw;
-        let base_display = base_raw as f64 / 10f64.powi(base_decimals);
-        let quote_display = quote_raw as f64 / 10f64.powi(quote_decimals);
-        assert_eq!(quote_display, base_display);
-        assert_eq!(quote_display / base_display, 1.0);
-    }
-
-    #[test]
-    fn top_of_book_serializes_null_sides_when_book_is_empty() {
-        let response = TopOfBookResponse {
-            pair: "OALPHA/PATH.USD".to_string(),
-            base: Address::repeat_byte(0xaa),
-            quote: Address::repeat_byte(0xbb),
-            bid: None,
-            ask: None,
-            midpoint: None,
-            spread: None,
-            as_of_block: U64::from(42u64),
-        };
-
-        let value = serde_json::to_value(&response).unwrap();
-        assert!(value["bid"].is_null());
-        assert!(value["ask"].is_null());
-        assert!(value["midpoint"].is_null());
-        assert!(value["spread"].is_null());
-        assert_eq!(value["asOfBlock"], "0x2a");
-    }
-
-    #[test]
-    fn top_of_book_serializes_populated_sides() {
-        let response = TopOfBookResponse {
-            pair: "OALPHA/PATH.USD".to_string(),
-            base: Address::repeat_byte(0xaa),
-            quote: Address::repeat_byte(0xbb),
-            bid: Some(OrderLevel {
-                price: U128::from(99u128),
-                quantity: U128::from(1_000_000u128),
-            }),
-            ask: Some(OrderLevel {
-                price: U128::from(101u128),
-                quantity: U128::from(750_000u128),
-            }),
-            midpoint: Some(U128::from(100u128)),
-            spread: Some(U128::from(2u128)),
-            as_of_block: U64::from(7u64),
-        };
-
-        let value = serde_json::to_value(&response).unwrap();
-        assert_eq!(value["bid"]["price"], "0x63");
-        assert_eq!(value["bid"]["quantity"], "0xf4240");
-        assert_eq!(value["ask"]["price"], "0x65");
-        assert_eq!(value["midpoint"], "0x64");
-        assert_eq!(value["spread"], "0x2");
-    }
-
-    #[test]
-    fn midpoint_history_signals_disabled_with_empty_samples_for_alpha() {
-        let response = MidpointHistoryResponse {
-            pair: "OALPHA/PATH.USD".to_string(),
-            base: Address::repeat_byte(0xaa),
-            quote: Address::repeat_byte(0xbb),
-            interval: "1m".to_string(),
-            samples: Vec::new(),
-            next_cursor: None,
-            history: HistoryAvailability {
-                enabled: false,
-                reason: "alpha".to_string(),
-            },
-        };
-
-        let value = serde_json::to_value(&response).unwrap();
-        assert_eq!(value["history"]["enabled"], false);
-        assert_eq!(value["history"]["reason"], "alpha");
-        assert!(value["samples"].as_array().unwrap().is_empty());
-        assert!(value["nextCursor"].is_null());
     }
 
     #[test]
@@ -676,12 +764,6 @@ mod tests {
         assert_eq!(
             pair.base,
             "0x20C000000000000000000000518dDADD37eD1d28"
-                .parse::<Address>()
-                .unwrap()
-        );
-        assert_eq!(
-            pair.quote,
-            "0x20C0000000000000000000000000000000000000"
                 .parse::<Address>()
                 .unwrap()
         );

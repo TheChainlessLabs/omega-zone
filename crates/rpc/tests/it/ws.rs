@@ -311,6 +311,8 @@ impl ZoneRpcApi for MockZoneRpcApi {
             }))
         })
     }
+
+    stub!(zone_get_withdrawal_status, _a: zone_rpc::types::WithdrawalStatusQuery, _b: zone_rpc::auth::AuthContext);
 }
 
 // ---------------------------------------------------------------------------
