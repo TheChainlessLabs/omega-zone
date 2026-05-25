@@ -17,7 +17,7 @@ use crate::{
     subscription::BoxWsSubscriptionFut,
     types::{
         BoxEyreFut, BoxFut, JsonRpcError, JsonRpcRequest, JsonRpcResponse, MethodTier,
-        classify_method,
+        WithdrawalStatusQuery, classify_method,
     },
 };
 
@@ -189,6 +189,16 @@ pub trait ZoneRpcApi: Send + Sync + 'static {
     /// `zone_getDepositStatus(tempoBlockNumber)` — returns per-caller deposit
     /// processing state for a Tempo L1 block.
     fn zone_get_deposit_status(&self, tempo_block_number: u64, auth: AuthContext) -> BoxFut<'_>;
+
+    /// `zone_getWithdrawalStatus(txHashOrWithdrawalIndex)` — returns lifecycle
+    /// status of the caller's own withdrawal, joining zone L2 outbox events with
+    /// L1 portal settlement events. Returns `null` if the withdrawal does not
+    /// exist or is not owned by the authenticated caller.
+    fn zone_get_withdrawal_status(
+        &self,
+        query: WithdrawalStatusQuery,
+        auth: AuthContext,
+    ) -> BoxFut<'_>;
 }
 
 /// Deserialize JSON-RPC params, returning an error response on failure.
@@ -342,6 +352,7 @@ pub async fn dispatch(
             api.zone_get_zone_info(auth.clone()).await,
         ),
         "zone_getDepositStatus" => handle_zone_get_deposit_status(id, raw, auth, api).await,
+        "zone_getWithdrawalStatus" => handle_zone_get_withdrawal_status(id, raw, auth, api).await,
         _ => {
             // Method is whitelisted but not yet implemented via direct API
             JsonRpcResponse::error(
@@ -754,6 +765,55 @@ async fn handle_zone_get_deposit_status(
     )
 }
 
+/// Handle `zone_getWithdrawalStatus(txHashOrWithdrawalIndex)`.
+///
+/// Accepts a single hex-encoded string that is parsed either as a 32-byte
+/// transaction hash or, failing that, as a `U64` quantity withdrawal index.
+async fn handle_zone_get_withdrawal_status(
+    id: Value,
+    raw: &str,
+    auth: &AuthContext,
+    api: &dyn ZoneRpcApi,
+) -> JsonRpcResponse {
+    let (param,) = match parse_params::<(String,)>(raw, &id, "expected [txHashOrWithdrawalIndex]") {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+
+    let query = match parse_withdrawal_status_query(&param) {
+        Ok(q) => q,
+        Err(err) => return JsonRpcResponse::error(id, err),
+    };
+
+    api_result(
+        id,
+        "zone_getWithdrawalStatus",
+        api.zone_get_withdrawal_status(query, auth.clone()).await,
+    )
+}
+
+/// Parse a `zone_getWithdrawalStatus` parameter into either a tx hash or a
+/// withdrawal index.
+///
+/// A 32-byte hex string (`0x` + 64 hex chars) is treated as a transaction hash.
+/// Any other valid hex quantity is treated as a `U64` withdrawal index.
+fn parse_withdrawal_status_query(param: &str) -> Result<WithdrawalStatusQuery, JsonRpcError> {
+    let stripped = param
+        .strip_prefix("0x")
+        .or_else(|| param.strip_prefix("0X"));
+    if let Some(hex) = stripped
+        && hex.len() == 64
+        && hex.chars().all(|c| c.is_ascii_hexdigit())
+        && let Ok(hash) = B256::from_str(param)
+    {
+        return Ok(WithdrawalStatusQuery::TxHash(hash));
+    }
+
+    U64::from_str(param)
+        .map(|v| WithdrawalStatusQuery::WithdrawalIndex(v.to()))
+        .map_err(|_| JsonRpcError::invalid_params("expected [txHashOrWithdrawalIndex]"))
+}
+
 /// Zones do not have a real pending block, so treat `pending` as `latest`.
 fn normalize_block_number(number: BlockNumberOrTag) -> BlockNumberOrTag {
     if number.is_pending() {
@@ -765,7 +825,10 @@ fn normalize_block_number(number: BlockNumberOrTag) -> BlockNumberOrTag {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicU64, Ordering},
+    };
 
     use alloy_primitives::Address;
     use serde_json::json;
@@ -775,12 +838,14 @@ mod tests {
 
     struct MockZoneRpcApi {
         last_tempo_block_number: AtomicU64,
+        last_withdrawal_query: Mutex<Option<WithdrawalStatusQuery>>,
     }
 
     impl Default for MockZoneRpcApi {
         fn default() -> Self {
             Self {
                 last_tempo_block_number: AtomicU64::new(0),
+                last_withdrawal_query: Mutex::new(None),
             }
         }
     }
@@ -854,6 +919,22 @@ mod tests {
                     "zoneProcessedThrough": alloy_primitives::U64::from(tempo_block_number),
                     "processed": true,
                     "deposits": [],
+                }))
+            })
+        }
+
+        fn zone_get_withdrawal_status(
+            &self,
+            query: WithdrawalStatusQuery,
+            _auth: AuthContext,
+        ) -> BoxFut<'_> {
+            self.last_withdrawal_query
+                .lock()
+                .expect("mock lock poisoned")
+                .replace(query);
+            Box::pin(async move {
+                to_raw(&json!({
+                    "status": "pending",
                 }))
             })
         }
@@ -931,6 +1012,91 @@ mod tests {
         let api = MockZoneRpcApi::default();
 
         let resp = dispatch(&request("zone_getDepositStatus", json!([7])), &auth(), &api).await;
+        assert!(resp.result.is_none());
+        assert_eq!(resp.error.as_ref().unwrap().code, -32602);
+    }
+
+    #[tokio::test]
+    async fn dispatches_zone_get_withdrawal_status_for_tx_hash() {
+        let api = MockZoneRpcApi::default();
+        let hash = B256::repeat_byte(0x42);
+
+        let resp = dispatch(
+            &request("zone_getWithdrawalStatus", json!([format!("{:#x}", hash)])),
+            &auth(),
+            &api,
+        )
+        .await;
+        assert!(resp.error.is_none());
+        assert_eq!(
+            *api.last_withdrawal_query.lock().unwrap(),
+            Some(WithdrawalStatusQuery::TxHash(hash))
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatches_zone_get_withdrawal_status_for_index() {
+        let api = MockZoneRpcApi::default();
+
+        let resp = dispatch(
+            &request("zone_getWithdrawalStatus", json!(["0x2a"])),
+            &auth(),
+            &api,
+        )
+        .await;
+        assert!(resp.error.is_none());
+        assert_eq!(
+            *api.last_withdrawal_query.lock().unwrap(),
+            Some(WithdrawalStatusQuery::WithdrawalIndex(42))
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_non_hex_zone_get_withdrawal_status_param() {
+        let api = MockZoneRpcApi::default();
+
+        let resp = dispatch(
+            &request("zone_getWithdrawalStatus", json!(["not-a-hex"])),
+            &auth(),
+            &api,
+        )
+        .await;
+        assert!(resp.result.is_none());
+        let err = resp.error.expect("invalid params should error");
+        assert_eq!(err.code, -32602);
+        assert_eq!(err.message, "expected [txHashOrWithdrawalIndex]");
+    }
+
+    #[test]
+    fn parses_tx_hash_for_withdrawal_status_query() {
+        let hash = B256::repeat_byte(0x42);
+        let parsed = parse_withdrawal_status_query(&format!("{:#x}", hash)).unwrap();
+        assert_eq!(parsed, WithdrawalStatusQuery::TxHash(hash));
+    }
+
+    #[test]
+    fn parses_short_hex_quantity_as_withdrawal_index() {
+        let parsed = parse_withdrawal_status_query("0x2a").unwrap();
+        assert_eq!(parsed, WithdrawalStatusQuery::WithdrawalIndex(42));
+    }
+
+    #[test]
+    fn rejects_non_hex_withdrawal_status_query() {
+        let err = parse_withdrawal_status_query("not-a-hex").unwrap_err();
+        assert_eq!(err.code, -32602);
+        assert_eq!(err.message, "expected [txHashOrWithdrawalIndex]");
+    }
+
+    #[tokio::test]
+    async fn rejects_numeric_zone_get_withdrawal_status_param() {
+        let api = MockZoneRpcApi::default();
+
+        let resp = dispatch(
+            &request("zone_getWithdrawalStatus", json!([7])),
+            &auth(),
+            &api,
+        )
+        .await;
         assert!(resp.result.is_none());
         assert_eq!(resp.error.as_ref().unwrap().code, -32602);
     }

@@ -500,6 +500,18 @@ impl ZoneRpcApi for ProxyZoneRpc {
             ))
         })
     }
+
+    fn zone_get_withdrawal_status(
+        &self,
+        _query: crate::types::WithdrawalStatusQuery,
+        _auth: AuthContext,
+    ) -> BoxFut<'_> {
+        Box::pin(async move {
+            Err(JsonRpcError::internal(
+                "zone-specific methods are not supported by the proxy backend",
+            ))
+        })
+    }
 }
 
 #[cfg(test)]

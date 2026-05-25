@@ -239,6 +239,80 @@ pub enum DepositState {
     Failed,
 }
 
+/// Query parameter for `zone_getWithdrawalStatus`.
+///
+/// Callers identify a withdrawal either by the zone L2 transaction hash that
+/// emitted `WithdrawalRequested` or by the global withdrawal index assigned by
+/// the outbox.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WithdrawalStatusQuery {
+    /// The zone L2 transaction hash that emitted `WithdrawalRequested`.
+    TxHash(B256),
+    /// The global withdrawal index assigned by `ZoneOutbox.requestWithdrawal`.
+    WithdrawalIndex(u64),
+}
+
+/// Lifecycle state returned by `zone_getWithdrawalStatus`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WithdrawalState {
+    /// `WithdrawalRequested` emitted on L2, no `BatchFinalized` yet.
+    Pending,
+    /// `BatchFinalized` emitted on L2, batch has not landed on L1.
+    Batched,
+    /// `BatchSubmitted` emitted on L1, withdrawal not yet processed.
+    Submitted,
+    /// `WithdrawalProcessed` emitted on L1 with `callbackSuccess = true`.
+    Processed,
+    /// `WithdrawalProcessed` emitted on L1 with `callbackSuccess = false`
+    /// but no accompanying `BounceBack`.
+    Failed,
+    /// `BounceBack` emitted on L1 — funds returned to `fallbackRecipient`.
+    Bounced,
+}
+
+/// Response payload for `zone_getWithdrawalStatus`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WithdrawalStatusResponse {
+    /// Global withdrawal index from `ZoneOutbox.WithdrawalRequested.withdrawalIndex`.
+    pub withdrawal_index: U64,
+    /// Zone L2 transaction hash that emitted `WithdrawalRequested`.
+    pub zone_tx_hash: B256,
+    /// Current lifecycle state.
+    pub status: WithdrawalState,
+    /// Token being withdrawn.
+    pub token: Address,
+    /// Withdrawn amount.
+    pub amount: U256,
+    /// L1 recipient of the withdrawal.
+    pub to: Address,
+    /// L1 fallback recipient used if the callback reverts.
+    pub fallback_recipient: Address,
+    /// Memo attached to the withdrawal.
+    pub memo: B256,
+    /// Zone L2 block number containing the `WithdrawalRequested` event.
+    pub zone_block_number: U64,
+    /// Zone-side `withdrawalBatchIndex` from `BatchFinalized`, if the batch was sealed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub withdrawal_batch_index: Option<U64>,
+    /// L1 portal queue slot assigned to this batch, if it has landed on L1.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub portal_slot: Option<U64>,
+    /// L1 transaction hash of the `submitBatch` that landed the batch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub l1_submit_batch_tx_hash: Option<B256>,
+    /// L1 transaction hash of the `processWithdrawal` that settled this withdrawal.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub l1_process_withdrawal_tx_hash: Option<B256>,
+    /// Whether the L1 callback executed without reverting, when applicable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub callback_success: Option<bool>,
+    /// Human-readable error description for terminal failure states.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 /// Method access tier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MethodTier {
@@ -275,7 +349,8 @@ pub fn classify_method(method: &str) -> Option<MethodTier> {
         | "web3_sha3"
         | "zone_getAuthorizationTokenInfo"
         | "zone_getZoneInfo"
-        | "zone_getDepositStatus" => Some(MethodTier::Public),
+        | "zone_getDepositStatus"
+        | "zone_getWithdrawalStatus" => Some(MethodTier::Public),
 
         // Fetch-then-check: public but redacted based on caller identity
         "eth_getTransactionByHash"
