@@ -563,3 +563,8 @@ The xtasks use this Moderato `ZoneFactory` as their built-in default: `create-zo
 | `just check-balance-private <name>` | Check balance via the private RPC (auto-generates auth token) |
 | `just zone-info <id-or-portal>` | Fetch zone metadata from ZoneFactory |
 | `just demo-blacklist [amount]` | End-to-end TIP-20 + TIP-403 blacklist lifecycle demo |
+| `just alpha-setup` | Deterministic private-alpha bring-up: enable OALPHA, prefund + deposit USER and MAKER, seed bid/ask, print state. See [docs/ALPHA.md](ALPHA.md). |
+| `just alpha-state` | Print the private-alpha frontend state: portal enablement, USER + MAKER balances, best bid/ask |
+| `just alpha-resolve-token <alias>` | Resolve a private-alpha token alias (`oalpha`, `pathusd`) to its address. Refuses the misleading `alphausd` L1 alias. |
+
+For the private-alpha portal specifically, **use the recipes in the `[alpha]` group, not the generic `enable-token` / `send-deposit` / `max-approve-portal` recipes**. The alpha recipes pin the alpha portal, OALPHA, and darkpool addresses, and reject the `alphausd` alias which would silently retarget the wrong L1 token. See [docs/ALPHA.md](ALPHA.md).
