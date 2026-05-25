@@ -111,6 +111,25 @@ The portal verifies `tempoBlockNumber` via EIP-2935 (last 8192 block hashes).
 If the zone falls behind, the submitter switches to **ancestry mode** with a
 header chain linking back to the target block.
 
+### Proof backend
+
+`verifierConfig` / `proof` bytes are produced by a `BatchProofProvider` (see
+[`src/proof.rs`](src/proof.rs)). The CLI flag `--proof.backend` selects:
+
+- `fail-fast` (default) — refuses to submit anything. Safe for misconfigured
+  nodes.
+- `empty-legacy` — pre-TEE behaviour. Only works against permissive dev
+  verifiers (devnet, in-process integration tests).
+- `tee` — wires the TEE attestation provider. Until the enclave runtime is
+  connected it logs the proposed payload and errors fail-closed.
+
+End-to-end TEE design, open Tempo questions, and the on-wire layout are
+documented in [`docs/TEE_PROOF.md`](../../docs/TEE_PROOF.md). First-batch and
+stuck-zone runbooks live in
+[`docs/RUNBOOK_FIRST_BATCH.md`](../../docs/RUNBOOK_FIRST_BATCH.md). The
+read-only diagnostic command is `cargo run -p tempo-xtask --
+settlement-preflight ...`.
+
 ## Withdrawals
 
 1. Users call `ZoneOutbox.requestWithdrawal()` on the zone.

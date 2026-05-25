@@ -83,6 +83,7 @@ eyre.workspace = true
 serde = { workspace = true, features = ["derive"] }
 futures.workspace = true
 parking_lot.workspace = true
+thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 

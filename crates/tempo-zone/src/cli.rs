@@ -12,7 +12,7 @@ use tempo_chainspec::spec::{TempoChainSpec, TempoChainSpecParser};
 
 use crate::{
     ZoneNode, ZonePrivateRpcConfig, ZoneSequencerAddOnsConfig, evm::ZoneEvmConfig,
-    rpc::auth::DEFAULT_MAX_AUTH_TOKEN_VALIDITY_SECS,
+    proof::ProofBackend, rpc::auth::DEFAULT_MAX_AUTH_TOKEN_VALIDITY_SECS,
 };
 
 const MAX_LOGS_PER_RESPONSE: u64 = 1_000_000;
@@ -87,6 +87,7 @@ impl ZoneCli {
                     withdrawal_poll_interval: Duration::from_secs(
                         args.withdrawal_poll_interval_secs,
                     ),
+                    proof_provider: args.proof_backend.into_provider(),
                 });
             }
 
@@ -187,6 +188,18 @@ pub struct ZoneArgs {
     /// withdrawal batches.
     #[arg(long = "sequencer", env = "SEQUENCER")]
     pub enable_sequencer: bool,
+
+    /// Proof backend used to build `verifierConfig` / `proof` bytes for each
+    /// batch. `fail-fast` (default) refuses to submit until an operator opts
+    /// in; `empty-legacy` keeps the pre-TEE behaviour for permissive dev
+    /// verifiers; `tee` wires the (still-incomplete) TEE attestation provider
+    /// so logs surface the commitment that *would* be signed.
+    #[arg(
+        long = "proof.backend",
+        env = "PROOF_BACKEND",
+        default_value = "fail-fast"
+    )]
+    pub proof_backend: ProofBackend,
 }
 
 fn prepend_log_filter(filter: &mut String, directives: &str) {

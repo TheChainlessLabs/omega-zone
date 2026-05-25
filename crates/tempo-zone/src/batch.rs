@@ -7,11 +7,15 @@
 //! [`BatchData`] is produced by the zone block builder (not implemented here) and
 //! sent to the submitter via a `tokio::sync::mpsc` channel.
 //!
-//! # POC limitations
+//! # Proof generation
 //!
-//! Proof validation is currently **skipped**: both `verifierConfig` and `proof`
-//! are submitted as empty bytes. The L1 verifier contract must be configured to
-//! accept empty proofs for this to work.
+//! `verifierConfig` and `proof` bytes are produced by a [`BatchProofProvider`]
+//! supplied at construction time. The submitter calls the provider once per batch
+//! and surfaces any error before sending the L1 transaction, so a misconfigured
+//! prover keeps the portal state intact. The default
+//! [`FailFastProofProvider`](crate::proof::FailFastProofProvider) refuses to
+//! submit anything until the operator picks a backend explicitly — see
+//! [`docs/TEE_PROOF.md`](../../docs/TEE_PROOF.md).
 //!
 //! # Anchor modes
 //!
@@ -26,9 +30,12 @@
 //! [`EIP2935_HISTORY_WINDOW`] (e.g. due to timing) by falling back to ancestry
 //! mode — a recent anchor block plus a parent-hash header chain.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
 
-use crate::abi::{self, BlockTransition, DepositQueueTransition, ZoneOutbox, ZonePortal};
+use crate::{
+    abi::{self, BlockTransition, DepositQueueTransition, ZoneOutbox, ZonePortal},
+    proof::{BatchPublicInputs, FailFastProofProvider, SharedProofProvider, TeeProofPayload},
+};
 use alloy_consensus::Transaction;
 use alloy_network::ReceiptResponse;
 use alloy_primitives::{Address, B256, Bytes, U256};
@@ -89,7 +96,8 @@ pub struct BatchData {
 /// Submits zone batches to the ZonePortal contract on Tempo L1.
 ///
 /// Holds a contract instance pointing at the portal, backed by a shared
-/// [`DynProvider`] with the sequencer's signing wallet.
+/// [`DynProvider`] with the sequencer's signing wallet, plus a
+/// [`BatchProofProvider`] that produces the verifier payload for each batch.
 pub struct BatchSubmitter {
     /// ZonePortal contract address on Tempo L1 (used in tracing spans).
     portal_address: Address,
@@ -105,16 +113,34 @@ pub struct BatchSubmitter {
     genesis_tempo_block_number: u64,
     /// Concurrency for pipelined L1 header fetching in ancestry mode.
     l1_fetch_concurrency: usize,
+    /// Produces the `(verifierConfig, proof)` payload for each batch.
+    proof_provider: SharedProofProvider,
 }
 
 impl BatchSubmitter {
-    /// Create a new batch submitter from a shared L1 provider.
-    ///
-    /// The provider must already include the sequencer wallet for signing.
+    /// Create a new batch submitter with the default
+    /// [`FailFastProofProvider`] — no batches will be submitted until the
+    /// operator opts into a real backend via
+    /// [`Self::with_proof_provider`] or [`Self::new_with_proof_provider`].
     pub fn new(
         portal_address: Address,
         l1_provider: DynProvider<TempoNetwork>,
         genesis_tempo_block_number: u64,
+    ) -> Self {
+        Self::new_with_proof_provider(
+            portal_address,
+            l1_provider,
+            genesis_tempo_block_number,
+            Arc::new(FailFastProofProvider),
+        )
+    }
+
+    /// Create a new batch submitter with an explicit proof provider.
+    pub fn new_with_proof_provider(
+        portal_address: Address,
+        l1_provider: DynProvider<TempoNetwork>,
+        genesis_tempo_block_number: u64,
+        proof_provider: SharedProofProvider,
     ) -> Self {
         let portal = ZonePortal::new(portal_address, l1_provider.clone());
         Self {
@@ -123,7 +149,19 @@ impl BatchSubmitter {
             portal,
             genesis_tempo_block_number,
             l1_fetch_concurrency: 16,
+            proof_provider,
         }
+    }
+
+    /// Swap the proof provider on an existing submitter.
+    pub fn with_proof_provider(mut self, provider: SharedProofProvider) -> Self {
+        self.proof_provider = provider;
+        self
+    }
+
+    /// Currently-installed proof provider — exposed for diagnostics and tests.
+    pub fn proof_provider(&self) -> &SharedProofProvider {
+        &self.proof_provider
     }
 
     /// Submit a batch to the ZonePortal on Tempo L1.
@@ -140,15 +178,18 @@ impl BatchSubmitter {
     /// [`EIP2935_HISTORY_WINDOW`] — use [`classify_anchor_gap`](Self::classify_anchor_gap)
     /// first and split via stepping if the gap is too large.
     ///
-    /// `verifierConfig` and `proof` are set to empty bytes — the verifier
-    /// contract must be configured to accept empty proofs.
-    // TODO: pass real proof bytes once proof generation is implemented.
+    /// `verifierConfig` and `proof` are produced by the configured
+    /// [`BatchProofProvider`]. The default
+    /// [`FailFastProofProvider`](crate::proof::FailFastProofProvider) errors
+    /// before any L1 transaction is signed, so a misconfigured node cannot spam
+    /// the portal with reverting calls.
     #[instrument(skip_all, fields(
         portal = %self.portal_address,
         tempo_block = batch.tempo_block_number,
         prev_block_hash = %batch.prev_block_hash,
         next_block_hash = %batch.next_block_hash,
         withdrawal_queue_hash = %batch.withdrawal_queue_hash,
+        proof_provider = self.proof_provider.name(),
     ))]
     pub async fn submit_batch(&self, batch: &BatchData) -> Result<B256> {
         if batch.tempo_block_number < self.genesis_tempo_block_number {
@@ -177,32 +218,59 @@ impl BatchSubmitter {
 
         let anchor_mode = self.resolve_anchor_mode(batch.tempo_block_number).await?;
         let recent_tempo_block_number = anchor_mode.recent_block_number();
-        let (current_l1_block, portal_block_hash) = tokio::join!(
-            self.l1_provider.get_block_number(),
-            self.read_portal_block_hash(),
-        );
-        let current_l1_block = current_l1_block?;
-        let portal_block_hash = portal_block_hash?;
 
-        info!(
-            ?anchor_mode,
-            recent_tempo_block_number,
-            current_l1_block,
-            portal_block_hash = %portal_block_hash,
-            batch_prev_block_hash = %batch.prev_block_hash,
-            nonce_key = ?SUBMIT_BATCH_NONCE_KEY,
-            "Preparing submitBatch to ZonePortal on L1"
-        );
+        // Preflight: gather portal state and warn on mismatches before signing.
+        let preflight = self
+            .preflight_report(batch, recent_tempo_block_number)
+            .await?;
+        preflight.log("submitBatch");
 
-        if portal_block_hash != batch.prev_block_hash {
+        if preflight.portal_block_hash != batch.prev_block_hash {
             warn!(
-                portal_block_hash = %portal_block_hash,
+                portal_block_hash = %preflight.portal_block_hash,
                 batch_prev_block_hash = %batch.prev_block_hash,
                 "Portal block hash does not match batch prev hash before submitBatch"
             );
         }
+        if preflight.last_processed_deposit_number != batch.prev_deposit_number {
+            warn!(
+                portal_last_processed = preflight.last_processed_deposit_number,
+                batch_prev_deposit_number = batch.prev_deposit_number,
+                "Portal lastProcessedDepositNumber does not match batch prev_deposit_number"
+            );
+        }
 
-        info!(?anchor_mode, "Submitting batch to ZonePortal on L1");
+        let public_inputs = preflight.public_inputs(batch, recent_tempo_block_number);
+        info!(
+            commitment = %public_inputs.commitment(),
+            expected_withdrawal_batch_index = public_inputs.expected_withdrawal_batch_index,
+            sequencer = %public_inputs.sequencer_address,
+            nonce_key = ?SUBMIT_BATCH_NONCE_KEY,
+            "Computed batch public-input commitment"
+        );
+
+        let TeeProofPayload {
+            verifier_config,
+            proof,
+        } = self
+            .proof_provider
+            .build_proof(&public_inputs)
+            .await
+            .map_err(|err| {
+                eyre::eyre!(
+                    "proof provider `{}` refused to produce a proof for batch \
+                     tempo_block_number={}: {err}",
+                    self.proof_provider.name(),
+                    batch.tempo_block_number
+                )
+            })?;
+
+        info!(
+            verifier_config_len = verifier_config.len(),
+            proof_len = proof.len(),
+            ?anchor_mode,
+            "Submitting batch to ZonePortal on L1"
+        );
 
         let pending = self
             .portal
@@ -212,8 +280,8 @@ impl BatchSubmitter {
                 block_transition,
                 deposit_transition,
                 batch.withdrawal_queue_hash,
-                Bytes::new(),
-                Bytes::new(),
+                verifier_config,
+                proof,
             )
             .nonce_key(SUBMIT_BATCH_NONCE_KEY)
             .send()
@@ -447,6 +515,101 @@ impl BatchSubmitter {
     /// Read the portal's `genesisTempoBlockNumber` from L1.
     pub async fn read_genesis_tempo_block_number(&self) -> Result<u64> {
         Ok(self.portal.genesisTempoBlockNumber().call().await?)
+    }
+
+    /// Read the portal's registered sequencer address from L1.
+    pub async fn read_portal_sequencer(&self) -> Result<Address> {
+        Ok(self.portal.sequencer().call().await?)
+    }
+
+    /// Read the portal's configured `IVerifier` contract address from L1.
+    pub async fn read_portal_verifier(&self) -> Result<Address> {
+        Ok(self.portal.verifier().call().await?)
+    }
+
+    /// Read the portal's `withdrawalBatchIndex` from L1.
+    pub async fn read_portal_withdrawal_batch_index(&self) -> Result<u64> {
+        Ok(self.portal.withdrawalBatchIndex().call().await?)
+    }
+
+    /// Read the portal's `lastProcessedDepositNumber` from L1.
+    pub async fn read_portal_last_processed_deposit_number(&self) -> Result<u64> {
+        Ok(self.portal.lastProcessedDepositNumber().call().await?)
+    }
+
+    /// Read the portal's `lastSyncedTempoBlockNumber` from L1.
+    pub async fn read_portal_last_synced_tempo_block_number(&self) -> Result<u64> {
+        Ok(self.portal.lastSyncedTempoBlockNumber().call().await?)
+    }
+
+    /// Take a diagnostic snapshot of portal state, the current L1 tip, and the
+    /// values the next `submitBatch` call will reference.
+    ///
+    /// Used both by [`submit_batch`](Self::submit_batch) (logged before the L1
+    /// call lands) and by external smoke / runbook tooling (the `xtask
+    /// settlement-preflight` subcommand) so failures point at the layer that
+    /// actually disagreed.
+    pub async fn preflight_report(
+        &self,
+        batch: &BatchData,
+        recent_tempo_block_number: u64,
+    ) -> Result<SubmitBatchPreflight> {
+        let current_l1_block_fut = async {
+            self.l1_provider
+                .get_block_number()
+                .await
+                .map_err(eyre::Report::from)
+        };
+        let block_hash_fut = self.read_portal_block_hash();
+        let sequencer_fut = self.read_portal_sequencer();
+        let verifier_fut = self.read_portal_verifier();
+        let batch_index_fut = self.read_portal_withdrawal_batch_index();
+        let last_processed_fut = self.read_portal_last_processed_deposit_number();
+        let last_synced_fut = self.read_portal_last_synced_tempo_block_number();
+        let head_fut = self.read_portal_withdrawal_queue_head();
+        let tail_fut = self.read_portal_withdrawal_queue_tail();
+
+        let (
+            current_l1_block,
+            portal_block_hash,
+            sequencer,
+            verifier,
+            withdrawal_batch_index,
+            last_processed_deposit_number,
+            last_synced_tempo_block_number,
+            withdrawal_queue_head,
+            withdrawal_queue_tail,
+        ) = tokio::try_join!(
+            current_l1_block_fut,
+            block_hash_fut,
+            sequencer_fut,
+            verifier_fut,
+            batch_index_fut,
+            last_processed_fut,
+            last_synced_fut,
+            head_fut,
+            tail_fut,
+        )?;
+
+        Ok(SubmitBatchPreflight {
+            portal_address: self.portal_address,
+            current_l1_block,
+            portal_block_hash,
+            sequencer,
+            verifier,
+            withdrawal_batch_index,
+            last_processed_deposit_number,
+            last_synced_tempo_block_number,
+            withdrawal_queue_head,
+            withdrawal_queue_tail,
+            recent_tempo_block_number,
+            batch_tempo_block_number: batch.tempo_block_number,
+            batch_prev_block_hash: batch.prev_block_hash,
+            batch_next_block_hash: batch.next_block_hash,
+            batch_prev_deposit_number: batch.prev_deposit_number,
+            batch_next_deposit_number: batch.next_deposit_number,
+            batch_withdrawal_queue_hash: batch.withdrawal_queue_hash,
+        })
     }
 
     /// Read the current `blockHash` from the ZonePortal on L1.
@@ -993,6 +1156,107 @@ pub(crate) struct StepPoint {
     pub zone_block: u64,
     /// Target `tempoBlockNumber` value at this split point.
     pub target_tempo_block: u64,
+}
+
+/// Snapshot of portal state plus the batch's intended public inputs taken
+/// immediately before [`BatchSubmitter::submit_batch`] signs the L1
+/// transaction.
+///
+/// Captures every value the L1 verifier sees so a `submitBatch` revert can
+/// be triaged without re-running the call: portal anchor, sequencer/verifier
+/// addresses, withdrawal queue cursors, and the batch's deposit / withdrawal
+/// transition.
+#[derive(Debug, Clone)]
+pub struct SubmitBatchPreflight {
+    /// ZonePortal contract address on Tempo L1.
+    pub portal_address: Address,
+    /// Tempo L1 tip at the moment of the snapshot.
+    pub current_l1_block: u64,
+    /// Portal's current `blockHash()` — must equal `batch_prev_block_hash` for
+    /// the submission to be accepted.
+    pub portal_block_hash: B256,
+    /// Portal's registered sequencer address.
+    pub sequencer: Address,
+    /// Portal's configured `IVerifier` contract address.
+    pub verifier: Address,
+    /// Portal's current `withdrawalBatchIndex`. The batch about to be submitted
+    /// will occupy `withdrawal_batch_index + 1`.
+    pub withdrawal_batch_index: u64,
+    /// Portal's `lastProcessedDepositNumber`. Should equal the batch's
+    /// `prev_deposit_number`.
+    pub last_processed_deposit_number: u64,
+    /// Portal's `lastSyncedTempoBlockNumber`. Zero on a fresh zone.
+    pub last_synced_tempo_block_number: u64,
+    /// Portal withdrawal queue head (logical, not modulo capacity).
+    pub withdrawal_queue_head: u64,
+    /// Portal withdrawal queue tail (logical, not modulo capacity).
+    pub withdrawal_queue_tail: u64,
+    /// `recentTempoBlockNumber` value the submitter will pass — `0` in direct
+    /// mode, otherwise the chosen anchor block.
+    pub recent_tempo_block_number: u64,
+    /// `tempoBlockNumber` the batch claims to have anchored.
+    pub batch_tempo_block_number: u64,
+    /// Previous zone block hash being asserted by the batch.
+    pub batch_prev_block_hash: B256,
+    /// Next zone block hash being committed by the batch.
+    pub batch_next_block_hash: B256,
+    /// Deposit counter at the start of processing.
+    pub batch_prev_deposit_number: u64,
+    /// Deposit counter after processing.
+    pub batch_next_deposit_number: u64,
+    /// Withdrawal queue hash for this batch.
+    pub batch_withdrawal_queue_hash: B256,
+}
+
+impl SubmitBatchPreflight {
+    /// Build the [`BatchPublicInputs`] the verifier will receive.
+    pub fn public_inputs(
+        &self,
+        batch: &BatchData,
+        recent_tempo_block_number: u64,
+    ) -> BatchPublicInputs {
+        BatchPublicInputs {
+            portal_address: self.portal_address,
+            sequencer_address: self.sequencer,
+            tempo_block_number: batch.tempo_block_number,
+            recent_tempo_block_number,
+            prev_block_hash: batch.prev_block_hash,
+            next_block_hash: batch.next_block_hash,
+            prev_processed_deposit_hash: batch.prev_processed_deposit_hash,
+            next_processed_deposit_hash: batch.next_processed_deposit_hash,
+            prev_deposit_number: batch.prev_deposit_number,
+            next_deposit_number: batch.next_deposit_number,
+            withdrawal_queue_hash: batch.withdrawal_queue_hash,
+            expected_withdrawal_batch_index: self.withdrawal_batch_index.saturating_add(1),
+        }
+    }
+
+    /// Emit a single structured tracing event with every preflight field.
+    /// `phase` is included as a field so submitter calls (`"submitBatch"`) can
+    /// be distinguished from out-of-band smoke runs (`"xtask"`, ...).
+    pub fn log(&self, phase: &'static str) {
+        info!(
+            phase,
+            portal = %self.portal_address,
+            current_l1_block = self.current_l1_block,
+            portal_block_hash = %self.portal_block_hash,
+            sequencer = %self.sequencer,
+            verifier = %self.verifier,
+            withdrawal_batch_index = self.withdrawal_batch_index,
+            last_processed_deposit_number = self.last_processed_deposit_number,
+            last_synced_tempo_block_number = self.last_synced_tempo_block_number,
+            withdrawal_queue_head = self.withdrawal_queue_head,
+            withdrawal_queue_tail = self.withdrawal_queue_tail,
+            recent_tempo_block_number = self.recent_tempo_block_number,
+            batch_tempo_block_number = self.batch_tempo_block_number,
+            batch_prev_block_hash = %self.batch_prev_block_hash,
+            batch_next_block_hash = %self.batch_next_block_hash,
+            batch_prev_deposit_number = self.batch_prev_deposit_number,
+            batch_next_deposit_number = self.batch_next_deposit_number,
+            batch_withdrawal_queue_hash = %self.batch_withdrawal_queue_hash,
+            "Portal preflight snapshot"
+        );
+    }
 }
 
 /// Zone L2 state read at a specific block, used to populate [`BatchData`].
