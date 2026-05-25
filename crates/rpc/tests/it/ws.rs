@@ -260,6 +260,53 @@ impl ZoneRpcApi for MockZoneRpcApi {
             }))
         })
     }
+
+    fn zone_get_my_orders(
+        &self,
+        _query: zone_rpc::darkpool::HistoryQuery,
+        _auth: zone_rpc::auth::AuthContext,
+    ) -> BoxFut<'_> {
+        Box::pin(async {
+            zone_rpc::types::to_raw(
+                &zone_rpc::darkpool::Page::<zone_rpc::darkpool::OrderEntry> {
+                    items: vec![],
+                    next_cursor: None,
+                },
+            )
+        })
+    }
+
+    fn zone_get_my_fills(
+        &self,
+        _query: zone_rpc::darkpool::HistoryQuery,
+        _auth: zone_rpc::auth::AuthContext,
+    ) -> BoxFut<'_> {
+        Box::pin(async {
+            zone_rpc::types::to_raw(&zone_rpc::darkpool::Page::<zone_rpc::darkpool::FillEntry> {
+                items: vec![],
+                next_cursor: None,
+            })
+        })
+    }
+
+    fn zone_get_my_transfers(
+        &self,
+        _query: zone_rpc::darkpool::TransferQuery,
+        _auth: zone_rpc::auth::AuthContext,
+    ) -> BoxFut<'_> {
+        Box::pin(async {
+            zone_rpc::types::to_raw(
+                &zone_rpc::darkpool::Page::<zone_rpc::darkpool::TransferEntry> {
+                    items: vec![],
+                    next_cursor: None,
+                },
+            )
+        })
+    }
+
+    fn zone_get_order(&self, _order_id: u128, _auth: zone_rpc::auth::AuthContext) -> BoxFut<'_> {
+        Box::pin(async { Ok(zone_rpc::types::raw_null()) })
+    }
 }
 
 // ---------------------------------------------------------------------------

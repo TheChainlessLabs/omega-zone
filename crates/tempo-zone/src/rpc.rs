@@ -50,6 +50,7 @@ use crate::abi::{
 };
 use zone_rpc::{
     auth::AuthContext,
+    darkpool::{self as zone_darkpool, FillRole, HistoryQuery, Page, TransferQuery},
     types::{
         AuthorizationTokenInfoResponse, BoxEyreFut, BoxFut, DepositKind, DepositState,
         DepositStatusEntry, DepositStatusResponse, JsonRpcError, ZoneInfoResponse, internal,
@@ -958,6 +959,216 @@ where
                 processed,
                 deposits,
             })
+        })
+    }
+
+    fn zone_get_my_orders(&self, query: HistoryQuery, auth: AuthContext) -> BoxFut<'_> {
+        Box::pin(async move {
+            let owner = zone_darkpool::require_owner(query.account, &auth.caller)?;
+            let limit = zone_darkpool::clamp_limit(query.limit);
+            let cursor = query
+                .cursor
+                .as_deref()
+                .map(zone_darkpool::Cursor::decode)
+                .transpose()?;
+            let pair_filter = zone_darkpool::parse_pair_filter(query.pair.as_deref())?;
+
+            let owner_topic = zone_darkpool::topic_for_address(&owner);
+            let topics = vec![
+                zone_darkpool::OrderSubmitted::SIGNATURE_HASH,
+                zone_darkpool::OrderPlaced::SIGNATURE_HASH,
+                zone_darkpool::OrderFilled::SIGNATURE_HASH,
+                zone_darkpool::OrderCancelled::SIGNATURE_HASH,
+            ];
+            let filter = zone_darkpool::build_darkpool_filter(&topics, Some(owner_topic), cursor);
+            let logs = EthFilterApiServer::logs(&self.eth.filter, filter)
+                .await
+                .map_err(internal)?;
+
+            let mut orders = zone_darkpool::reconstruct_orders(
+                logs.iter()
+                    .filter(|log| zone_darkpool::caller_is_maker(log, &owner)),
+            );
+
+            if let Some(pair) = pair_filter {
+                orders.retain(|o| o.base_token == pair.0 && o.quote_token == pair.1);
+            }
+            if let Some(status) = query.status {
+                orders.retain(|o| o.status == status);
+            }
+            orders.sort_by(|a, b| {
+                b.updated_at_block
+                    .cmp(&a.updated_at_block)
+                    .then_with(|| b.order_id.cmp(&a.order_id))
+            });
+
+            let next_cursor = zone_darkpool::next_order_cursor(&orders, limit);
+            orders.truncate(limit as usize);
+
+            to_raw(&Page {
+                items: orders,
+                next_cursor,
+            })
+        })
+    }
+
+    fn zone_get_my_fills(&self, query: HistoryQuery, auth: AuthContext) -> BoxFut<'_> {
+        Box::pin(async move {
+            let owner = zone_darkpool::require_owner(query.account, &auth.caller)?;
+            let limit = zone_darkpool::clamp_limit(query.limit);
+            let cursor = query
+                .cursor
+                .as_deref()
+                .map(zone_darkpool::Cursor::decode)
+                .transpose()?;
+            let pair_filter = zone_darkpool::parse_pair_filter(query.pair.as_deref())?;
+
+            let owner_topic = zone_darkpool::topic_for_address(&owner);
+            let topics = vec![zone_darkpool::OrderFilled::SIGNATURE_HASH];
+
+            // OrderSubmitted carries the only pair metadata. Scan from
+            // genesis because a fill at `cursor` can reference an older
+            // resting order. Foreign submissions are used only for pair
+            // metadata; their order ids are never returned.
+            let submitted_filter = zone_darkpool::build_darkpool_filter(
+                &[zone_darkpool::OrderSubmitted::SIGNATURE_HASH],
+                None,
+                None,
+            );
+
+            let maker_filter =
+                zone_darkpool::build_darkpool_filter(&topics, Some(owner_topic), cursor);
+            let mut taker_filter = zone_darkpool::build_darkpool_filter(&topics, None, cursor);
+            taker_filter.topics[3] = alloy_rpc_types_eth::FilterSet::from(owner_topic);
+
+            let submitted_logs = EthFilterApiServer::logs(&self.eth.filter, submitted_filter)
+                .await
+                .map_err(internal)?;
+            let maker_logs = EthFilterApiServer::logs(&self.eth.filter, maker_filter)
+                .await
+                .map_err(internal)?;
+            let taker_logs = EthFilterApiServer::logs(&self.eth.filter, taker_filter)
+                .await
+                .map_err(internal)?;
+
+            let pair_index = zone_darkpool::build_pair_index(submitted_logs.iter(), &owner);
+
+            let mut fills: Vec<zone_darkpool::FillEntry> = maker_logs
+                .iter()
+                .filter(|log| zone_darkpool::caller_is_maker(log, &owner))
+                .filter_map(|log| {
+                    zone_darkpool::fill_entry_from_log(log, FillRole::Maker, &pair_index)
+                })
+                .chain(
+                    taker_logs
+                        .iter()
+                        .filter(|log| zone_darkpool::caller_is_taker(log, &owner))
+                        .filter_map(|log| {
+                            zone_darkpool::fill_entry_from_log(log, FillRole::Taker, &pair_index)
+                        }),
+                )
+                .collect();
+
+            if let Some(pair) = pair_filter {
+                fills.retain(|f| f.base_token == pair.0 && f.quote_token == pair.1);
+            }
+            fills.sort_by(|a, b| {
+                b.block_number
+                    .cmp(&a.block_number)
+                    .then_with(|| b.tx_hash.cmp(&a.tx_hash))
+            });
+            fills.dedup_by(|a, b| {
+                a.tx_hash == b.tx_hash && a.order_id == b.order_id && a.role == b.role
+            });
+
+            let next_cursor = zone_darkpool::next_fill_cursor(&fills, limit);
+            fills.truncate(limit as usize);
+
+            to_raw(&Page {
+                items: fills,
+                next_cursor,
+            })
+        })
+    }
+
+    fn zone_get_my_transfers(&self, query: TransferQuery, auth: AuthContext) -> BoxFut<'_> {
+        Box::pin(async move {
+            let owner = zone_darkpool::require_owner(query.account, &auth.caller)?;
+            let limit = zone_darkpool::clamp_limit(query.limit);
+            let cursor = query
+                .cursor
+                .as_deref()
+                .map(zone_darkpool::Cursor::decode)
+                .transpose()?;
+
+            let owner_topic = zone_darkpool::topic_for_address(&owner);
+            let transfer_topics = vec![
+                zone_rpc::filter::TRANSFER_TOPIC,
+                zone_rpc::filter::TRANSFER_WITH_MEMO_TOPIC,
+                zone_rpc::filter::MINT_TOPIC,
+                zone_rpc::filter::BURN_TOPIC,
+            ];
+            let from_filter = zone_darkpool::build_tip20_filter(
+                &transfer_topics,
+                Some(owner_topic),
+                cursor,
+                true,
+            );
+            let to_filter = zone_darkpool::build_tip20_filter(
+                &transfer_topics,
+                Some(owner_topic),
+                cursor,
+                false,
+            );
+
+            let from_logs = EthFilterApiServer::logs(&self.eth.filter, from_filter)
+                .await
+                .map_err(internal)?;
+            let to_logs = EthFilterApiServer::logs(&self.eth.filter, to_filter)
+                .await
+                .map_err(internal)?;
+
+            let mut transfers: Vec<zone_darkpool::TransferEntry> = from_logs
+                .into_iter()
+                .chain(to_logs)
+                .filter(|log| zone_rpc::filter::is_log_visible(log, &owner))
+                .filter_map(|log| zone_darkpool::transfer_entry_from_log(&log, &owner))
+                .collect();
+
+            transfers.sort_by(|a, b| {
+                b.block_number
+                    .cmp(&a.block_number)
+                    .then_with(|| b.log_index.cmp(&a.log_index))
+            });
+            transfers.dedup_by(|a, b| a.tx_hash == b.tx_hash && a.log_index == b.log_index);
+
+            let next_cursor = zone_darkpool::next_transfer_cursor(&transfers, limit);
+            transfers.truncate(limit as usize);
+
+            to_raw(&Page {
+                items: transfers,
+                next_cursor,
+            })
+        })
+    }
+
+    fn zone_get_order(&self, order_id: u128, auth: AuthContext) -> BoxFut<'_> {
+        Box::pin(async move {
+            let owner = auth.caller;
+            let filter = zone_darkpool::build_order_filter(order_id, &owner);
+            let logs = EthFilterApiServer::logs(&self.eth.filter, filter)
+                .await
+                .map_err(internal)?;
+            let mut orders = zone_darkpool::reconstruct_orders(
+                logs.iter()
+                    .filter(|log| zone_darkpool::caller_is_maker(log, &owner)),
+            );
+            match orders.pop() {
+                Some(order) if order.order_id == alloy_primitives::U128::from(order_id) => {
+                    to_raw(&order)
+                }
+                _ => Ok(raw_null()),
+            }
         })
     }
 }

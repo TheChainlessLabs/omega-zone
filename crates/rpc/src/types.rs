@@ -275,7 +275,11 @@ pub fn classify_method(method: &str) -> Option<MethodTier> {
         | "web3_sha3"
         | "zone_getAuthorizationTokenInfo"
         | "zone_getZoneInfo"
-        | "zone_getDepositStatus" => Some(MethodTier::Public),
+        | "zone_getDepositStatus"
+        | "zone_getMyOrders"
+        | "zone_getMyFills"
+        | "zone_getMyTransfers"
+        | "zone_getOrder" => Some(MethodTier::Public),
 
         // Fetch-then-check: public but redacted based on caller identity
         "eth_getTransactionByHash"
