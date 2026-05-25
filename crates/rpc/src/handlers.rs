@@ -276,6 +276,12 @@ pub async fn dispatch(
         MethodTier::Restricted => {
             return JsonRpcResponse::error(id, JsonRpcError::sequencer_only());
         }
+        MethodTier::UnsupportedAccountManagement => {
+            return JsonRpcResponse::error(
+                id,
+                JsonRpcError::unsupported_account_method(&req.method),
+            );
+        }
         _ => {}
     }
 
@@ -979,6 +985,56 @@ mod tests {
         let err = resp.error.expect("should reject state overrides");
         assert_eq!(err.code, -32602);
         assert_eq!(err.message, "state overrides not allowed");
+    }
+
+    #[tokio::test]
+    async fn rejects_eth_send_transaction_with_account_method_error() {
+        let api = MockZoneRpcApi::default();
+        let resp = dispatch(
+            &request(
+                "eth_sendTransaction",
+                json!([{
+                    "from": format!("{:#x}", Address::repeat_byte(0xaa)),
+                    "to": format!("{:#x}", Address::repeat_byte(0x11)),
+                    "data": "0x",
+                }]),
+            ),
+            &auth(),
+            &api,
+        )
+        .await;
+
+        assert!(resp.result.is_none());
+        let err = resp.error.expect("should reject eth_sendTransaction");
+        assert_eq!(err.code, -32004);
+        assert!(
+            err.message.contains("eth_sendTransaction")
+                && err.message.contains("eth_sendRawTransaction"),
+            "error should point at the raw-tx path; got: {}",
+            err.message,
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_eth_sign_transaction_with_account_method_error() {
+        let api = MockZoneRpcApi::default();
+        let resp = dispatch(
+            &request(
+                "eth_signTransaction",
+                json!([{
+                    "from": format!("{:#x}", Address::repeat_byte(0xaa)),
+                    "to": format!("{:#x}", Address::repeat_byte(0x11)),
+                    "data": "0x",
+                }]),
+            ),
+            &auth(),
+            &api,
+        )
+        .await;
+
+        let err = resp.error.expect("should reject eth_signTransaction");
+        assert_eq!(err.code, -32004);
+        assert!(err.message.contains("eth_signTransaction"));
     }
 
     #[tokio::test]

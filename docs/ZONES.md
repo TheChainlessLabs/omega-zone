@@ -316,6 +316,90 @@ cast rpc eth_call \
 
 Swap the `to` address above if you want to query a different zone TIP-20.
 
+#### Wallets & Frontend Integration
+
+The private zone RPC never owns user signing keys. Wallet flows must follow the same shape as `cast rpc` above: produce an authorization token, then submit pre-signed raw transactions.
+
+##### Authorization token
+
+The token is a hex blob of `<signature><version:1><zoneId:4><chainId:8><issuedAt:8><expiresAt:8>` (29 fixed bytes plus a variable-length signature suffix). All multi-byte integers are big-endian. The signing message is `keccak256("TempoZoneRPC"-padded-to-32 || fields)`.
+
+Sign with one of:
+
+- A secp256k1 signature over the raw 32-byte digest, **or**
+- An EIP-191 `personal_sign` of the same digest (`keccak256("\x19Ethereum Signed Message:\n32" || digest)`), **or**
+- A P-256 / WebAuthn / keychain signature for accounts that authorise via `AccountKeychain`.
+
+The server accepts both the raw and the EIP-191-prefixed recovery paths, so `personal_sign` from injected wallets and `eth_signMessage` from server-side signers both work. Submit the token in the `X-Authorization-Token` HTTP header (case-insensitive) on every call. Token TTL is capped server-side at `private-rpc.max-auth-token-validity-secs` (default 30 days).
+
+The protocol prefix string "TempoZoneRPC" is the authoritative scheme name; treat any "Ethereum Sign" phrasing in older docs as describing the optional EIP-191 wrapping, not a separate format.
+
+##### Submitting transactions
+
+```
+1. Wallet authorises the session
+   └─> wallet personal_signs the token digest → frontend caches the token
+
+2. Frontend builds a transaction off the zone:
+   └─> nonce       → eth_getTransactionCount via the private RPC
+   └─> fees        → eth_maxPriorityFeePerGas + eth_feeHistory
+   └─> chain id    → eth_chainId
+   └─> calldata    → encoded with viem / wagmi / ethers
+
+3. Wallet signs the transaction → frontend gets the RLP-encoded raw tx
+
+4. Frontend submits:
+   POST /
+   X-Authorization-Token: <token>
+   {"jsonrpc":"2.0","method":"eth_sendRawTransaction","params":["0x…"],"id":1}
+```
+
+The server decodes the raw transaction, recovers the signer, and verifies it equals the token's authenticated account. A mismatch returns `-32003 Transaction rejected`.
+
+`eth_sendRawTransactionSync` is also exposed — same sender check, but it waits for inclusion and returns the receipt.
+
+##### Errors the wallet path can hit
+
+| Code | Cause | Fix |
+|------|-------|-----|
+| `-32001 Unauthorized` (HTTP 401/403) | Missing, expired, or wrong-signer token | Re-sign the token digest with the connected wallet |
+| `-32003 Transaction rejected` | Recovered tx sender ≠ authenticated account | Re-sign the tx with the same key that signed the auth token |
+| `-32004 …does not hold caller signing keys…` | Frontend called `eth_sendTransaction` or `eth_signTransaction` | Sign locally and submit via `eth_sendRawTransaction[Sync]` |
+| `-32004 Account mismatch` | `from` in a simulation call (`eth_call`, `eth_estimateGas`, `eth_fillTransaction`) ≠ authenticated account | Omit `from` or set it to the caller's address |
+| `-32005 Sequencer only` | Method only available to the sequencer (e.g. `eth_getStorageAt`, `debug_traceTransaction`) | Use a public read instead |
+| `-32006 Method disabled` | Method explicitly disabled (e.g. `eth_subscribe` over HTTP) | Use the WebSocket transport |
+| `-32602 contract creation not supported on zones` | `to == null` or a Tempo `Call.to = Create` | Deploy on L1 instead |
+
+##### Chain metadata for wagmi / viem / Tempo Wallet
+
+The zone is a stand-alone EVM chain. Wallets discover it via `wallet_addEthereumChain` or via the application's wagmi config — give them the full set of fields, not just an RPC URL:
+
+| Field | Value | Notes |
+|-------|-------|-------|
+| `chainId` | `421700000 + (zone_id % 1002610000)` (mainnet) or `1424310000 + (zone_id % 723173648)` (testnet) | Match what `eth_chainId` on the zone returns; see `--zone.id` in [Zone Node CLI Options](#zone-node-cli-options) |
+| `chainName` | "Omega Zone" or your zone's product name | Free-form |
+| `rpcUrls` | The private RPC URL (e.g. `http://localhost:8544` in dev) | Must be reachable from the wallet; the wallet attaches `X-Authorization-Token` per request through your app's transport, not directly |
+| `nativeCurrency.name` / `symbol` | Whichever TIP-20 the zone uses as its fee token (default `pathUSD`) | Some wallets reject the chain if this is absent |
+| `nativeCurrency.decimals` | `18` | Tempo TIP-20s are 18-decimal |
+| `blockExplorerUrls` | Placeholder URL, even if no public explorer exists yet | Some wallets reject the chain without one |
+
+`unsupported chain ID` errors from wagmi/viem are usually one of:
+
+- the wagmi `chains` array does not include the zone — register it with `defineChain({ id, name, nativeCurrency, rpcUrls })` and add it to `createConfig({ chains: [...] })`, or
+- the wallet is still on L1 — call `useSwitchChain().switchChainAsync({ chainId: zoneChainId })` before any zone read/write.
+
+"Maximum call stack" errors from Tempo Wallet on zone writes are the wallet falling back to `eth_fillTransaction` recursion when the tx targets a zone-only precompile. Build the transaction defaults yourself (nonce + EIP-1559 fees + chain id) before signing — see the `getZoneTransactionDefaults` helper in `frontend/components/darkpool-dashboard.tsx` for the canonical pattern.
+
+##### Reference TypeScript flow
+
+The frontend in this repo demonstrates each step:
+
+- `frontend/lib/zone-auth.ts` — builds the authorization token digest, calls `personal_sign`, caches the token in `sessionStorage`, retries once on a token-expiry error.
+- `frontend/lib/config.ts` — wagmi `defineChain` for the zone and the Tempo L1 chain.
+- `frontend/components/darkpool-dashboard.tsx` — `signAndSubmitWithAccessKey` builds a Tempo-typed transaction, signs it with the access-key keypair, then POSTs `eth_sendRawTransaction` to the private RPC via `zonePrivateRpc`.
+
+When integrating a new client, mirror that shape. Do **not** rely on `walletClient.writeContract` against the zone chain — viem will translate that to `eth_sendTransaction`, which the private RPC will reject with the `-32004` message above.
+
 #### Check portal status on L1
 
 ```bash

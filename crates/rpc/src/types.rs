@@ -140,6 +140,24 @@ impl JsonRpcError {
         }
     }
 
+    /// Unsupported account-management method (-32004).
+    ///
+    /// Returned for JSON-RPC methods that assume the node owns the caller's
+    /// signing key (e.g. `eth_sendTransaction`). The private zone RPC never
+    /// holds caller keys — clients must sign the transaction locally and
+    /// submit it via `eth_sendRawTransaction` or `eth_sendRawTransactionSync`.
+    pub fn unsupported_account_method(method: &str) -> Self {
+        Self {
+            code: -32004,
+            message: format!(
+                "{method} is not supported: the private zone RPC does not hold \
+                 caller signing keys. Sign the transaction client-side and \
+                 submit it via eth_sendRawTransaction or eth_sendRawTransactionSync."
+            ),
+            data: None,
+        }
+    }
+
     /// Parse error — invalid JSON (-32700).
     pub fn parse_error(msg: impl Into<String>) -> Self {
         Self {
@@ -248,6 +266,10 @@ pub enum MethodTier {
     Restricted,
     /// Disabled on the private RPC.
     Disabled,
+    /// The method assumes the node owns a caller signing key, which the
+    /// private zone RPC never does. Returns a clear pointer to the
+    /// `eth_sendRawTransaction` path.
+    UnsupportedAccountManagement,
 }
 
 /// Classify a JSON-RPC method into its access tier.
@@ -293,11 +315,17 @@ pub fn classify_method(method: &str) -> Option<MethodTier> {
         // Transaction submission: public (caller sends their own txs)
         "eth_sendRawTransaction" | "eth_sendRawTransactionSync" => Some(MethodTier::Public),
 
+        // Unsupported account-management methods — the node never holds caller
+        // signing keys, so these always fail. Dispatch intercepts them with a
+        // dedicated error message pointing wallets at `eth_sendRawTransaction`.
+        "eth_sendTransaction" | "eth_signTransaction" => {
+            Some(MethodTier::UnsupportedAccountManagement)
+        }
+
         // Sequencer-only — raw state inspection and full block data bypass privacy scoping
         "eth_getCode"
         | "eth_getStorageAt"
         | "eth_getBlockReceipts"
-        | "eth_sendTransaction"
         | "debug_traceTransaction"
         | "debug_traceBlockByNumber"
         | "debug_traceBlockByHash"
