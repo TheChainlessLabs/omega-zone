@@ -189,6 +189,39 @@ pub trait ZoneRpcApi: Send + Sync + 'static {
     /// `zone_getDepositStatus(tempoBlockNumber)` — returns per-caller deposit
     /// processing state for a Tempo L1 block.
     fn zone_get_deposit_status(&self, tempo_block_number: u64, auth: AuthContext) -> BoxFut<'_>;
+
+    /// `zone_listBatches(params)` — paginate the public, aggregate-only batch
+    /// history. The response is caller-agnostic and must never include
+    /// owner-linked data.
+    ///
+    /// Default impl returns "method disabled" so backends that do not surface
+    /// the batch explorer (e.g. the proxy) opt in explicitly.
+    fn zone_list_batches(
+        &self,
+        _params: crate::types::ListBatchesParams,
+        _auth: AuthContext,
+    ) -> BoxFut<'_> {
+        Box::pin(async { Err(JsonRpcError::method_disabled()) })
+    }
+
+    /// `zone_getBatch(batchNumber)` — return the public, aggregate-only summary
+    /// for a single batch. Returns `null` when the batch is not yet on L1.
+    ///
+    /// Default impl returns "method disabled" so backends that do not surface
+    /// the batch explorer (e.g. the proxy) opt in explicitly.
+    fn zone_get_batch(&self, _batch_number: u64, _auth: AuthContext) -> BoxFut<'_> {
+        Box::pin(async { Err(JsonRpcError::method_disabled()) })
+    }
+
+    /// `zone_searchBatch(query)` — resolve a batch by batch number or by L1
+    /// settlement tx hash. Returns the same aggregate-only summary shape as
+    /// `zone_getBatch`.
+    ///
+    /// Default impl returns "method disabled" so backends that do not surface
+    /// the batch explorer (e.g. the proxy) opt in explicitly.
+    fn zone_search_batch(&self, _query: String, _auth: AuthContext) -> BoxFut<'_> {
+        Box::pin(async { Err(JsonRpcError::method_disabled()) })
+    }
 }
 
 /// Deserialize JSON-RPC params, returning an error response on failure.
@@ -342,6 +375,9 @@ pub async fn dispatch(
             api.zone_get_zone_info(auth.clone()).await,
         ),
         "zone_getDepositStatus" => handle_zone_get_deposit_status(id, raw, auth, api).await,
+        "zone_listBatches" => handle_zone_list_batches(id, raw, auth, api).await,
+        "zone_getBatch" => handle_zone_get_batch(id, raw, auth, api).await,
+        "zone_searchBatch" => handle_zone_search_batch(id, raw, auth, api).await,
         _ => {
             // Method is whitelisted but not yet implemented via direct API
             JsonRpcResponse::error(
@@ -724,6 +760,103 @@ async fn handle_uninstall_filter(
     )
 }
 
+/// Handle `zone_listBatches(params)`.
+///
+/// Accepts either `[]`, `[params]`, or `[limit, cursor]` for ergonomic clients.
+async fn handle_zone_list_batches(
+    id: Value,
+    raw: &str,
+    auth: &AuthContext,
+    api: &dyn ZoneRpcApi,
+) -> JsonRpcResponse {
+    let params = match parse_list_batches_params(raw) {
+        Ok(params) => params,
+        Err(msg) => {
+            return JsonRpcResponse::error(id, JsonRpcError::invalid_params(msg));
+        }
+    };
+
+    api_result(
+        id,
+        "zone_listBatches",
+        api.zone_list_batches(params, auth.clone()).await,
+    )
+}
+
+/// Parse `zone_listBatches` params into a [`ListBatchesParams`].
+///
+/// Accepts three shapes:
+/// - `[]` — empty, use defaults.
+/// - `[ { limit, cursor } ]` — single object positional argument.
+/// - `[limit, cursor]` — positional tuple form.
+#[allow(clippy::result_large_err)]
+fn parse_list_batches_params(raw: &str) -> Result<crate::types::ListBatchesParams, &'static str> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed == "[]" {
+        return Ok(crate::types::ListBatchesParams::default());
+    }
+
+    if let Ok((params,)) = serde_json::from_str::<(crate::types::ListBatchesParams,)>(raw) {
+        return Ok(params);
+    }
+
+    if let Ok((limit, cursor)) = serde_json::from_str::<(Option<u32>, Option<U64>)>(raw) {
+        return Ok(crate::types::ListBatchesParams { limit, cursor });
+    }
+
+    Err("expected [] or [params] for zone_listBatches")
+}
+
+/// Handle `zone_getBatch(batchNumber)`.
+async fn handle_zone_get_batch(
+    id: Value,
+    raw: &str,
+    auth: &AuthContext,
+    api: &dyn ZoneRpcApi,
+) -> JsonRpcResponse {
+    let (batch_number,) = match parse_params::<(String,)>(raw, &id, "expected [batchNumber]") {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let batch_number = match U64::from_str(&batch_number) {
+        Ok(value) => value.to(),
+        Err(_) => {
+            return JsonRpcResponse::error(
+                id,
+                JsonRpcError::invalid_params("expected [batchNumber]"),
+            );
+        }
+    };
+
+    api_result(
+        id,
+        "zone_getBatch",
+        api.zone_get_batch(batch_number, auth.clone()).await,
+    )
+}
+
+/// Handle `zone_searchBatch(query)`.
+///
+/// `query` is a string that may be either a batch number (`"0x2a"` or `"42"`)
+/// or an L1 settlement tx hash (`"0x..."` 32 bytes).
+async fn handle_zone_search_batch(
+    id: Value,
+    raw: &str,
+    auth: &AuthContext,
+    api: &dyn ZoneRpcApi,
+) -> JsonRpcResponse {
+    let (query,) = match parse_params::<(String,)>(raw, &id, "expected [query]") {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+
+    api_result(
+        id,
+        "zone_searchBatch",
+        api.zone_search_batch(query, auth.clone()).await,
+    )
+}
+
 /// Handle `zone_getDepositStatus(tempoBlockNumber)`.
 async fn handle_zone_get_deposit_status(
     id: Value,
@@ -979,6 +1112,57 @@ mod tests {
         let err = resp.error.expect("should reject state overrides");
         assert_eq!(err.code, -32602);
         assert_eq!(err.message, "state overrides not allowed");
+    }
+
+    #[tokio::test]
+    async fn parses_list_batches_with_no_params() {
+        let result = parse_list_batches_params("[]").expect("empty params should parse");
+        assert!(result.limit.is_none());
+        assert!(result.cursor.is_none());
+    }
+
+    #[tokio::test]
+    async fn parses_list_batches_with_object_form() {
+        let result = parse_list_batches_params("[{\"limit\":10,\"cursor\":\"0x2a\"}]")
+            .expect("object form should parse");
+        assert_eq!(result.limit, Some(10));
+        assert_eq!(result.cursor, Some(alloy_primitives::U64::from(42)));
+    }
+
+    #[tokio::test]
+    async fn parses_list_batches_with_tuple_form() {
+        let result = parse_list_batches_params("[10, \"0x2a\"]").expect("tuple form should parse");
+        assert_eq!(result.limit, Some(10));
+        assert_eq!(result.cursor, Some(alloy_primitives::U64::from(42)));
+    }
+
+    #[tokio::test]
+    async fn dispatches_zone_get_batch_for_hex_quantity() {
+        let api = MockZoneRpcApi::default();
+        let resp = dispatch(&request("zone_getBatch", json!(["0x2a"])), &auth(), &api).await;
+        // MockZoneRpcApi falls back to the trait default which returns "method
+        // disabled" — what matters for dispatch is that we route correctly and
+        // surface that error rather than "method not found".
+        assert!(resp.result.is_none());
+        let err = resp.error.as_ref().expect("default impl returns error");
+        assert_eq!(err.code, -32006);
+    }
+
+    #[tokio::test]
+    async fn dispatches_zone_list_batches_with_empty_params() {
+        let api = MockZoneRpcApi::default();
+        let resp = dispatch(&request("zone_listBatches", json!([])), &auth(), &api).await;
+        // Same as above: default impl returns method disabled.
+        let err = resp.error.as_ref().expect("default impl returns error");
+        assert_eq!(err.code, -32006);
+    }
+
+    #[tokio::test]
+    async fn rejects_numeric_zone_get_batch_param() {
+        let api = MockZoneRpcApi::default();
+        let resp = dispatch(&request("zone_getBatch", json!([7])), &auth(), &api).await;
+        assert!(resp.result.is_none());
+        assert_eq!(resp.error.as_ref().unwrap().code, -32602);
     }
 
     #[tokio::test]

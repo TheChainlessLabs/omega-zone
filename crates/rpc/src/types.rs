@@ -239,6 +239,137 @@ pub enum DepositState {
     Failed,
 }
 
+/// Settlement state of a sequencer batch returned by the batch explorer methods.
+///
+/// The batch explorer methods (`zone_listBatches`, `zone_getBatch`,
+/// `zone_searchBatch`) only return public, aggregate-only batch metadata. They
+/// never include per-user data — that is the responsibility of the private,
+/// caller-scoped methods such as `zone_getDepositStatus`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BatchStatus {
+    /// Batch was sealed by the sequencer but no `BatchSubmitted` event has been
+    /// observed on L1 yet. Reserved — listing endpoints only surface batches
+    /// already on L1, so this value is not emitted today.
+    Pending,
+    /// `BatchSubmitted` was observed on L1 (the verifier accepted the proof and
+    /// the portal state advanced). For v1 — where the verifier accepts an empty
+    /// proof — this is the terminal happy-path state.
+    Submitted,
+    /// Reserved for future use once meaningful proof verification is enforced
+    /// on L1. Not emitted today.
+    Verified,
+    /// L1 settlement attempt failed (tx reverted or otherwise rejected).
+    /// Reserved — the current explorer reads only events emitted on success,
+    /// so this value is not emitted today.
+    Failed,
+}
+
+/// Aggregate per-token settled volume for a batch.
+///
+/// Sums withdrawal amounts that the L1 portal exposed via aggregate hash-chain
+/// events. Never includes per-sender or per-recipient information.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchAggregateVolume {
+    /// Settled token address.
+    pub token: Address,
+    /// Aggregate amount settled for `token` in this batch.
+    pub amount: U256,
+}
+
+/// Aggregate-only summary of a single sequencer batch.
+///
+/// **Privacy:** This response is intentionally caller-agnostic. It MUST NOT
+/// include owner-linked fields (user addresses, per-order ids, per-fill data,
+/// counterparty information). Anything that would distinguish one caller's
+/// experience from another's belongs in a private, scoped RPC method.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchSummary {
+    /// L1 portal `withdrawalBatchIndex` for this batch.
+    pub batch_number: U64,
+    /// First zone L2 block included in the batch, if resolvable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub zone_block_from: Option<U64>,
+    /// Last zone L2 block included in the batch, if resolvable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub zone_block_to: Option<U64>,
+    /// Tempo L1 block number anchored by `submitBatch`'s `tempoBlockNumber`
+    /// argument (decoded from the L1 calldata).
+    pub tempo_block_number: U64,
+    /// Withdrawal queue hash for this batch — the cryptographic anchor that
+    /// commits the batch's aggregated withdrawal set.
+    pub root: B256,
+    /// Portal `blockHash` value before this batch was applied.
+    pub prev_block_hash: B256,
+    /// Portal `blockHash` value after this batch was applied.
+    pub next_block_hash: B256,
+    /// Settlement state. See [`BatchStatus`].
+    pub status: BatchStatus,
+    /// Zone block timestamp at `zone_block_to`, when resolvable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sealed_at: Option<U64>,
+    /// L1 block timestamp at `tempo_block_number` of the `BatchSubmitted` event.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub settled_at: Option<U64>,
+    /// Aggregate count of orders included in the batch.
+    ///
+    /// "Order" granularity is not directly tracked on-chain at the zone layer;
+    /// today this surfaces the on-chain withdrawal count (which is a safe
+    /// public aggregate). Set to `0x0` when no withdrawals settle in the batch.
+    pub order_count: U64,
+    /// Aggregate count of fills. Reserved for future use once an explicit Fill
+    /// concept is plumbed through; the zone layer does not track fills today.
+    pub fill_count: U64,
+    /// Aggregate trading pair tags settled in the batch. The zone layer does
+    /// not have pair semantics, so this is always empty here; higher-layer
+    /// services may populate it before exposing to the explorer UI.
+    pub aggregate_pairs: Vec<String>,
+    /// Aggregate per-token volume settled by the batch. Empty in v1 — the
+    /// portal exposes only the withdrawal hash chain, not a per-token sum.
+    pub aggregate_volume: Vec<BatchAggregateVolume>,
+    /// L1 transaction hash that emitted `BatchSubmitted` for this batch.
+    pub settlement_tx_hash: B256,
+    /// Reference to the settlement proof (e.g. `tee:<attestation-id>`), when
+    /// known. `None` in v1 because the verifier accepts an empty proof and no
+    /// attestation is recorded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proof_ref: Option<String>,
+}
+
+/// Pagination parameters for `zone_listBatches`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListBatchesParams {
+    /// Maximum number of summaries to return. Server caps at
+    /// [`LIST_BATCHES_MAX_LIMIT`]; defaults to [`LIST_BATCHES_DEFAULT_LIMIT`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    /// Batch number to page from — the server returns batches strictly older
+    /// than `cursor`. Omit to start from the newest batch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<U64>,
+}
+
+/// Default page size for `zone_listBatches`.
+pub const LIST_BATCHES_DEFAULT_LIMIT: u32 = 20;
+
+/// Maximum page size for `zone_listBatches`.
+pub const LIST_BATCHES_MAX_LIMIT: u32 = 100;
+
+/// Response payload for `zone_listBatches`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchListResponse {
+    /// Returned batches in descending `batchNumber` order.
+    pub batches: Vec<BatchSummary>,
+    /// Cursor for the next page. Pass this as `cursor` in the next call.
+    /// `None` when no older batches remain.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<U64>,
+}
+
 /// Method access tier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MethodTier {
@@ -275,7 +406,10 @@ pub fn classify_method(method: &str) -> Option<MethodTier> {
         | "web3_sha3"
         | "zone_getAuthorizationTokenInfo"
         | "zone_getZoneInfo"
-        | "zone_getDepositStatus" => Some(MethodTier::Public),
+        | "zone_getDepositStatus"
+        | "zone_listBatches"
+        | "zone_getBatch"
+        | "zone_searchBatch" => Some(MethodTier::Public),
 
         // Fetch-then-check: public but redacted based on caller identity
         "eth_getTransactionByHash"
