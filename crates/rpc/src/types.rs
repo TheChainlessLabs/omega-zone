@@ -331,6 +331,113 @@ pub struct WithdrawalStatusResponse {
     pub error: Option<String>,
 }
 
+/// Settlement state of a sequencer batch returned by the batch explorer methods.
+///
+/// The batch explorer methods (`zone_listBatches`, `zone_getBatch`,
+/// `zone_searchBatch`) only return public, aggregate-only batch metadata. They
+/// never include per-user data; caller-scoped data belongs in private methods
+/// such as `zone_getDepositStatus` and `zone_getWithdrawalStatus`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BatchStatus {
+    /// Batch was sealed by the sequencer but no L1 `BatchSubmitted` event has
+    /// been observed yet. Reserved; listing endpoints only surface L1 batches.
+    Pending,
+    /// `BatchSubmitted` was observed on L1.
+    Submitted,
+    /// Reserved for future use once meaningful proof verification is enforced.
+    Verified,
+    /// L1 settlement attempt failed. Reserved; current explorer reads only
+    /// successful events.
+    Failed,
+}
+
+/// Aggregate per-token settled volume for a batch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchAggregateVolume {
+    /// Settled token address.
+    pub token: Address,
+    /// Aggregate amount settled for `token` in this batch.
+    pub amount: U256,
+}
+
+/// Aggregate-only summary of a single sequencer batch.
+///
+/// **Privacy:** This response is intentionally caller-agnostic. It must not
+/// include owner-linked fields, per-order ids, per-fill data, or counterparty
+/// information.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchSummary {
+    /// L1 portal `withdrawalBatchIndex` for this batch.
+    pub batch_number: U64,
+    /// First zone L2 block included in the batch, if resolvable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub zone_block_from: Option<U64>,
+    /// Last zone L2 block included in the batch, if resolvable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub zone_block_to: Option<U64>,
+    /// Tempo L1 block number anchored by `submitBatch`.
+    pub tempo_block_number: U64,
+    /// Withdrawal queue hash for this batch.
+    pub root: B256,
+    /// Portal `blockHash` before this batch was applied.
+    pub prev_block_hash: B256,
+    /// Portal `blockHash` after this batch was applied.
+    pub next_block_hash: B256,
+    /// Settlement state.
+    pub status: BatchStatus,
+    /// Zone block timestamp at `zone_block_to`, when resolvable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sealed_at: Option<U64>,
+    /// L1 block timestamp of the `BatchSubmitted` event.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub settled_at: Option<U64>,
+    /// Aggregate order count. Reserved for higher-layer indexing; zero today.
+    pub order_count: U64,
+    /// Aggregate fill count. Reserved for higher-layer indexing; zero today.
+    pub fill_count: U64,
+    /// Aggregate trading pair tags settled in the batch.
+    pub aggregate_pairs: Vec<String>,
+    /// Aggregate per-token volume settled by the batch.
+    pub aggregate_volume: Vec<BatchAggregateVolume>,
+    /// L1 transaction hash that emitted `BatchSubmitted`.
+    pub settlement_tx_hash: B256,
+    /// Reference to the settlement proof, when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proof_ref: Option<String>,
+}
+
+/// Pagination parameters for `zone_listBatches`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListBatchesParams {
+    /// Maximum number of summaries to return.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    /// Exclusive cursor batch number. Omit to start from the newest batch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<U64>,
+}
+
+/// Default page size for `zone_listBatches`.
+pub const LIST_BATCHES_DEFAULT_LIMIT: u32 = 20;
+
+/// Maximum page size for `zone_listBatches`.
+pub const LIST_BATCHES_MAX_LIMIT: u32 = 100;
+
+/// Response payload for `zone_listBatches`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchListResponse {
+    /// Returned batches in descending `batchNumber` order.
+    pub batches: Vec<BatchSummary>,
+    /// Cursor for the next page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<U64>,
+}
+
 /// Method access tier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MethodTier {
@@ -372,7 +479,10 @@ pub fn classify_method(method: &str) -> Option<MethodTier> {
         | "zone_getAuthorizationTokenInfo"
         | "zone_getZoneInfo"
         | "zone_getDepositStatus"
-        | "zone_getWithdrawalStatus" => Some(MethodTier::Public),
+        | "zone_getWithdrawalStatus"
+        | "zone_listBatches"
+        | "zone_getBatch"
+        | "zone_searchBatch" => Some(MethodTier::Public),
 
         // Fetch-then-check: public but redacted based on caller identity
         "eth_getTransactionByHash"

@@ -7,11 +7,12 @@ pub use zone_rpc::*;
 
 use std::{
     collections::{HashMap, HashSet},
+    str::FromStr,
     sync::{Arc, Weak},
     time::Duration,
 };
 
-use alloy_consensus::{Transaction as _, TxReceipt};
+use alloy_consensus::{BlockHeader, Transaction as _, TxReceipt};
 use alloy_network::{ReceiptResponse, TransactionResponse};
 use alloy_primitives::{Address, B256, Bloom, Bytes, U64, U256};
 use alloy_provider::{DynProvider, Provider, ProviderBuilder};
@@ -53,8 +54,9 @@ use crate::abi::{
 use zone_rpc::{
     auth::AuthContext,
     types::{
-        AuthorizationTokenInfoResponse, BoxEyreFut, BoxFut, DepositKind, DepositState,
-        DepositStatusEntry, DepositStatusResponse, JsonRpcError, WithdrawalState,
+        AuthorizationTokenInfoResponse, BatchListResponse, BatchStatus, BatchSummary, BoxEyreFut,
+        BoxFut, DepositKind, DepositState, DepositStatusEntry, DepositStatusResponse, JsonRpcError,
+        LIST_BATCHES_DEFAULT_LIMIT, LIST_BATCHES_MAX_LIMIT, ListBatchesParams, WithdrawalState,
         WithdrawalStatusQuery, WithdrawalStatusResponse, ZoneInfoResponse, internal, raw_null,
         raw_zero, to_raw,
     },
@@ -301,6 +303,130 @@ impl<Api: EthApiTypes + 'static> TempoZoneRpc<Api> {
             .enabled_tokens()
             .await
             .map_err(internal)
+    }
+
+    /// Read the portal's `withdrawalBatchIndex`, the highest batch number
+    /// currently observable on L1.
+    async fn latest_batch_number(&self) -> Result<u64, JsonRpcError> {
+        if self.config.zone_portal.is_zero() {
+            return Err(JsonRpcError::internal("zone portal not configured"));
+        }
+        ZonePortal::new(self.config.zone_portal, self.l1_provider.clone())
+            .withdrawalBatchIndex()
+            .call()
+            .await
+            .map_err(internal)
+    }
+
+    /// Fetch a single `BatchSubmitted` log by indexed `withdrawalBatchIndex`.
+    async fn fetch_batch_log(
+        &self,
+        batch_number: u64,
+    ) -> Result<Option<alloy_rpc_types_eth::Log>, JsonRpcError> {
+        if self.config.zone_portal.is_zero() {
+            return Err(JsonRpcError::internal("zone portal not configured"));
+        }
+        let filter = Filter::new()
+            .address(self.config.zone_portal)
+            .event_signature(ZonePortal::BatchSubmitted::SIGNATURE_HASH)
+            .topic1(batch_number_topic(batch_number))
+            .from_block(0);
+        let logs = self.l1_provider.get_logs(&filter).await.map_err(internal)?;
+        Ok(logs.into_iter().next())
+    }
+
+    /// Fetch `BatchSubmitted` logs for inclusive batch range `[start, end]`.
+    async fn fetch_batch_logs_in_range(
+        &self,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<alloy_rpc_types_eth::Log>, JsonRpcError> {
+        if self.config.zone_portal.is_zero() {
+            return Err(JsonRpcError::internal("zone portal not configured"));
+        }
+        if end < start {
+            return Ok(Vec::new());
+        }
+        let topics: Vec<B256> = (start..=end).map(batch_number_topic).collect();
+        let filter = Filter::new()
+            .address(self.config.zone_portal)
+            .event_signature(ZonePortal::BatchSubmitted::SIGNATURE_HASH)
+            .topic1(topics)
+            .from_block(0);
+        let mut logs = self.l1_provider.get_logs(&filter).await.map_err(internal)?;
+        logs.sort_by_key(|log| log_batch_index(log).unwrap_or(0));
+        Ok(logs)
+    }
+
+    /// Resolve a `BatchSubmitted` log into the public, aggregate-only summary
+    /// returned by the explorer methods.
+    async fn build_batch_summary(
+        &self,
+        log: alloy_rpc_types_eth::Log,
+    ) -> Result<BatchSummary, JsonRpcError> {
+        let event = ZonePortal::BatchSubmitted::decode_log(&log.inner)
+            .map_err(internal)?
+            .data;
+        let settlement_tx_hash = log
+            .transaction_hash
+            .ok_or_else(|| JsonRpcError::internal("BatchSubmitted log missing transaction hash"))?;
+        let l1_block_number = log
+            .block_number
+            .ok_or_else(|| JsonRpcError::internal("BatchSubmitted log missing block number"))?;
+
+        let (settled_at, tx, zone_block_to) = tokio::try_join!(
+            async {
+                self.l1_provider
+                    .get_block_by_number(l1_block_number.into())
+                    .await
+                    .map(|opt| opt.as_ref().map(|b| b.header.timestamp()))
+                    .map_err(internal)
+            },
+            async {
+                self.l1_provider
+                    .get_transaction_by_hash(settlement_tx_hash)
+                    .await
+                    .map_err(internal)?
+                    .ok_or_else(|| {
+                        JsonRpcError::internal("BatchSubmitted settlement tx not found on L1")
+                    })
+            },
+            async {
+                self.zone_provider
+                    .get_block_by_hash(event.nextBlockHash)
+                    .await
+                    .map_err(internal)
+            },
+        )?;
+
+        let call = ZonePortal::submitBatchCall::abi_decode(tx.input().as_ref()).map_err(|err| {
+            JsonRpcError::internal(format!("failed to decode submitBatch calldata: {err}"))
+        })?;
+
+        let (zone_block_to_number, sealed_at) = match zone_block_to {
+            Some(block) => (Some(block.number()), Some(block.header.timestamp())),
+            None => (None, None),
+        };
+
+        let zone_block_from_number = if call.blockTransition.prevBlockHash.is_zero() {
+            Some(0u64)
+        } else {
+            self.zone_provider
+                .get_block_by_hash(call.blockTransition.prevBlockHash)
+                .await
+                .map_err(internal)?
+                .map(|block| block.number())
+        };
+
+        Ok(map_batch_summary(
+            &event,
+            &call,
+            settlement_tx_hash,
+            settled_at,
+            zone_block_from_number,
+            zone_block_to_number,
+            sealed_at,
+        ))
     }
 
     /// Find the `WithdrawalRequested` event matching `query`, scoped to the
@@ -1153,6 +1279,124 @@ where
         })
     }
 
+    fn zone_list_batches(&self, params: ListBatchesParams, _auth: AuthContext) -> BoxFut<'_> {
+        Box::pin(async move {
+            let limit = params
+                .limit
+                .unwrap_or(LIST_BATCHES_DEFAULT_LIMIT)
+                .min(LIST_BATCHES_MAX_LIMIT)
+                .max(1);
+
+            let latest = self.latest_batch_number().await?;
+            if latest == 0 {
+                return to_raw(&BatchListResponse {
+                    batches: Vec::new(),
+                    next_cursor: None,
+                });
+            }
+
+            let end = match params.cursor {
+                Some(cursor) => {
+                    let cursor: u64 = cursor.to();
+                    if cursor == 0 {
+                        return to_raw(&BatchListResponse {
+                            batches: Vec::new(),
+                            next_cursor: None,
+                        });
+                    }
+                    cursor.saturating_sub(1).min(latest)
+                }
+                None => latest,
+            };
+
+            let start = end.saturating_sub((limit as u64).saturating_sub(1)).max(1);
+            let logs = self.fetch_batch_logs_in_range(start, end).await?;
+
+            let futures = logs
+                .into_iter()
+                .map(|log| self.build_batch_summary(log))
+                .collect::<Vec<_>>();
+            let mut batches = futures::future::try_join_all(futures).await?;
+            batches.sort_by(|a, b| b.batch_number.cmp(&a.batch_number));
+
+            let next_cursor = if start > 1 {
+                Some(U64::from(start))
+            } else {
+                None
+            };
+
+            to_raw(&BatchListResponse {
+                batches,
+                next_cursor,
+            })
+        })
+    }
+
+    fn zone_get_batch(&self, batch_number: u64, _auth: AuthContext) -> BoxFut<'_> {
+        Box::pin(async move {
+            if batch_number == 0 {
+                return Ok(raw_null());
+            }
+            let log = match self.fetch_batch_log(batch_number).await? {
+                Some(log) => log,
+                None => return Ok(raw_null()),
+            };
+            let summary = self.build_batch_summary(log).await?;
+            to_raw(&summary)
+        })
+    }
+
+    fn zone_search_batch(&self, query: String, _auth: AuthContext) -> BoxFut<'_> {
+        Box::pin(async move {
+            let trimmed = query.trim();
+            if trimmed.is_empty() {
+                return Err(JsonRpcError::invalid_params("query must not be empty"));
+            }
+
+            match classify_batch_query(trimmed) {
+                BatchQuery::BatchNumber(0) => Ok(raw_null()),
+                BatchQuery::BatchNumber(batch_number) => {
+                    let log = match self.fetch_batch_log(batch_number).await? {
+                        Some(log) => log,
+                        None => return Ok(raw_null()),
+                    };
+                    let summary = self.build_batch_summary(log).await?;
+                    to_raw(&summary)
+                }
+                BatchQuery::SettlementTxHash(tx_hash) => {
+                    let receipt = match self
+                        .l1_provider
+                        .get_transaction_receipt(tx_hash)
+                        .await
+                        .map_err(internal)?
+                    {
+                        Some(receipt) => receipt,
+                        None => return Ok(raw_null()),
+                    };
+                    let portal_address = self.config.zone_portal;
+                    let event_topic = ZonePortal::BatchSubmitted::SIGNATURE_HASH;
+                    let log = receipt
+                        .inner
+                        .logs()
+                        .iter()
+                        .find(|log| {
+                            log.address() == portal_address
+                                && log.topics().first() == Some(&event_topic)
+                        })
+                        .cloned();
+                    let Some(log) = log else {
+                        return Ok(raw_null());
+                    };
+                    let summary = self.build_batch_summary(log).await?;
+                    to_raw(&summary)
+                }
+                BatchQuery::Invalid => Err(JsonRpcError::invalid_params(
+                    "query must be a batch number (decimal or hex) or an L1 settlement tx hash",
+                )),
+            }
+        })
+    }
+
     fn zone_get_withdrawal_status(
         &self,
         query: WithdrawalStatusQuery,
@@ -1419,6 +1663,85 @@ enum TerminalLookup {
     /// guess, so the caller should keep the public status at `submitted` and
     /// surface this state via a non-sensitive error code.
     Ambiguous,
+}
+
+/// Classification of a `zone_searchBatch` query string.
+#[derive(Debug, PartialEq, Eq)]
+enum BatchQuery {
+    /// Decimal or hex batch number.
+    BatchNumber(u64),
+    /// Exactly 32-byte hex hash interpreted as the L1 settlement tx hash.
+    SettlementTxHash(B256),
+    /// Could not be parsed as either form.
+    Invalid,
+}
+
+fn classify_batch_query(query: &str) -> BatchQuery {
+    let hex_body = query
+        .strip_prefix("0x")
+        .or_else(|| query.strip_prefix("0X"));
+
+    if let Some(body) = hex_body
+        && body.len() == 64
+        && let Ok(hash) = B256::from_str(query)
+    {
+        return BatchQuery::SettlementTxHash(hash);
+    }
+
+    if let Ok(value) = U64::from_str(query) {
+        return BatchQuery::BatchNumber(value.to());
+    }
+    if let Ok(value) = query.parse::<u64>() {
+        return BatchQuery::BatchNumber(value);
+    }
+
+    BatchQuery::Invalid
+}
+
+/// Encode `batch_number` as the topic-1 value used by indexed `uint64` filters.
+fn batch_number_topic(batch_number: u64) -> B256 {
+    B256::from(U256::from(batch_number).to_be_bytes::<32>())
+}
+
+/// Decode the indexed `withdrawalBatchIndex` from topic-1 of a `BatchSubmitted` log.
+fn log_batch_index(log: &alloy_rpc_types_eth::Log) -> Option<u64> {
+    let topic = log.topics().get(1)?;
+    let bytes = topic.as_slice();
+    let last_eight = bytes.get(24..32)?;
+    let mut arr = [0u8; 8];
+    arr.copy_from_slice(last_eight);
+    Some(u64::from_be_bytes(arr))
+}
+
+/// Pure mapping: `BatchSubmitted` event + decoded `submitBatch` calldata +
+/// timing data to aggregate-only [`BatchSummary`].
+fn map_batch_summary(
+    event: &ZonePortal::BatchSubmitted,
+    call: &ZonePortal::submitBatchCall,
+    settlement_tx_hash: B256,
+    settled_at: Option<u64>,
+    zone_block_from: Option<u64>,
+    zone_block_to: Option<u64>,
+    sealed_at: Option<u64>,
+) -> BatchSummary {
+    BatchSummary {
+        batch_number: U64::from(event.withdrawalBatchIndex),
+        zone_block_from: zone_block_from.map(U64::from),
+        zone_block_to: zone_block_to.map(U64::from),
+        tempo_block_number: U64::from(call.tempoBlockNumber),
+        root: event.withdrawalQueueHash,
+        prev_block_hash: call.blockTransition.prevBlockHash,
+        next_block_hash: event.nextBlockHash,
+        status: BatchStatus::Submitted,
+        sealed_at: sealed_at.map(U64::from),
+        settled_at: settled_at.map(U64::from),
+        order_count: U64::ZERO,
+        fill_count: U64::ZERO,
+        aggregate_pairs: Vec::new(),
+        aggregate_volume: Vec::new(),
+        settlement_tx_hash,
+        proof_ref: None,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1766,6 +2089,163 @@ mod tests {
 
         let out = classify_terminal_candidates(vec![1u32, 2u32, 3u32]);
         assert!(matches!(out, TerminalCandidateOutcome::Ambiguous));
+    }
+
+    fn sample_batch_event(batch: u64) -> ZonePortal::BatchSubmitted {
+        ZonePortal::BatchSubmitted {
+            withdrawalBatchIndex: batch,
+            nextProcessedDepositQueueHash: B256::repeat_byte(0x11),
+            nextBlockHash: B256::repeat_byte(0x22),
+            withdrawalQueueHash: B256::repeat_byte(0x33),
+            lastProcessedDepositNumber: 7,
+        }
+    }
+
+    fn sample_batch_call(tempo_block: u64) -> ZonePortal::submitBatchCall {
+        ZonePortal::submitBatchCall {
+            tempoBlockNumber: tempo_block,
+            recentTempoBlockNumber: 0,
+            blockTransition: crate::abi::BlockTransition {
+                prevBlockHash: B256::repeat_byte(0x44),
+                nextBlockHash: B256::repeat_byte(0x22),
+            },
+            depositQueueTransition: crate::abi::DepositQueueTransition {
+                prevProcessedHash: B256::ZERO,
+                nextProcessedHash: B256::repeat_byte(0x11),
+                prevDepositNumber: 0,
+                nextDepositNumber: 7,
+            },
+            withdrawalQueueHash: B256::repeat_byte(0x33),
+            verifierConfig: Default::default(),
+            proof: Default::default(),
+        }
+    }
+
+    #[test]
+    fn map_batch_summary_uses_event_and_call_fields() {
+        let event = sample_batch_event(42);
+        let call = sample_batch_call(1_000);
+        let settlement_tx = B256::repeat_byte(0x55);
+
+        let summary = map_batch_summary(
+            &event,
+            &call,
+            settlement_tx,
+            Some(123),
+            Some(8),
+            Some(20),
+            Some(456),
+        );
+
+        assert_eq!(summary.batch_number, U64::from(42));
+        assert_eq!(summary.zone_block_from, Some(U64::from(8)));
+        assert_eq!(summary.zone_block_to, Some(U64::from(20)));
+        assert_eq!(summary.tempo_block_number, U64::from(1_000));
+        assert_eq!(summary.root, event.withdrawalQueueHash);
+        assert_eq!(summary.prev_block_hash, call.blockTransition.prevBlockHash);
+        assert_eq!(summary.next_block_hash, event.nextBlockHash);
+        assert_eq!(summary.status, BatchStatus::Submitted);
+        assert_eq!(summary.sealed_at, Some(U64::from(456)));
+        assert_eq!(summary.settled_at, Some(U64::from(123)));
+        assert_eq!(summary.settlement_tx_hash, settlement_tx);
+        assert_eq!(summary.proof_ref, None);
+    }
+
+    #[test]
+    fn map_batch_summary_emits_aggregate_only_fields() {
+        let event = sample_batch_event(7);
+        let call = sample_batch_call(50);
+        let summary = map_batch_summary(
+            &event,
+            &call,
+            B256::repeat_byte(0x66),
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let json = serde_json::to_value(&summary).expect("summary should serialize");
+        let obj = json.as_object().expect("summary must be a JSON object");
+        for forbidden in [
+            "from",
+            "to",
+            "sender",
+            "recipient",
+            "owner",
+            "counterparty",
+            "orderId",
+            "fillId",
+            "trader",
+            "userAddress",
+        ] {
+            assert!(
+                !obj.contains_key(forbidden),
+                "batch summary leaked owner-linked field `{forbidden}`",
+            );
+        }
+
+        assert_eq!(summary.order_count, U64::ZERO);
+        assert_eq!(summary.fill_count, U64::ZERO);
+        assert!(summary.aggregate_pairs.is_empty());
+        assert!(summary.aggregate_volume.is_empty());
+    }
+
+    #[test]
+    fn batch_number_topic_left_pads_uint64() {
+        let topic = batch_number_topic(0x2a);
+        assert_eq!(&topic.as_slice()[..24], &[0u8; 24]);
+        assert_eq!(
+            u64::from_be_bytes(topic.as_slice()[24..32].try_into().unwrap()),
+            42
+        );
+    }
+
+    #[test]
+    fn log_batch_index_round_trips_through_topic() {
+        let topics = vec![
+            ZonePortal::BatchSubmitted::SIGNATURE_HASH,
+            batch_number_topic(123),
+        ];
+        let log = alloy_rpc_types_eth::Log {
+            inner: alloy_primitives::Log {
+                address: Address::ZERO,
+                data: alloy_primitives::LogData::new_unchecked(topics, Bytes::default()),
+            },
+            block_hash: None,
+            block_number: None,
+            block_timestamp: None,
+            transaction_hash: None,
+            transaction_index: None,
+            log_index: None,
+            removed: false,
+        };
+        assert_eq!(log_batch_index(&log), Some(123));
+    }
+
+    #[test]
+    fn classify_batch_query_recognises_batch_numbers() {
+        assert_eq!(classify_batch_query("42"), BatchQuery::BatchNumber(42));
+        assert_eq!(classify_batch_query("0x2a"), BatchQuery::BatchNumber(42));
+        assert_eq!(classify_batch_query("0X2A"), BatchQuery::BatchNumber(42));
+    }
+
+    #[test]
+    fn classify_batch_query_recognises_settlement_tx_hash() {
+        let hash = format!("0x{}", "11".repeat(32));
+        match classify_batch_query(&hash) {
+            BatchQuery::SettlementTxHash(parsed) => {
+                assert_eq!(parsed, B256::repeat_byte(0x11));
+            }
+            other => panic!("expected SettlementTxHash, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_batch_query_rejects_garbage() {
+        assert_eq!(classify_batch_query("not-a-batch"), BatchQuery::Invalid);
+        let too_short = format!("0x{}", "11".repeat(31));
+        assert_eq!(classify_batch_query(&too_short), BatchQuery::Invalid);
     }
 
     #[test]
