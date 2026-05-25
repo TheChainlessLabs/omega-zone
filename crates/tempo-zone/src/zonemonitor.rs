@@ -43,6 +43,7 @@ use crate::{
         AnchorGapKind, BatchData, BatchSubmitter, ZoneBlockSnapshot, fetch_slot_withdrawals,
         log_query_ranges,
     },
+    proof::SharedProofProvider,
     withdrawals::SharedWithdrawalStore,
 };
 
@@ -141,6 +142,7 @@ impl ZoneMonitor {
         withdrawal_store: SharedWithdrawalStore,
         withdrawal_notify: Arc<Notify>,
         repair_notify: Arc<Notify>,
+        proof_provider: SharedProofProvider,
     ) -> Result<Self> {
         let zone_rpc_url = config.zone_rpc_url.clone();
         let retry_layer = RetryBackoffLayer::new(
@@ -167,6 +169,7 @@ impl ZoneMonitor {
             withdrawal_store,
             withdrawal_notify,
             repair_notify,
+            proof_provider,
         )
         .await
     }
@@ -178,6 +181,7 @@ impl ZoneMonitor {
         withdrawal_store: SharedWithdrawalStore,
         withdrawal_notify: Arc<Notify>,
         repair_notify: Arc<Notify>,
+        proof_provider: SharedProofProvider,
     ) -> Result<Self> {
         let metrics = crate::metrics::ZoneMonitorMetrics::default();
         let outbox = ZoneOutbox::new(config.outbox_address, provider.clone());
@@ -191,10 +195,11 @@ impl ZoneMonitor {
                 .await
                 .wrap_err("failed to read genesisTempoBlockNumber during zone monitor startup")?;
 
-        let batch_submitter = BatchSubmitter::new(
+        let batch_submitter = BatchSubmitter::new_with_proof_provider(
             config.portal_address,
             l1_provider,
             genesis_tempo_block_number,
+            proof_provider,
         );
 
         let (prev_zone_block_hash, portal_withdrawal_queue_tail) = tokio::try_join!(
@@ -723,6 +728,7 @@ impl ZoneMonitor {
                     self.metrics
                         .batch_submit_latency_seconds
                         .record(submit_started.elapsed().as_secs_f64());
+                    let revert_reason = decode_portal_revert(&e);
                     if attempt < MAX_RETRIES {
                         self.metrics.batch_submit_retry_total.increment(1);
                         warn!(
@@ -730,13 +736,13 @@ impl ZoneMonitor {
                             max_retries = MAX_RETRIES,
                             delay_secs = delay.as_secs(),
                             error = %e,
+                            revert_reason,
                             "Batch submission failed, retrying"
                         );
                         tokio::time::sleep(delay).await;
                         delay *= 2;
                     } else {
                         self.metrics.batch_submit_failure_total.increment(1);
-                        let revert_reason = decode_portal_revert(&e);
                         error!(
                             error = %e,
                             revert_reason,
@@ -949,12 +955,15 @@ impl ZoneMonitor {
 /// advances on successful submission.
 ///
 /// The `l1_provider` must already include the sequencer wallet for signing L1 transactions.
+/// The `proof_provider` produces the `(verifierConfig, proof)` payload submitted with
+/// each batch — see [`crate::proof`].
 pub fn spawn_zone_monitor(
     config: ZoneMonitorConfig,
     l1_provider: DynProvider<TempoNetwork>,
     withdrawal_store: SharedWithdrawalStore,
     withdrawal_notify: Arc<Notify>,
     repair_notify: Arc<Notify>,
+    proof_provider: SharedProofProvider,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut monitor = loop {
@@ -964,6 +973,7 @@ pub fn spawn_zone_monitor(
                 withdrawal_store.clone(),
                 withdrawal_notify.clone(),
                 repair_notify.clone(),
+                proof_provider.clone(),
             )
             .await
             {
@@ -986,16 +996,34 @@ pub fn spawn_zone_monitor(
 
 /// Try to decode a ZonePortal revert reason from an eyre error chain.
 ///
-/// Extracts hex-encoded revert data from the error's display string and decodes
-/// it using alloy's `ContractError`, which handles standard `Revert(string)`,
-/// `Panic(uint256)`, and ZonePortal custom errors (`NotSequencer`, etc.).
+/// Scrapes hex-encoded revert data from the error's display string and decodes
+/// it via alloy's `ContractError`, which covers standard `Revert(string)`,
+/// `Panic(uint256)`, and `ZonePortal` custom errors (`NotSequencer`,
+/// `InvalidProof`, ...). When decoding fails, falls back to reporting the raw
+/// 4-byte selector so an unknown verifier error still surfaces a hex tag
+/// instead of an opaque "execution reverted".
 fn decode_portal_revert(err: &eyre::Report) -> Option<String> {
     let msg = format!("{err}");
     let start = msg.find("data: \"0x")? + "data: \"".len();
     let end = msg[start..].find('"')? + start;
     let bytes = alloy_primitives::hex::decode(&msg[start..end]).ok()?;
-    let error = ContractError::<ZonePortal::ZonePortalErrors>::abi_decode(&bytes).ok()?;
-    Some(error.to_string())
+
+    if let Ok(error) = ContractError::<ZonePortal::ZonePortalErrors>::abi_decode(&bytes) {
+        return Some(error.to_string());
+    }
+
+    if bytes.len() >= 4 {
+        Some(format!(
+            "unknown revert selector 0x{} (data {} bytes)",
+            alloy_primitives::hex::encode(&bytes[..4]),
+            bytes.len()
+        ))
+    } else {
+        Some(format!(
+            "revert data {} bytes (too short for a selector)",
+            bytes.len()
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -1053,6 +1081,7 @@ mod tests {
         };
         let zone_provider = mock_provider(zone);
         let l1_provider = mock_provider(l1);
+        let proof_provider: SharedProofProvider = Arc::new(crate::proof::EmptyLegacyProofProvider);
 
         ZoneMonitor {
             config,
@@ -1062,7 +1091,12 @@ mod tests {
             inbox: ZoneInbox::new(Address::repeat_byte(0x33), zone_provider.clone()),
             tempo_state: TempoState::new(Address::repeat_byte(0x44), zone_provider),
             withdrawal_store: SharedWithdrawalStore::new(),
-            batch_submitter: BatchSubmitter::new(portal_address, l1_provider, 0),
+            batch_submitter: BatchSubmitter::new_with_proof_provider(
+                portal_address,
+                l1_provider,
+                0,
+                proof_provider,
+            ),
             withdrawal_notify: Arc::new(Notify::new()),
             repair_notify: Arc::new(Notify::new()),
             last_submitted_zone_block: 10,
@@ -1099,6 +1133,7 @@ mod tests {
             SharedWithdrawalStore::new(),
             Arc::new(Notify::new()),
             Arc::new(Notify::new()),
+            Arc::new(crate::proof::EmptyLegacyProofProvider),
         )
         .await
         {

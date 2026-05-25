@@ -500,6 +500,127 @@ impl ZoneRpcApi for ProxyZoneRpc {
             ))
         })
     }
+
+    fn zone_list_batches(
+        &self,
+        _params: crate::types::ListBatchesParams,
+        _auth: AuthContext,
+    ) -> BoxFut<'_> {
+        Box::pin(async move {
+            Err(JsonRpcError::internal(
+                "zone-specific methods are not supported by the proxy backend",
+            ))
+        })
+    }
+
+    fn zone_get_batch(&self, _batch_number: u64, _auth: AuthContext) -> BoxFut<'_> {
+        Box::pin(async move {
+            Err(JsonRpcError::internal(
+                "zone-specific methods are not supported by the proxy backend",
+            ))
+        })
+    }
+
+    fn zone_search_batch(&self, _query: String, _auth: AuthContext) -> BoxFut<'_> {
+        Box::pin(async move {
+            Err(JsonRpcError::internal(
+                "zone-specific methods are not supported by the proxy backend",
+            ))
+        })
+    }
+
+    fn zone_get_market_config(&self, _auth: AuthContext) -> BoxFut<'_> {
+        Box::pin(async move {
+            Err(JsonRpcError::internal(
+                "zone-specific methods are not supported by the proxy backend",
+            ))
+        })
+    }
+
+    fn zone_get_top_of_book(
+        &self,
+        _base: Address,
+        _quote: Address,
+        _auth: AuthContext,
+    ) -> BoxFut<'_> {
+        Box::pin(async move {
+            Err(JsonRpcError::internal(
+                "zone-specific methods are not supported by the proxy backend",
+            ))
+        })
+    }
+
+    fn zone_get_midpoint_history(
+        &self,
+        _base: Address,
+        _quote: Address,
+        _interval: String,
+        _limit: u32,
+        _cursor: Option<String>,
+        _auth: AuthContext,
+    ) -> BoxFut<'_> {
+        Box::pin(async move {
+            Err(JsonRpcError::internal(
+                "zone-specific methods are not supported by the proxy backend",
+            ))
+        })
+    }
+
+    fn zone_get_my_orders(
+        &self,
+        _query: crate::darkpool::HistoryQuery,
+        _auth: AuthContext,
+    ) -> BoxFut<'_> {
+        Box::pin(async move {
+            Err(JsonRpcError::internal(
+                "zone-specific methods are not supported by the proxy backend",
+            ))
+        })
+    }
+
+    fn zone_get_my_fills(
+        &self,
+        _query: crate::darkpool::HistoryQuery,
+        _auth: AuthContext,
+    ) -> BoxFut<'_> {
+        Box::pin(async move {
+            Err(JsonRpcError::internal(
+                "zone-specific methods are not supported by the proxy backend",
+            ))
+        })
+    }
+
+    fn zone_get_my_transfers(
+        &self,
+        _query: crate::darkpool::TransferQuery,
+        _auth: AuthContext,
+    ) -> BoxFut<'_> {
+        Box::pin(async move {
+            Err(JsonRpcError::internal(
+                "zone-specific methods are not supported by the proxy backend",
+            ))
+        })
+    }
+
+    fn zone_get_order(&self, _order_id: u128, _auth: AuthContext) -> BoxFut<'_> {
+        Box::pin(async move {
+            Err(JsonRpcError::internal(
+                "zone-specific methods are not supported by the proxy backend",
+            ))
+        })
+    }
+
+    fn zone_get_withdrawal_status(
+        &self,
+        _query: crate::types::WithdrawalStatusQuery,
+        _auth: AuthContext,
+    ) -> BoxFut<'_> {
+        Box::pin(async move {
+            Err(JsonRpcError::internal(
+                "zone-specific methods are not supported by the proxy backend",
+            ))
+        })
+    }
 }
 
 #[cfg(test)]

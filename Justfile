@@ -4,6 +4,17 @@ act_debug_mode := env("ACT", "false")
 zone_rpc := env("ZONE_RPC_URL", "http://localhost:8546")
 zone_http_port := env("ZONE_HTTP_PORT", "8546")
 
+# Private-alpha pinned addresses. These are deliberate constants — the alpha
+# tester flow refuses to fall back to ambient defaults so a wrong env var
+# cannot silently retarget setup at the moderato shared portal or the
+# `alphausd` L1 alias. See docs/ALPHA.md for the full runbook.
+alpha_oalpha    := "0x20C000000000000000000000518dDADD37eD1d28"
+alpha_pathusd   := "0x20C0000000000000000000000000000000000000"
+alpha_darkpool  := "0x0B00000000000000000000000000000000000001"
+alpha_portal    := "0xA6b5f8aF076DaAFBfd373a2629e4E46c8e03e6b2"
+alpha_zone_id   := "35"
+alpha_chain_id  := "421700035"
+
 [group('deps')]
 install-cross:
     cargo install cross --git https://github.com/cross-rs/cross
@@ -149,6 +160,19 @@ create-zone name token="":
         --initial-token "$ZONE_TOKEN_L1" \
         --sequencer "$SEQUENCER_ADDR" \
         --private-key "$PK"
+    GENESIS_JSON="$OUTPUT/genesis.json"
+    TMP_GENESIS="$(mktemp)"
+    jq '.config += {
+        t0Time: 0,
+        t1Time: 0,
+        t1aTime: 0,
+        t1bTime: 0,
+        t1cTime: 0,
+        t2Time: 0,
+        t3Time: 0,
+        t4Time: 0
+    }' "$GENESIS_JSON" > "$TMP_GENESIS"
+    mv "$TMP_GENESIS" "$GENESIS_JSON"
     echo "Zone '{{name}}' created. Artifacts in $OUTPUT/"
 
 [group('zone')]
@@ -239,6 +263,7 @@ zone-up name reset="false" profile="dev" args="":
                       --http \
                       --http.addr 0.0.0.0 \
                       --http.port {{zone_http_port}} \
+                      --http.corsdomain "*" \
                       --http.api all \
                       --datadir "$DATADIR" \
                       --log.file.directory "$DATADIR/logs" \
@@ -688,6 +713,19 @@ deploy-zone name token="":
         --initial-token "$ZONE_TOKEN_L1" \
         --sequencer "$SEQUENCER_ADDR" \
         --private-key "$SEQUENCER_KEY"
+    GENESIS_JSON="$OUTPUT/genesis.json"
+    TMP_GENESIS="$(mktemp)"
+    jq '.config += {
+        t0Time: 0,
+        t1Time: 0,
+        t1aTime: 0,
+        t1bTime: 0,
+        t1cTime: 0,
+        t2Time: 0,
+        t3Time: 0,
+        t4Time: 0
+    }' "$GENESIS_JSON" > "$TMP_GENESIS"
+    mv "$TMP_GENESIS" "$GENESIS_JSON"
     echo ""
 
     # Save sequencer key into zone.json for later use
@@ -744,6 +782,7 @@ deploy-zone name token="":
                       --http \
                       --http.addr 0.0.0.0 \
                       --http.port {{zone_http_port}} \
+                      --http.corsdomain "*" \
                       --http.api all \
                       --datadir "$DATADIR" \
                       --log.file.directory "$DATADIR/logs" \
@@ -797,3 +836,210 @@ docs-specs-test:
 [doc('Build Solidity specs')]
 docs-specs-build:
     cd specs/ref-impls && forge build --sizes
+
+# ─── Private alpha runbook ──────────────────────────────────────────────────
+# Deterministic bring-up for the OALPHA / PATH.USD market on zone 35. Intended
+# only for the private-alpha portal `{{alpha_portal}}` — see docs/ALPHA.md.
+# These recipes refuse the `alphausd` L1 alias because it resolves to a
+# different token than OALPHA and has caused confusion in earlier alpha bring-ups.
+
+[group('alpha')]
+[doc('Resolves a private-alpha token alias (oalpha, pathusd) or 0x address to its canonical address. Fails loudly on `alphausd` because it points to a different L1 token from the private-alpha OALPHA.')]
+alpha-resolve-token token:
+    #!/bin/bash
+    set -euo pipefail
+    TOKEN_LOWER=$(echo "{{token}}" | tr '[:upper:]' '[:lower:]')
+    case "$TOKEN_LOWER" in
+        oalpha|o-alpha|o_alpha)
+            echo "{{alpha_oalpha}}" ;;
+        pathusd|path-usd|path_usd)
+            echo "{{alpha_pathusd}}" ;;
+        alphausd|alpha-usd|alpha_usd)
+            echo "ERROR: 'alphausd' resolves to 0x20C0000000000000000000000000000000000001," >&2
+            echo "       which is NOT the private-alpha OALPHA token." >&2
+            echo "       Private alpha uses OALPHA = {{alpha_oalpha}}." >&2
+            echo "       Use the 'oalpha' alias or the explicit address." >&2
+            exit 1 ;;
+        0x*)
+            if [[ ${#TOKEN_LOWER} -ne 42 ]]; then
+                echo "ERROR: '{{token}}' is not a 20-byte 0x address." >&2
+                exit 1
+            fi
+            echo "{{token}}" ;;
+        *)
+            echo "ERROR: unknown token '{{token}}'. Use 'oalpha', 'pathusd', or a 0x address." >&2
+            exit 1 ;;
+    esac
+
+[group('alpha')]
+[doc('Checks whether a token is enabled on the private-alpha portal. Token defaults to OALPHA.')]
+alpha-token-status token="oalpha":
+    #!/bin/bash
+    set -euo pipefail
+    RPC="${L1_RPC_URL:?Set L1_RPC_URL env var}"
+    HTTP_RPC=$(echo "$RPC" | sed 's|^wss://|https://|' | sed 's|^ws://|http://|')
+    TOKEN=$(just alpha-resolve-token "{{token}}") || exit $?
+    ENABLED=$(cast call "{{alpha_portal}}" "isTokenEnabled(address)(bool)" "$TOKEN" --rpc-url "$HTTP_RPC")
+    printf '%-12s %s  enabled=%s\n' "{{token}}" "$TOKEN" "$ENABLED"
+
+[group('alpha')]
+[doc('Enables OALPHA on the private-alpha portal if not already enabled. Idempotent. Requires SEQUENCER_KEY and L1_RPC_URL.')]
+alpha-enable-oalpha:
+    #!/bin/bash
+    set -euo pipefail
+    RPC="${L1_RPC_URL:?Set L1_RPC_URL env var}"
+    HTTP_RPC=$(echo "$RPC" | sed 's|^wss://|https://|' | sed 's|^ws://|http://|')
+    ENABLED=$(cast call "{{alpha_portal}}" "isTokenEnabled(address)(bool)" "{{alpha_oalpha}}" --rpc-url "$HTTP_RPC")
+    if [[ "$ENABLED" == "true" ]]; then
+        echo "OALPHA already enabled on portal {{alpha_portal}}."
+        exit 0
+    fi
+    echo "OALPHA not enabled — calling enableToken via just enable-token..."
+    L1_PORTAL_ADDRESS="{{alpha_portal}}" just enable-token "{{alpha_oalpha}}"
+
+[group('alpha')]
+[doc('Funds an address with pathUSD on Tempo L1 via the testnet faucet RPC. Used to give USER and MAKER gas before they touch the alpha portal.')]
+alpha-prefund-l1 account:
+    #!/bin/bash
+    set -euo pipefail
+    RPC="${L1_RPC_URL:?Set L1_RPC_URL env var}"
+    HTTP_RPC=$(echo "$RPC" | sed 's|^wss://|https://|' | sed 's|^ws://|http://|')
+    echo "Funding {{account}} on L1 via tempo_fundAddress..."
+    cast rpc tempo_fundAddress "{{account}}" --rpc-url "$HTTP_RPC" > /dev/null
+    BAL=$(cast call "{{alpha_pathusd}}" "balanceOf(address)(uint256)" "{{account}}" --rpc-url "$HTTP_RPC")
+    echo "  L1 pathUSD balance: $BAL"
+
+[group('alpha')]
+[doc('Approves the private-alpha portal for max OALPHA and pathUSD spend from the caller. Caller signs with PRIVATE_KEY.')]
+alpha-approve-portal:
+    #!/bin/bash
+    set -euo pipefail
+    L1_PORTAL_ADDRESS="{{alpha_portal}}" just max-approve-portal "{{alpha_pathusd}}"
+    L1_PORTAL_ADDRESS="{{alpha_portal}}" just max-approve-portal "{{alpha_oalpha}}"
+
+[group('alpha')]
+[doc('Deposits OALPHA and pathUSD into the alpha zone for the caller (or a specified recipient). PRIVATE_KEY must already hold both tokens on L1. Amounts are in token sub-units (both tokens use 6 decimals).')]
+alpha-deposit oalpha_amount="10000000" pathusd_amount="10000000" to="":
+    #!/bin/bash
+    set -euo pipefail
+    PK="${PRIVATE_KEY:?Set PRIVATE_KEY env var}"
+    RECIPIENT="{{to}}"
+    if [[ -z "$RECIPIENT" ]]; then
+        RECIPIENT=$(cast wallet address "$PK")
+    fi
+    echo "Depositing to $RECIPIENT on portal {{alpha_portal}}:"
+    L1_PORTAL_ADDRESS="{{alpha_portal}}" just send-deposit "{{pathusd_amount}}" "$RECIPIENT" "{{alpha_pathusd}}"
+    L1_PORTAL_ADDRESS="{{alpha_portal}}" just send-deposit "{{oalpha_amount}}"  "$RECIPIENT" "{{alpha_oalpha}}"
+
+# No `alpha-approve-darkpool` recipe on purpose. The darkpool precompile pulls
+# escrow via `system_transfer_from`, not via TIP-20 `transferFrom`, so an EOA
+# main-key maker does not need a darkpool allowance — only L1 portal approvals
+# (covered by `alpha-approve-portal`) and a sufficient zone balance. See the
+# "Approvals: portal yes, darkpool no" section in docs/ALPHA.md.
+[group('alpha')]
+[doc('Places one resting bid (price=bid_price) and one resting ask (price=ask_price) for OALPHA/pathUSD on the alpha darkpool. Signs with MAKER_KEY env var. Maker must already hold OALPHA + pathUSD on the zone. No darkpool approve is needed — see docs/ALPHA.md.')]
+alpha-seed-liquidity amount="1000000" bid_price="1" ask_price="2" rpc=zone_rpc:
+    #!/bin/bash
+    set -euo pipefail
+    MK="${MAKER_KEY:?Set MAKER_KEY env var (maker private key for the resting orders)}"
+    if (( {{bid_price}} >= {{ask_price}} )); then
+        echo "ERROR: bid_price ({{bid_price}}) must be strictly less than ask_price ({{ask_price}})" >&2
+        exit 1
+    fi
+    MAKER_ADDR=$(cast wallet address "$MK")
+    echo "Seeding OALPHA / pathUSD darkpool liquidity from maker $MAKER_ADDR..."
+    echo "  bid: {{amount}} OALPHA @ {{bid_price}}  (escrows {{amount}}*{{bid_price}} pathUSD)"
+    BID_TX=$(cast send "{{alpha_darkpool}}" "place(address,uint128,uint128,bool)" \
+        "{{alpha_oalpha}}" "{{amount}}" "{{bid_price}}" true \
+        --rpc-url "{{rpc}}" --private-key "$MK" --gas-limit 500000 --json | jq -r '.transactionHash')
+    echo "  bid tx: $BID_TX"
+    echo "  ask: {{amount}} OALPHA @ {{ask_price}}  (escrows {{amount}} OALPHA)"
+    ASK_TX=$(cast send "{{alpha_darkpool}}" "place(address,uint128,uint128,bool)" \
+        "{{alpha_oalpha}}" "{{amount}}" "{{ask_price}}" false \
+        --rpc-url "{{rpc}}" --private-key "$MK" --gas-limit 500000 --json | jq -r '.transactionHash')
+    echo "  ask tx: $ASK_TX"
+
+[group('alpha')]
+[doc('Prints the final state a frontend tester needs: portal enablement, user + maker L1/zone balances, and best bid/ask on OALPHA. Reads USER_KEY (or PRIVATE_KEY) and MAKER_KEY for addresses.')]
+alpha-state rpc=zone_rpc:
+    #!/bin/bash
+    set -euo pipefail
+    RPC="${L1_RPC_URL:?Set L1_RPC_URL env var}"
+    HTTP_RPC=$(echo "$RPC" | sed 's|^wss://|https://|' | sed 's|^ws://|http://|')
+    USER_KEY_VAL="${USER_KEY:-${PRIVATE_KEY:-}}"
+    if [[ -z "$USER_KEY_VAL" ]]; then
+        echo "ERROR: set USER_KEY or PRIVATE_KEY env var to identify the user wallet." >&2
+        exit 1
+    fi
+    USER_ADDR=$(cast wallet address "$USER_KEY_VAL")
+    MAKER_ADDR=""
+    if [[ -n "${MAKER_KEY:-}" ]]; then
+        MAKER_ADDR=$(cast wallet address "$MAKER_KEY")
+    fi
+    echo "================================================================"
+    echo "  Private alpha state — portal {{alpha_portal}} (zone {{alpha_zone_id}})"
+    echo "================================================================"
+    just alpha-token-status pathusd
+    just alpha-token-status oalpha
+    echo
+    echo "User:  $USER_ADDR"
+    USER_L1_PATH=$(cast call "{{alpha_pathusd}}" "balanceOf(address)(uint256)" "$USER_ADDR" --rpc-url "$HTTP_RPC")
+    USER_L1_OALPHA=$(cast call "{{alpha_oalpha}}"  "balanceOf(address)(uint256)" "$USER_ADDR" --rpc-url "$HTTP_RPC")
+    USER_L2_PATH=$(cast call "{{alpha_pathusd}}" "balanceOf(address)(uint256)" "$USER_ADDR" --rpc-url "{{rpc}}")
+    USER_L2_OALPHA=$(cast call "{{alpha_oalpha}}"  "balanceOf(address)(uint256)" "$USER_ADDR" --rpc-url "{{rpc}}")
+    printf '  L1   pathUSD %-30s  OALPHA %s\n' "$USER_L1_PATH" "$USER_L1_OALPHA"
+    printf '  zone pathUSD %-30s  OALPHA %s\n' "$USER_L2_PATH" "$USER_L2_OALPHA"
+    if [[ -n "$MAKER_ADDR" ]]; then
+        echo
+        echo "Maker: $MAKER_ADDR"
+        MAKER_L2_PATH=$(cast call "{{alpha_pathusd}}" "balanceOf(address)(uint256)" "$MAKER_ADDR" --rpc-url "{{rpc}}")
+        MAKER_L2_OALPHA=$(cast call "{{alpha_oalpha}}"  "balanceOf(address)(uint256)" "$MAKER_ADDR" --rpc-url "{{rpc}}")
+        printf '  zone pathUSD %-30s  OALPHA %s\n' "$MAKER_L2_PATH" "$MAKER_L2_OALPHA"
+    fi
+    echo
+    echo "Darkpool {{alpha_darkpool}} — OALPHA/pathUSD top of book:"
+    BID=$(cast call "{{alpha_darkpool}}" "bestBid(address)(uint128,uint128)" "{{alpha_oalpha}}" --rpc-url "{{rpc}}")
+    ASK=$(cast call "{{alpha_darkpool}}" "bestAsk(address)(uint128,uint128)" "{{alpha_oalpha}}" --rpc-url "{{rpc}}")
+    echo "  best bid (price, quantity): $(echo "$BID" | tr '\n' ' ')"
+    echo "  best ask (price, quantity): $(echo "$ASK" | tr '\n' ' ')"
+
+[group('alpha')]
+[doc('One-shot private-alpha bring-up: enables OALPHA if needed, prefunds + deposits for USER and MAKER, seeds resting bid/ask around price 1, prints final state. Requires USER_KEY, MAKER_KEY, SEQUENCER_KEY, L1_RPC_URL env vars.')]
+alpha-setup oalpha_amount="10000000" pathusd_amount="10000000" seed_amount="1000000" bid_price="1" ask_price="2" rpc=zone_rpc:
+    #!/bin/bash
+    set -euo pipefail
+    USER_KEY_VAL="${USER_KEY:?Set USER_KEY env var (frontend tester private key)}"
+    MAKER_KEY_VAL="${MAKER_KEY:?Set MAKER_KEY env var (resting-liquidity private key)}"
+    USER_ADDR=$(cast wallet address "$USER_KEY_VAL")
+    MAKER_ADDR=$(cast wallet address "$MAKER_KEY_VAL")
+    echo "================================================================"
+    echo "  alpha-setup — portal {{alpha_portal}} (zone {{alpha_zone_id}})"
+    echo "  user   $USER_ADDR"
+    echo "  maker  $MAKER_ADDR"
+    echo "================================================================"
+
+    echo
+    echo "Step 1/5: ensure OALPHA is enabled on the alpha portal..."
+    just alpha-enable-oalpha
+
+    echo
+    echo "Step 2/5: prefund USER and MAKER with pathUSD on L1..."
+    just alpha-prefund-l1 "$USER_ADDR"
+    just alpha-prefund-l1 "$MAKER_ADDR"
+
+    echo
+    echo "Step 3/5: deposit USER funds into the zone..."
+    PRIVATE_KEY="$USER_KEY_VAL" just alpha-approve-portal
+    PRIVATE_KEY="$USER_KEY_VAL" just alpha-deposit "{{oalpha_amount}}" "{{pathusd_amount}}"
+
+    echo
+    echo "Step 4/5: deposit MAKER funds into the zone..."
+    PRIVATE_KEY="$MAKER_KEY_VAL" just alpha-approve-portal
+    PRIVATE_KEY="$MAKER_KEY_VAL" just alpha-deposit "{{oalpha_amount}}" "{{pathusd_amount}}"
+
+    echo
+    echo "Step 5/5: seed resting OALPHA / pathUSD liquidity from MAKER..."
+    just alpha-seed-liquidity "{{seed_amount}}" "{{bid_price}}" "{{ask_price}}" "{{rpc}}"
+
+    echo
+    just alpha-state "{{rpc}}"

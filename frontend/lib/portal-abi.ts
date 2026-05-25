@@ -109,6 +109,13 @@ export const TIP20_ABI = [
     outputs: [{ name: "", type: "string" }],
   },
   {
+    name: "quoteToken",
+    type: "function",
+    stateMutability: "view",
+    inputs: [],
+    outputs: [{ name: "", type: "address" }],
+  },
+  {
     name: "decimals",
     type: "function",
     stateMutability: "view",
@@ -117,4 +124,37 @@ export const TIP20_ABI = [
   },
 ] as const;
 
-export const PATH_USD = "0x20C0000000000000000000000000000000000000" as const;
+export const BRIDGE_TOKENS = [
+  {
+    id: "pathusd",
+    name: "Path USD",
+    symbol: "pathUSD",
+    address: "0x20C0000000000000000000000000000000000000",
+    decimals: 6,
+  },
+  {
+    id: "alphausd",
+    name: "Alpha USD",
+    symbol: "alphaUSD",
+    address: "0x20C0000000000000000000000000000000000001",
+    decimals: 6,
+  },
+  {
+    id: "betausd",
+    name: "Beta USD",
+    symbol: "betaUSD",
+    address: "0x20C0000000000000000000000000000000000002",
+    decimals: 6,
+  },
+  {
+    id: "thetausd",
+    name: "Theta USD",
+    symbol: "thetaUSD",
+    address: "0x20C0000000000000000000000000000000000003",
+    decimals: 6,
+  },
+] as const;
+
+export type BridgeToken = (typeof BRIDGE_TOKENS)[number];
+
+export const PATH_USD = BRIDGE_TOKENS[0].address;

@@ -3,16 +3,20 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
+    "sync:zone-env": "node scripts/sync-zone-env.mjs",
+    "predev": "npm run sync:zone-env",
     "dev": "next dev",
+    "prebuild": "npm run sync:zone-env",
     "build": "next build",
+    "prestart": "npm run sync:zone-env",
     "start": "next start",
     "lint": "eslint"
   },
   "dependencies": {
-    "@rainbow-me/rainbowkit": "^2.2.11",
     "@tanstack/react-query": "^5.100.9",
     "lucide-react": "^1.14.0",
     "next": "16.2.6",
+    "accounts": "~0.8.1",
     "react": "19.2.4",
     "react-dom": "19.2.4",
     "viem": "^2.48.11",
