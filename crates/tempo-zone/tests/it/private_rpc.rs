@@ -386,6 +386,36 @@ fn classify_admin_wildcard() {
 }
 
 #[test]
+fn classify_owner_scoped_darkpool_methods_are_public() {
+    for method in [
+        "zone_getMyOrders",
+        "zone_getMyFills",
+        "zone_getMyTransfers",
+        "zone_getOrder",
+    ] {
+        assert_eq!(
+            classify_method(method),
+            Some(MethodTier::Public),
+            "expected {method} to be Public"
+        );
+    }
+}
+
+// ============ Darkpool address / event topic drift guard ============
+
+/// The address constant duplicated into `zone-rpc` for owner-scoped history
+/// must match the actual darkpool precompile address. If this fails after a
+/// precompile change, update `zone_rpc::darkpool::DARKPOOL_ADDRESS`.
+#[test]
+fn darkpool_address_matches_precompile() {
+    assert_eq!(
+        zone::rpc::darkpool::DARKPOOL_ADDRESS,
+        zone::precompiles::DARKPOOL_ADDRESS,
+        "rpc constant drifted from precompile constant"
+    );
+}
+
+#[test]
 fn classify_unknown_is_none() {
     assert_eq!(classify_method("eth_someNewMethod"), None);
     assert_eq!(classify_method("foo_bar"), None);

@@ -69,12 +69,17 @@ pub fn verify_raw_tx_sender(data: &[u8], auth: &AuthContext) -> Result<(), JsonR
 
 #[cfg(test)]
 mod tests {
+    use alloy_consensus::{SignableTransaction, TxEip1559};
+    use alloy_eips::eip2718::Encodable2718;
     use alloy_primitives::{Address, Bytes, TxKind, U256};
     use alloy_rpc_types_eth::{TransactionInput, TransactionRequest};
+    use alloy_signer::SignerSync;
+    use alloy_signer_local::PrivateKeySigner;
     use tempo_alloy::rpc::TempoTransactionRequest;
-    use tempo_primitives::transaction::Call;
+    use tempo_primitives::{TempoTxEnvelope, transaction::Call};
 
-    use super::enforce_no_contract_creation;
+    use super::{enforce_no_contract_creation, verify_raw_tx_sender};
+    use crate::auth::AuthContext;
 
     fn call_target(byte: u8) -> TxKind {
         TxKind::Call(Address::repeat_byte(byte))
@@ -123,6 +128,63 @@ mod tests {
         }];
 
         assert!(enforce_no_contract_creation(&request).is_ok());
+    }
+
+    fn sign_eip1559_tx(signer: &PrivateKeySigner) -> Vec<u8> {
+        let tx = TxEip1559 {
+            chain_id: 99,
+            nonce: 0,
+            gas_limit: 21_000,
+            max_fee_per_gas: 1,
+            max_priority_fee_per_gas: 1,
+            to: TxKind::Call(Address::repeat_byte(0x11)),
+            value: U256::ZERO,
+            access_list: Default::default(),
+            input: Bytes::default(),
+        };
+        let sig = signer
+            .sign_hash_sync(&tx.signature_hash())
+            .expect("eip-1559 signing");
+        let signed = tx.into_signed(sig);
+        TempoTxEnvelope::Eip1559(signed).encoded_2718()
+    }
+
+    #[test]
+    fn verify_raw_tx_sender_accepts_matching_caller() {
+        let signer = PrivateKeySigner::random();
+        let encoded = sign_eip1559_tx(&signer);
+        let auth = AuthContext {
+            caller: signer.address(),
+            expires_at: u64::MAX,
+        };
+
+        verify_raw_tx_sender(&encoded, &auth).expect("matching sender accepted");
+    }
+
+    #[test]
+    fn verify_raw_tx_sender_rejects_sender_mismatch() {
+        let signer = PrivateKeySigner::random();
+        let encoded = sign_eip1559_tx(&signer);
+        let auth = AuthContext {
+            caller: Address::repeat_byte(0xff),
+            expires_at: u64::MAX,
+        };
+
+        let err = verify_raw_tx_sender(&encoded, &auth).unwrap_err();
+        assert_eq!(err.code, -32003);
+        assert_eq!(err.message, "Transaction rejected");
+    }
+
+    #[test]
+    fn verify_raw_tx_sender_rejects_malformed_payload() {
+        let auth = AuthContext {
+            caller: Address::repeat_byte(0xaa),
+            expires_at: u64::MAX,
+        };
+
+        let err = verify_raw_tx_sender(b"not-a-tx", &auth).unwrap_err();
+        assert_eq!(err.code, -32602);
+        assert!(err.message.contains("decode"));
     }
 
     #[test]

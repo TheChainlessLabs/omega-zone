@@ -14,10 +14,11 @@ use tracing::warn;
 
 use crate::{
     auth::AuthContext,
+    darkpool::{HistoryQuery, TransferQuery},
     subscription::BoxWsSubscriptionFut,
     types::{
-        BoxEyreFut, BoxFut, JsonRpcError, JsonRpcRequest, JsonRpcResponse, MethodTier,
-        classify_method,
+        BoxEyreFut, BoxFut, JsonRpcError, JsonRpcRequest, JsonRpcResponse, MarketPair, MethodTier,
+        WithdrawalStatusQuery, classify_method,
     },
 };
 
@@ -189,6 +190,72 @@ pub trait ZoneRpcApi: Send + Sync + 'static {
     /// `zone_getDepositStatus(tempoBlockNumber)` — returns per-caller deposit
     /// processing state for a Tempo L1 block.
     fn zone_get_deposit_status(&self, tempo_block_number: u64, auth: AuthContext) -> BoxFut<'_>;
+
+    /// `zone_listBatches(params)` — paginate public, aggregate-only batch
+    /// history. The response is caller-agnostic and must never include
+    /// owner-linked data.
+    fn zone_list_batches(
+        &self,
+        _params: crate::types::ListBatchesParams,
+        _auth: AuthContext,
+    ) -> BoxFut<'_> {
+        Box::pin(async { Err(JsonRpcError::method_disabled()) })
+    }
+
+    /// `zone_getBatch(batchNumber)` — return the public, aggregate-only
+    /// summary for a single batch. Returns `null` when the batch is not on L1.
+    fn zone_get_batch(&self, _batch_number: u64, _auth: AuthContext) -> BoxFut<'_> {
+        Box::pin(async { Err(JsonRpcError::method_disabled()) })
+    }
+
+    /// `zone_searchBatch(query)` — resolve a batch by batch number or L1
+    /// settlement tx hash.
+    fn zone_search_batch(&self, _query: String, _auth: AuthContext) -> BoxFut<'_> {
+        Box::pin(async { Err(JsonRpcError::method_disabled()) })
+    }
+
+    /// `zone_getMarketConfig()` — returns canonical market metadata.
+    fn zone_get_market_config(&self, auth: AuthContext) -> BoxFut<'_>;
+
+    /// `zone_getTopOfBook(pair)` — returns aggregate best bid/ask and midpoint.
+    fn zone_get_top_of_book(&self, base: Address, quote: Address, auth: AuthContext) -> BoxFut<'_>;
+
+    /// `zone_getMidpointHistory(pair, interval, limit, cursor?)` — returns
+    /// aggregate midpoint samples for charting.
+    fn zone_get_midpoint_history(
+        &self,
+        base: Address,
+        quote: Address,
+        interval: String,
+        limit: u32,
+        cursor: Option<String>,
+        auth: AuthContext,
+    ) -> BoxFut<'_>;
+
+    /// `zone_getMyOrders(query)` — returns the authenticated caller's
+    /// darkpool order history.
+    fn zone_get_my_orders(&self, query: HistoryQuery, auth: AuthContext) -> BoxFut<'_>;
+
+    /// `zone_getMyFills(query)` — returns the authenticated caller's darkpool
+    /// fill history.
+    fn zone_get_my_fills(&self, query: HistoryQuery, auth: AuthContext) -> BoxFut<'_>;
+
+    /// `zone_getMyTransfers(query)` — returns the authenticated caller's
+    /// TIP-20 transfer history.
+    fn zone_get_my_transfers(&self, query: TransferQuery, auth: AuthContext) -> BoxFut<'_>;
+
+    /// `zone_getOrder(orderId)` — returns a single owner-scoped darkpool order.
+    fn zone_get_order(&self, order_id: u128, auth: AuthContext) -> BoxFut<'_>;
+
+    /// `zone_getWithdrawalStatus(txHashOrWithdrawalIndex)` — returns lifecycle
+    /// status of the caller's own withdrawal, joining zone L2 outbox events with
+    /// L1 portal settlement events. Returns `null` if the withdrawal does not
+    /// exist or is not owned by the authenticated caller.
+    fn zone_get_withdrawal_status(
+        &self,
+        query: WithdrawalStatusQuery,
+        auth: AuthContext,
+    ) -> BoxFut<'_>;
 }
 
 /// Deserialize JSON-RPC params, returning an error response on failure.
@@ -276,6 +343,12 @@ pub async fn dispatch(
         MethodTier::Restricted => {
             return JsonRpcResponse::error(id, JsonRpcError::sequencer_only());
         }
+        MethodTier::UnsupportedAccountManagement => {
+            return JsonRpcResponse::error(
+                id,
+                JsonRpcError::unsupported_account_method(&req.method),
+            );
+        }
         _ => {}
     }
 
@@ -342,6 +415,21 @@ pub async fn dispatch(
             api.zone_get_zone_info(auth.clone()).await,
         ),
         "zone_getDepositStatus" => handle_zone_get_deposit_status(id, raw, auth, api).await,
+        "zone_listBatches" => handle_zone_list_batches(id, raw, auth, api).await,
+        "zone_getBatch" => handle_zone_get_batch(id, raw, auth, api).await,
+        "zone_searchBatch" => handle_zone_search_batch(id, raw, auth, api).await,
+        "zone_getMarketConfig" => api_result(
+            id,
+            "zone_getMarketConfig",
+            api.zone_get_market_config(auth.clone()).await,
+        ),
+        "zone_getTopOfBook" => handle_zone_get_top_of_book(id, raw, auth, api).await,
+        "zone_getMidpointHistory" => handle_zone_get_midpoint_history(id, raw, auth, api).await,
+        "zone_getMyOrders" => handle_zone_get_my_orders(id, raw, auth, api).await,
+        "zone_getMyFills" => handle_zone_get_my_fills(id, raw, auth, api).await,
+        "zone_getMyTransfers" => handle_zone_get_my_transfers(id, raw, auth, api).await,
+        "zone_getOrder" => handle_zone_get_order(id, raw, auth, api).await,
+        "zone_getWithdrawalStatus" => handle_zone_get_withdrawal_status(id, raw, auth, api).await,
         _ => {
             // Method is whitelisted but not yet implemented via direct API
             JsonRpcResponse::error(
@@ -724,6 +812,268 @@ async fn handle_uninstall_filter(
     )
 }
 
+/// Handle `zone_listBatches(params)`.
+///
+/// Accepts either `[]`, `[params]`, or `[limit, cursor]` for ergonomic clients.
+async fn handle_zone_list_batches(
+    id: Value,
+    raw: &str,
+    auth: &AuthContext,
+    api: &dyn ZoneRpcApi,
+) -> JsonRpcResponse {
+    let params = match parse_list_batches_params(raw) {
+        Ok(params) => params,
+        Err(msg) => return JsonRpcResponse::error(id, JsonRpcError::invalid_params(msg)),
+    };
+
+    api_result(
+        id,
+        "zone_listBatches",
+        api.zone_list_batches(params, auth.clone()).await,
+    )
+}
+
+/// Parse `zone_listBatches` params into a [`ListBatchesParams`].
+#[allow(clippy::result_large_err)]
+fn parse_list_batches_params(raw: &str) -> Result<crate::types::ListBatchesParams, &'static str> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed == "[]" {
+        return Ok(crate::types::ListBatchesParams::default());
+    }
+
+    if let Ok((params,)) = serde_json::from_str::<(crate::types::ListBatchesParams,)>(raw) {
+        return Ok(params);
+    }
+
+    if let Ok((limit, cursor)) = serde_json::from_str::<(Option<u32>, Option<U64>)>(raw) {
+        return Ok(crate::types::ListBatchesParams { limit, cursor });
+    }
+
+    Err("expected [] or [params] for zone_listBatches")
+}
+
+/// Handle `zone_getBatch(batchNumber)`.
+async fn handle_zone_get_batch(
+    id: Value,
+    raw: &str,
+    auth: &AuthContext,
+    api: &dyn ZoneRpcApi,
+) -> JsonRpcResponse {
+    let (batch_number,) = match parse_params::<(String,)>(raw, &id, "expected [batchNumber]") {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let batch_number = match U64::from_str(&batch_number) {
+        Ok(value) => value.to(),
+        Err(_) => {
+            return JsonRpcResponse::error(
+                id,
+                JsonRpcError::invalid_params("expected [batchNumber]"),
+            );
+        }
+    };
+
+    api_result(
+        id,
+        "zone_getBatch",
+        api.zone_get_batch(batch_number, auth.clone()).await,
+    )
+}
+
+/// Handle `zone_searchBatch(query)`.
+async fn handle_zone_search_batch(
+    id: Value,
+    raw: &str,
+    auth: &AuthContext,
+    api: &dyn ZoneRpcApi,
+) -> JsonRpcResponse {
+    let (query,) = match parse_params::<(String,)>(raw, &id, "expected [query]") {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+
+    api_result(
+        id,
+        "zone_searchBatch",
+        api.zone_search_batch(query, auth.clone()).await,
+    )
+}
+
+/// Handle `zone_getTopOfBook(pair)`.
+async fn handle_zone_get_top_of_book(
+    id: Value,
+    raw: &str,
+    auth: &AuthContext,
+    api: &dyn ZoneRpcApi,
+) -> JsonRpcResponse {
+    let (pair,) = match parse_params::<(MarketPair,)>(raw, &id, "expected [{base, quote}]") {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+
+    api_result(
+        id,
+        "zone_getTopOfBook",
+        api.zone_get_top_of_book(pair.base, pair.quote, auth.clone())
+            .await,
+    )
+}
+
+const DEFAULT_MIDPOINT_HISTORY_LIMIT: u32 = 500;
+const MAX_MIDPOINT_HISTORY_LIMIT: u32 = 5_000;
+
+/// Params for `zone_getMidpointHistory`: `[{base, quote}, interval, limit?, cursor?]`.
+#[derive(serde::Deserialize)]
+struct MidpointHistoryParams(
+    MarketPair,
+    String,
+    #[serde(default)] Option<u32>,
+    #[serde(default)] Option<String>,
+);
+
+/// Handle `zone_getMidpointHistory(pair, interval, limit?, cursor?)`.
+async fn handle_zone_get_midpoint_history(
+    id: Value,
+    raw: &str,
+    auth: &AuthContext,
+    api: &dyn ZoneRpcApi,
+) -> JsonRpcResponse {
+    let MidpointHistoryParams(pair, interval, limit, cursor) = match parse_params(
+        raw,
+        &id,
+        "expected [{base, quote}, interval, limit?, cursor?]",
+    ) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+
+    let limit = limit
+        .unwrap_or(DEFAULT_MIDPOINT_HISTORY_LIMIT)
+        .min(MAX_MIDPOINT_HISTORY_LIMIT);
+
+    api_result(
+        id,
+        "zone_getMidpointHistory",
+        api.zone_get_midpoint_history(pair.base, pair.quote, interval, limit, cursor, auth.clone())
+            .await,
+    )
+}
+
+/// Handle `zone_getMyOrders(query)`.
+async fn handle_zone_get_my_orders(
+    id: Value,
+    raw: &str,
+    auth: &AuthContext,
+    api: &dyn ZoneRpcApi,
+) -> JsonRpcResponse {
+    let query = match parse_history_query(raw, &id) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    api_result(
+        id,
+        "zone_getMyOrders",
+        api.zone_get_my_orders(query, auth.clone()).await,
+    )
+}
+
+/// Handle `zone_getMyFills(query)`.
+async fn handle_zone_get_my_fills(
+    id: Value,
+    raw: &str,
+    auth: &AuthContext,
+    api: &dyn ZoneRpcApi,
+) -> JsonRpcResponse {
+    let query = match parse_history_query(raw, &id) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    api_result(
+        id,
+        "zone_getMyFills",
+        api.zone_get_my_fills(query, auth.clone()).await,
+    )
+}
+
+/// Handle `zone_getMyTransfers(query)`.
+async fn handle_zone_get_my_transfers(
+    id: Value,
+    raw: &str,
+    auth: &AuthContext,
+    api: &dyn ZoneRpcApi,
+) -> JsonRpcResponse {
+    let query = match parse_transfer_query(raw, &id) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    api_result(
+        id,
+        "zone_getMyTransfers",
+        api.zone_get_my_transfers(query, auth.clone()).await,
+    )
+}
+
+/// Handle `zone_getOrder(orderId)`.
+async fn handle_zone_get_order(
+    id: Value,
+    raw: &str,
+    auth: &AuthContext,
+    api: &dyn ZoneRpcApi,
+) -> JsonRpcResponse {
+    let (order_id_hex,) = match parse_params::<(String,)>(raw, &id, "expected [orderId]") {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let order_id = match alloy_primitives::U128::from_str(&order_id_hex) {
+        Ok(v) => v.to::<u128>(),
+        Err(_) => {
+            return JsonRpcResponse::error(
+                id,
+                JsonRpcError::invalid_params("orderId must be a hex quantity"),
+            );
+        }
+    };
+    api_result(
+        id,
+        "zone_getOrder",
+        api.zone_get_order(order_id, auth.clone()).await,
+    )
+}
+
+#[allow(clippy::result_large_err)]
+fn parse_history_query(raw: &str, id: &Value) -> Result<HistoryQuery, JsonRpcResponse> {
+    let parsed: Vec<Option<HistoryQuery>> = serde_json::from_str(raw).map_err(|_| {
+        JsonRpcResponse::error(
+            id.clone(),
+            JsonRpcError::invalid_params("expected [query?]"),
+        )
+    })?;
+    if parsed.len() > 1 {
+        return Err(JsonRpcResponse::error(
+            id.clone(),
+            JsonRpcError::invalid_params("expected [query?]"),
+        ));
+    }
+    Ok(parsed.into_iter().next().flatten().unwrap_or_default())
+}
+
+#[allow(clippy::result_large_err)]
+fn parse_transfer_query(raw: &str, id: &Value) -> Result<TransferQuery, JsonRpcResponse> {
+    let parsed: Vec<Option<TransferQuery>> = serde_json::from_str(raw).map_err(|_| {
+        JsonRpcResponse::error(
+            id.clone(),
+            JsonRpcError::invalid_params("expected [query?]"),
+        )
+    })?;
+    if parsed.len() > 1 {
+        return Err(JsonRpcResponse::error(
+            id.clone(),
+            JsonRpcError::invalid_params("expected [query?]"),
+        ));
+    }
+    Ok(parsed.into_iter().next().flatten().unwrap_or_default())
+}
+
 /// Handle `zone_getDepositStatus(tempoBlockNumber)`.
 async fn handle_zone_get_deposit_status(
     id: Value,
@@ -754,6 +1104,55 @@ async fn handle_zone_get_deposit_status(
     )
 }
 
+/// Handle `zone_getWithdrawalStatus(txHashOrWithdrawalIndex)`.
+///
+/// Accepts a single hex-encoded string that is parsed either as a 32-byte
+/// transaction hash or, failing that, as a `U64` quantity withdrawal index.
+async fn handle_zone_get_withdrawal_status(
+    id: Value,
+    raw: &str,
+    auth: &AuthContext,
+    api: &dyn ZoneRpcApi,
+) -> JsonRpcResponse {
+    let (param,) = match parse_params::<(String,)>(raw, &id, "expected [txHashOrWithdrawalIndex]") {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+
+    let query = match parse_withdrawal_status_query(&param) {
+        Ok(q) => q,
+        Err(err) => return JsonRpcResponse::error(id, err),
+    };
+
+    api_result(
+        id,
+        "zone_getWithdrawalStatus",
+        api.zone_get_withdrawal_status(query, auth.clone()).await,
+    )
+}
+
+/// Parse a `zone_getWithdrawalStatus` parameter into either a tx hash or a
+/// withdrawal index.
+///
+/// A 32-byte hex string (`0x` + 64 hex chars) is treated as a transaction hash.
+/// Any other valid hex quantity is treated as a `U64` withdrawal index.
+fn parse_withdrawal_status_query(param: &str) -> Result<WithdrawalStatusQuery, JsonRpcError> {
+    let stripped = param
+        .strip_prefix("0x")
+        .or_else(|| param.strip_prefix("0X"));
+    if let Some(hex) = stripped
+        && hex.len() == 64
+        && hex.chars().all(|c| c.is_ascii_hexdigit())
+        && let Ok(hash) = B256::from_str(param)
+    {
+        return Ok(WithdrawalStatusQuery::TxHash(hash));
+    }
+
+    U64::from_str(param)
+        .map(|v| WithdrawalStatusQuery::WithdrawalIndex(v.to()))
+        .map_err(|_| JsonRpcError::invalid_params("expected [txHashOrWithdrawalIndex]"))
+}
+
 /// Zones do not have a real pending block, so treat `pending` as `latest`.
 fn normalize_block_number(number: BlockNumberOrTag) -> BlockNumberOrTag {
     if number.is_pending() {
@@ -765,7 +1164,10 @@ fn normalize_block_number(number: BlockNumberOrTag) -> BlockNumberOrTag {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicU64, Ordering},
+    };
 
     use alloy_primitives::Address;
     use serde_json::json;
@@ -775,12 +1177,18 @@ mod tests {
 
     struct MockZoneRpcApi {
         last_tempo_block_number: AtomicU64,
+        last_withdrawal_query: Mutex<Option<WithdrawalStatusQuery>>,
+        last_midpoint_limit: AtomicU64,
+        last_midpoint_cursor: Mutex<Option<String>>,
     }
 
     impl Default for MockZoneRpcApi {
         fn default() -> Self {
             Self {
                 last_tempo_block_number: AtomicU64::new(0),
+                last_withdrawal_query: Mutex::new(None),
+                last_midpoint_limit: AtomicU64::new(0),
+                last_midpoint_cursor: Mutex::new(None),
             }
         }
     }
@@ -857,6 +1265,128 @@ mod tests {
                 }))
             })
         }
+
+        fn zone_get_market_config(&self, _auth: AuthContext) -> BoxFut<'_> {
+            Box::pin(async move {
+                to_raw(&json!({
+                    "darkpool": format!("{:#x}", Address::repeat_byte(0xdd)),
+                    "markets": [],
+                }))
+            })
+        }
+
+        fn zone_get_top_of_book(
+            &self,
+            base: Address,
+            quote: Address,
+            _auth: AuthContext,
+        ) -> BoxFut<'_> {
+            Box::pin(async move {
+                to_raw(&json!({
+                    "pair": "MOCK/MOCK",
+                    "base": base,
+                    "quote": quote,
+                    "bid": null,
+                    "ask": null,
+                    "midpoint": null,
+                    "spread": null,
+                    "asOfBlock": "0x0",
+                }))
+            })
+        }
+
+        fn zone_get_midpoint_history(
+            &self,
+            base: Address,
+            quote: Address,
+            interval: String,
+            limit: u32,
+            cursor: Option<String>,
+            _auth: AuthContext,
+        ) -> BoxFut<'_> {
+            self.last_midpoint_limit
+                .store(limit as u64, Ordering::Relaxed);
+            *self
+                .last_midpoint_cursor
+                .lock()
+                .expect("mock lock poisoned") = cursor;
+            Box::pin(async move {
+                to_raw(&json!({
+                    "pair": "MOCK/MOCK",
+                    "base": base,
+                    "quote": quote,
+                    "interval": interval,
+                    "samples": [],
+                    "nextCursor": null,
+                    "history": {
+                        "enabled": false,
+                        "reason": "mock",
+                    },
+                }))
+            })
+        }
+
+        fn zone_get_my_orders(
+            &self,
+            query: crate::darkpool::HistoryQuery,
+            auth: AuthContext,
+        ) -> BoxFut<'_> {
+            Box::pin(async move {
+                crate::darkpool::require_owner(query.account, &auth.caller)?;
+                to_raw(&crate::darkpool::Page::<crate::darkpool::OrderEntry> {
+                    items: vec![],
+                    next_cursor: None,
+                })
+            })
+        }
+
+        fn zone_get_my_fills(
+            &self,
+            query: crate::darkpool::HistoryQuery,
+            auth: AuthContext,
+        ) -> BoxFut<'_> {
+            Box::pin(async move {
+                crate::darkpool::require_owner(query.account, &auth.caller)?;
+                to_raw(&crate::darkpool::Page::<crate::darkpool::FillEntry> {
+                    items: vec![],
+                    next_cursor: None,
+                })
+            })
+        }
+
+        fn zone_get_my_transfers(
+            &self,
+            query: crate::darkpool::TransferQuery,
+            auth: AuthContext,
+        ) -> BoxFut<'_> {
+            Box::pin(async move {
+                crate::darkpool::require_owner(query.account, &auth.caller)?;
+                to_raw(&crate::darkpool::Page::<crate::darkpool::TransferEntry> {
+                    items: vec![],
+                    next_cursor: None,
+                })
+            })
+        }
+
+        fn zone_get_order(&self, _order_id: u128, _auth: AuthContext) -> BoxFut<'_> {
+            Box::pin(async { Ok(crate::types::raw_null()) })
+        }
+
+        fn zone_get_withdrawal_status(
+            &self,
+            query: WithdrawalStatusQuery,
+            _auth: AuthContext,
+        ) -> BoxFut<'_> {
+            self.last_withdrawal_query
+                .lock()
+                .expect("mock lock poisoned")
+                .replace(query);
+            Box::pin(async move {
+                to_raw(&json!({
+                    "status": "pending",
+                }))
+            })
+        }
     }
 
     fn auth() -> AuthContext {
@@ -927,10 +1457,307 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dispatches_zone_get_market_config() {
+        let api = MockZoneRpcApi::default();
+        let resp = dispatch(&request("zone_getMarketConfig", json!([])), &auth(), &api).await;
+
+        assert!(resp.error.is_none());
+        let body: serde_json::Value =
+            serde_json::from_str(resp.result.as_ref().unwrap().get()).unwrap();
+        assert_eq!(
+            body["darkpool"],
+            format!("{:#x}", Address::repeat_byte(0xdd))
+        );
+        assert!(body["markets"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn dispatches_zone_get_top_of_book_with_pair_object() {
+        let api = MockZoneRpcApi::default();
+        let base = format!("{:#x}", Address::repeat_byte(0x11));
+        let quote = format!("{:#x}", Address::repeat_byte(0x22));
+
+        let resp = dispatch(
+            &request("zone_getTopOfBook", json!([{"base": base, "quote": quote}])),
+            &auth(),
+            &api,
+        )
+        .await;
+
+        assert!(resp.error.is_none(), "{:?}", resp.error);
+        let body: serde_json::Value =
+            serde_json::from_str(resp.result.as_ref().unwrap().get()).unwrap();
+        assert_eq!(body["base"], base);
+        assert_eq!(body["quote"], quote);
+        assert!(body["bid"].is_null());
+        assert!(body["ask"].is_null());
+    }
+
+    #[tokio::test]
+    async fn rejects_zone_get_top_of_book_missing_pair() {
+        let api = MockZoneRpcApi::default();
+        let resp = dispatch(&request("zone_getTopOfBook", json!([])), &auth(), &api).await;
+
+        assert!(resp.result.is_none());
+        let err = resp.error.expect("missing pair must error");
+        assert_eq!(err.code, -32602);
+        assert_eq!(err.message, "expected [{base, quote}]");
+    }
+
+    #[tokio::test]
+    async fn dispatches_zone_get_midpoint_history_defaults_limit_when_omitted() {
+        let api = MockZoneRpcApi::default();
+        let base = format!("{:#x}", Address::repeat_byte(0x11));
+        let quote = format!("{:#x}", Address::repeat_byte(0x22));
+
+        let resp = dispatch(
+            &request(
+                "zone_getMidpointHistory",
+                json!([{"base": base, "quote": quote}, "1m"]),
+            ),
+            &auth(),
+            &api,
+        )
+        .await;
+        assert!(resp.error.is_none(), "{:?}", resp.error);
+        assert_eq!(
+            api.last_midpoint_limit.load(Ordering::Relaxed),
+            DEFAULT_MIDPOINT_HISTORY_LIMIT as u64,
+        );
+        assert!(api.last_midpoint_cursor.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn dispatches_zone_get_midpoint_history_caps_limit() {
+        let api = MockZoneRpcApi::default();
+        let base = format!("{:#x}", Address::repeat_byte(0x11));
+        let quote = format!("{:#x}", Address::repeat_byte(0x22));
+
+        let resp = dispatch(
+            &request(
+                "zone_getMidpointHistory",
+                json!([
+                    {"base": base, "quote": quote},
+                    "1m",
+                    MAX_MIDPOINT_HISTORY_LIMIT + 99,
+                    "cur-1",
+                ]),
+            ),
+            &auth(),
+            &api,
+        )
+        .await;
+        assert!(resp.error.is_none(), "{:?}", resp.error);
+        assert_eq!(
+            api.last_midpoint_limit.load(Ordering::Relaxed),
+            MAX_MIDPOINT_HISTORY_LIMIT as u64,
+        );
+        assert_eq!(
+            api.last_midpoint_cursor.lock().unwrap().as_deref(),
+            Some("cur-1"),
+        );
+    }
+
+    #[tokio::test]
+    async fn zone_get_my_orders_defaults_to_caller() {
+        let api = MockZoneRpcApi::default();
+        let resp = dispatch(&request("zone_getMyOrders", json!([])), &auth(), &api).await;
+
+        assert!(resp.error.is_none(), "no-args call must succeed");
+        let body: serde_json::Value =
+            serde_json::from_str(resp.result.as_ref().unwrap().get()).unwrap();
+        assert!(body["items"].as_array().unwrap().is_empty());
+        assert!(body["nextCursor"].is_null());
+    }
+
+    #[tokio::test]
+    async fn zone_get_my_orders_accepts_matching_account() {
+        let api = MockZoneRpcApi::default();
+        let resp = dispatch(
+            &request(
+                "zone_getMyOrders",
+                json!([{ "account": format!("{:#x}", Address::repeat_byte(0xaa)) }]),
+            ),
+            &auth(),
+            &api,
+        )
+        .await;
+        assert!(resp.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn zone_get_my_orders_rejects_foreign_account() {
+        let api = MockZoneRpcApi::default();
+        let foreign = Address::repeat_byte(0xbb);
+        let resp = dispatch(
+            &request(
+                "zone_getMyOrders",
+                json!([{ "account": format!("{:#x}", foreign) }]),
+            ),
+            &auth(),
+            &api,
+        )
+        .await;
+        assert!(resp.result.is_none(), "foreign-account query must fail");
+        let err = resp.error.expect("should reject foreign account");
+        assert_eq!(err.code, -32004);
+        assert_eq!(err.message, "Account mismatch");
+    }
+
+    #[tokio::test]
+    async fn zone_get_my_fills_rejects_foreign_account() {
+        let api = MockZoneRpcApi::default();
+        let foreign = Address::repeat_byte(0xcc);
+        let resp = dispatch(
+            &request(
+                "zone_getMyFills",
+                json!([{ "account": format!("{:#x}", foreign) }]),
+            ),
+            &auth(),
+            &api,
+        )
+        .await;
+        let err = resp.error.expect("should reject foreign account");
+        assert_eq!(err.code, -32004);
+    }
+
+    #[tokio::test]
+    async fn zone_get_my_transfers_rejects_foreign_account() {
+        let api = MockZoneRpcApi::default();
+        let foreign = Address::repeat_byte(0xdd);
+        let resp = dispatch(
+            &request(
+                "zone_getMyTransfers",
+                json!([{ "account": format!("{:#x}", foreign) }]),
+            ),
+            &auth(),
+            &api,
+        )
+        .await;
+        let err = resp.error.expect("should reject foreign account");
+        assert_eq!(err.code, -32004);
+    }
+
+    #[tokio::test]
+    async fn zone_get_order_accepts_hex_id() {
+        let api = MockZoneRpcApi::default();
+        let resp = dispatch(&request("zone_getOrder", json!(["0x2a"])), &auth(), &api).await;
+        assert!(resp.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn zone_get_order_rejects_numeric_id() {
+        let api = MockZoneRpcApi::default();
+        let resp = dispatch(&request("zone_getOrder", json!([42])), &auth(), &api).await;
+        let err = resp.error.expect("numeric id should be rejected");
+        assert_eq!(err.code, -32602);
+    }
+
+    #[tokio::test]
+    async fn zone_get_order_rejects_missing_param() {
+        let api = MockZoneRpcApi::default();
+        let resp = dispatch(&request("zone_getOrder", json!([])), &auth(), &api).await;
+        let err = resp.error.expect("missing param should be rejected");
+        assert_eq!(err.code, -32602);
+    }
+
+    #[tokio::test]
+    async fn zone_get_my_orders_rejects_garbage_cursor() {
+        let err = crate::darkpool::Cursor::decode("not-a-cursor")
+            .expect_err("garbage cursor should be rejected");
+        assert_eq!(err.code, -32602);
+    }
+
+    #[tokio::test]
     async fn rejects_numeric_zone_get_deposit_status_param() {
         let api = MockZoneRpcApi::default();
 
         let resp = dispatch(&request("zone_getDepositStatus", json!([7])), &auth(), &api).await;
+        assert!(resp.result.is_none());
+        assert_eq!(resp.error.as_ref().unwrap().code, -32602);
+    }
+
+    #[tokio::test]
+    async fn dispatches_zone_get_withdrawal_status_for_tx_hash() {
+        let api = MockZoneRpcApi::default();
+        let hash = B256::repeat_byte(0x42);
+
+        let resp = dispatch(
+            &request("zone_getWithdrawalStatus", json!([format!("{:#x}", hash)])),
+            &auth(),
+            &api,
+        )
+        .await;
+        assert!(resp.error.is_none());
+        assert_eq!(
+            *api.last_withdrawal_query.lock().unwrap(),
+            Some(WithdrawalStatusQuery::TxHash(hash))
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatches_zone_get_withdrawal_status_for_index() {
+        let api = MockZoneRpcApi::default();
+
+        let resp = dispatch(
+            &request("zone_getWithdrawalStatus", json!(["0x2a"])),
+            &auth(),
+            &api,
+        )
+        .await;
+        assert!(resp.error.is_none());
+        assert_eq!(
+            *api.last_withdrawal_query.lock().unwrap(),
+            Some(WithdrawalStatusQuery::WithdrawalIndex(42))
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_non_hex_zone_get_withdrawal_status_param() {
+        let api = MockZoneRpcApi::default();
+
+        let resp = dispatch(
+            &request("zone_getWithdrawalStatus", json!(["not-a-hex"])),
+            &auth(),
+            &api,
+        )
+        .await;
+        assert!(resp.result.is_none());
+        let err = resp.error.expect("invalid params should error");
+        assert_eq!(err.code, -32602);
+        assert_eq!(err.message, "expected [txHashOrWithdrawalIndex]");
+    }
+
+    #[test]
+    fn parses_tx_hash_for_withdrawal_status_query() {
+        let hash = B256::repeat_byte(0x42);
+        let parsed = parse_withdrawal_status_query(&format!("{:#x}", hash)).unwrap();
+        assert_eq!(parsed, WithdrawalStatusQuery::TxHash(hash));
+    }
+
+    #[test]
+    fn parses_short_hex_quantity_as_withdrawal_index() {
+        let parsed = parse_withdrawal_status_query("0x2a").unwrap();
+        assert_eq!(parsed, WithdrawalStatusQuery::WithdrawalIndex(42));
+    }
+
+    #[test]
+    fn rejects_non_hex_withdrawal_status_query() {
+        let err = parse_withdrawal_status_query("not-a-hex").unwrap_err();
+        assert_eq!(err.code, -32602);
+        assert_eq!(err.message, "expected [txHashOrWithdrawalIndex]");
+    }
+
+    #[tokio::test]
+    async fn rejects_numeric_zone_get_withdrawal_status_param() {
+        let api = MockZoneRpcApi::default();
+
+        let resp = dispatch(
+            &request("zone_getWithdrawalStatus", json!([7])),
+            &auth(),
+            &api,
+        )
+        .await;
         assert!(resp.result.is_none());
         assert_eq!(resp.error.as_ref().unwrap().code, -32602);
     }
@@ -979,6 +1806,103 @@ mod tests {
         let err = resp.error.expect("should reject state overrides");
         assert_eq!(err.code, -32602);
         assert_eq!(err.message, "state overrides not allowed");
+    }
+
+    #[tokio::test]
+    async fn parses_list_batches_with_no_params() {
+        let result = parse_list_batches_params("[]").expect("empty params should parse");
+        assert!(result.limit.is_none());
+        assert!(result.cursor.is_none());
+    }
+
+    #[tokio::test]
+    async fn parses_list_batches_with_object_form() {
+        let result = parse_list_batches_params("[{\"limit\":10,\"cursor\":\"0x2a\"}]")
+            .expect("object form should parse");
+        assert_eq!(result.limit, Some(10));
+        assert_eq!(result.cursor, Some(U64::from(42)));
+    }
+
+    #[tokio::test]
+    async fn parses_list_batches_with_tuple_form() {
+        let result = parse_list_batches_params("[10, \"0x2a\"]").expect("tuple form should parse");
+        assert_eq!(result.limit, Some(10));
+        assert_eq!(result.cursor, Some(U64::from(42)));
+    }
+
+    #[tokio::test]
+    async fn dispatches_zone_get_batch_for_hex_quantity() {
+        let api = MockZoneRpcApi::default();
+        let resp = dispatch(&request("zone_getBatch", json!(["0x2a"])), &auth(), &api).await;
+        assert!(resp.result.is_none());
+        let err = resp.error.as_ref().expect("default impl returns error");
+        assert_eq!(err.code, -32006);
+    }
+
+    #[tokio::test]
+    async fn dispatches_zone_list_batches_with_empty_params() {
+        let api = MockZoneRpcApi::default();
+        let resp = dispatch(&request("zone_listBatches", json!([])), &auth(), &api).await;
+        let err = resp.error.as_ref().expect("default impl returns error");
+        assert_eq!(err.code, -32006);
+    }
+
+    #[tokio::test]
+    async fn rejects_numeric_zone_get_batch_param() {
+        let api = MockZoneRpcApi::default();
+        let resp = dispatch(&request("zone_getBatch", json!([7])), &auth(), &api).await;
+        assert!(resp.result.is_none());
+        assert_eq!(resp.error.as_ref().unwrap().code, -32602);
+    }
+
+    #[tokio::test]
+    async fn rejects_eth_send_transaction_with_account_method_error() {
+        let api = MockZoneRpcApi::default();
+        let resp = dispatch(
+            &request(
+                "eth_sendTransaction",
+                json!([{
+                    "from": format!("{:#x}", Address::repeat_byte(0xaa)),
+                    "to": format!("{:#x}", Address::repeat_byte(0x11)),
+                    "data": "0x",
+                }]),
+            ),
+            &auth(),
+            &api,
+        )
+        .await;
+
+        assert!(resp.result.is_none());
+        let err = resp.error.expect("should reject eth_sendTransaction");
+        assert_eq!(err.code, -32004);
+        assert!(
+            err.message.contains("eth_sendTransaction")
+                && err.message.contains("eth_sendRawTransaction"),
+            "error should point at the raw-tx path; got: {}",
+            err.message,
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_eth_sign_transaction_with_account_method_error() {
+        let api = MockZoneRpcApi::default();
+        let resp = dispatch(
+            &request(
+                "eth_signTransaction",
+                json!([{
+                    "from": format!("{:#x}", Address::repeat_byte(0xaa)),
+                    "to": format!("{:#x}", Address::repeat_byte(0x11)),
+                    "data": "0x",
+                }]),
+            ),
+            &auth(),
+            &api,
+        )
+        .await;
+
+        let err = resp.error.expect("should reject eth_signTransaction");
+        assert_eq!(err.code, -32004);
+        assert!(err.message.contains("eth_signTransaction"));
     }
 
     #[tokio::test]
