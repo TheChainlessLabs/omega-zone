@@ -343,6 +343,7 @@ impl TestContext {
             chain_id: CHAIN_ID,
             max_auth_token_validity: zone_rpc::auth::DEFAULT_MAX_AUTH_TOKEN_VALIDITY,
             zone_portal: Address::ZERO,
+            ref_price_provider: None,
         };
         let addr = start_private_rpc(config, Arc::new(api)).await.unwrap();
         Self { addr, signer }

@@ -2,6 +2,8 @@
 
 use std::{net::SocketAddr, time::Duration};
 
+use crate::refprice::ReferencePriceProviderConfig;
+
 /// Configuration for the private zone RPC server.
 #[derive(Debug, Clone)]
 pub struct PrivateRpcConfig {
@@ -24,4 +26,10 @@ pub struct PrivateRpcConfig {
     pub max_auth_token_validity: Duration,
     /// The ZonePortal contract address on L1 (used for querying deposits, not for auth tokens).
     pub zone_portal: alloy_primitives::Address,
+    /// Optional reference-price provider for the alpha canonical pair.
+    ///
+    /// `None` keeps `zone_getReferencePrice` in the explicit-disabled state,
+    /// which the frontend must treat as "no public oracle present". This is
+    /// alpha infrastructure — not a production oracle.
+    pub ref_price_provider: Option<ReferencePriceProviderConfig>,
 }

@@ -55,6 +55,7 @@ use crate::abi::{
 use zone_rpc::{
     auth::AuthContext,
     darkpool::{self as zone_darkpool, FillRole, HistoryQuery, Page, TransferQuery},
+    refprice as zone_refprice,
     types::{
         AuthorizationTokenInfoResponse, BatchAggregateVolume, BatchListResponse, BatchStatus,
         BatchSummary, BoxEyreFut, BoxFut, DepositKind, DepositState, DepositStatusEntry,
@@ -62,10 +63,12 @@ use zone_rpc::{
         LIST_BATCHES_MAX_LIMIT, ListBatchesParams, MarketAction, MarketConfigResponse, MarketEntry,
         MarketToken, MidpointHistoryResponse, MidpointSample, OrderLevel, TopOfBookResponse,
         WithdrawalState,
+        REFERENCE_PRICE_DISCLAIMER, REFERENCE_PRICE_UNIT, ReferencePriceResponse,
         WithdrawalStatusQuery, WithdrawalStatusResponse, ZoneInfoResponse, internal, raw_null,
         raw_zero, to_raw,
     },
 };
+use zone_precompiles::refprice::{ReferencePrice, ReferencePriceGuard};
 
 use crate::midpoint::{
     MIDPOINT_RETENTION, MIDPOINT_SAMPLE_INTERVAL, MidpointHistory, RawSample, SUPPORTED_INTERVALS,
@@ -180,6 +183,9 @@ pub struct TempoZoneRpc<Api: EthApiTypes> {
     /// [`zone_get_midpoint_history`](Self::zone_get_midpoint_history).
     /// Written by a background sampler; never sees owner data.
     midpoint_history: Arc<MidpointHistory>,
+    /// Unix timestamp at which the (static) reference-price snapshot was
+    /// loaded. Used to compute snapshot age for `zone_getReferencePrice`.
+    ref_price_loaded_at: u64,
 }
 
 impl<Api: EthApiTypes + 'static> TempoZoneRpc<Api> {
@@ -207,6 +213,10 @@ impl<Api: EthApiTypes + 'static> TempoZoneRpc<Api> {
             .wrap_err("failed to connect private RPC zone provider")?
             .erased();
         let tempo_state = crate::abi::TempoState::new(TEMPO_STATE_ADDRESS, zone_provider.clone());
+        let ref_price_loaded_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
         let rpc = Self {
             eth,
             config,
@@ -215,6 +225,7 @@ impl<Api: EthApiTypes + 'static> TempoZoneRpc<Api> {
             tempo_state,
             filter_owners: Arc::new(Mutex::new(HashMap::new())),
             midpoint_history: Arc::new(MidpointHistory::new(MIDPOINT_RETENTION)),
+            ref_price_loaded_at,
         };
         rpc.spawn_filter_owner_pruner();
         rpc.spawn_midpoint_sampler();
@@ -1526,6 +1537,34 @@ where
         Box::pin(async move { to_raw(&canonical_alpha_market_config()) })
     }
 
+    fn zone_get_reference_price(
+        &self,
+        base: Address,
+        quote: Address,
+        _auth: AuthContext,
+    ) -> BoxFut<'_> {
+        Box::pin(async move {
+            ensure_canonical_pair(base, quote)?;
+
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let as_of_block = self
+                .zone_provider
+                .get_block_number()
+                .await
+                .map_err(internal)?;
+            let response = build_reference_price_response(
+                self.config.ref_price_provider.as_ref(),
+                self.ref_price_loaded_at,
+                now_secs,
+                as_of_block,
+            );
+            to_raw(&response)
+        })
+    }
+
     fn zone_get_top_of_book(
         &self,
         base: Address,
@@ -2518,6 +2557,78 @@ fn canonical_alpha_market_config() -> MarketConfigResponse {
     }
 }
 
+/// Build the `zone_getReferencePrice` response payload from the configured
+/// provider (if any) and the current zone clock.
+///
+/// Pure function so the response shape is unit-testable without spinning up
+/// reth providers. For a static provider, `as_of_block` is 0 (the value does
+/// not anchor to a specific zone block) and `as_of_timestamp` is the unix
+/// second at which the snapshot was loaded into the node, so freshness ages
+/// linearly with node uptime.
+fn build_reference_price_response(
+    provider: Option<&zone_refprice::ReferencePriceProviderConfig>,
+    loaded_at_secs: u64,
+    now_secs: u64,
+    _as_of_block: u64,
+) -> ReferencePriceResponse {
+    let Some(provider) = provider else {
+        return ReferencePriceResponse {
+            enabled: false,
+            pair: alpha::PAIR_LABEL.to_string(),
+            base: alpha::BASE,
+            quote: alpha::QUOTE,
+            price: None,
+            source: None,
+            as_of_block: None,
+            as_of_timestamp: None,
+            fresh: None,
+            age_secs: None,
+            max_deviation_bps: None,
+            max_staleness_secs: None,
+            price_unit: REFERENCE_PRICE_UNIT.to_string(),
+            disclaimer: REFERENCE_PRICE_DISCLAIMER.to_string(),
+            reason: Some("reference-price provider not configured".to_string()),
+        };
+    };
+
+    let (price, source) = match &provider.kind {
+        zone_refprice::ReferencePriceProviderKind::Static { price, source } => {
+            (*price, source.clone())
+        }
+    };
+
+    let snapshot = ReferencePrice {
+        price,
+        source: source.clone(),
+        as_of_block: 0,
+        as_of_timestamp: loaded_at_secs,
+    };
+    let guard = ReferencePriceGuard {
+        max_deviation_bps: provider.max_deviation_bps,
+        max_staleness_secs: provider.max_staleness_secs,
+    };
+    let fresh = guard.is_fresh(&snapshot, now_secs);
+    let age = ReferencePriceGuard::age_secs(&snapshot, now_secs);
+
+    ReferencePriceResponse {
+        enabled: true,
+        pair: alpha::PAIR_LABEL.to_string(),
+        base: alpha::BASE,
+        quote: alpha::QUOTE,
+        price: Some(U128::from(price)),
+        source: Some(source),
+        as_of_block: Some(U64::from(0u64)),
+        as_of_timestamp: Some(U64::from(loaded_at_secs)),
+        fresh: Some(fresh),
+        age_secs: Some(U64::from(age)),
+        max_deviation_bps: Some(provider.max_deviation_bps),
+        max_staleness_secs: Some(provider.max_staleness_secs),
+        price_unit: REFERENCE_PRICE_UNIT.to_string(),
+        disclaimer: REFERENCE_PRICE_DISCLAIMER.to_string(),
+        reason: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3332,5 +3443,133 @@ mod tests {
             assert!(sample.contains_key("timestamp"));
             assert!(sample.contains_key("midpoint"));
         }
+    }
+
+    fn static_alpha_provider(price: u128) -> zone_refprice::ReferencePriceProviderConfig {
+        zone_refprice::ReferencePriceProviderConfig {
+            max_deviation_bps: 1_000,
+            max_staleness_secs: 0,
+            kind: zone_refprice::ReferencePriceProviderKind::Static {
+                price,
+                source: "static:alpha".to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn market_reference_price_disabled_returns_explicit_disabled_response() {
+        let response = build_reference_price_response(None, 1_700_000_000, 1_700_000_100, 42);
+
+        assert!(!response.enabled);
+        assert_eq!(response.pair, "OALPHA/PATH.USD");
+        assert_eq!(response.base, alpha::BASE);
+        assert_eq!(response.quote, alpha::QUOTE);
+        assert!(response.price.is_none());
+        assert!(response.source.is_none());
+        assert!(response.as_of_block.is_none());
+        assert!(response.as_of_timestamp.is_none());
+        assert!(response.fresh.is_none());
+        assert!(response.age_secs.is_none());
+        assert!(response.max_deviation_bps.is_none());
+        assert!(response.max_staleness_secs.is_none());
+        assert_eq!(response.price_unit, "raw integer; quote = baseAmount * price");
+        assert_eq!(
+            response.disclaimer,
+            "alpha infrastructure; not a production oracle"
+        );
+        assert_eq!(
+            response.reason.as_deref(),
+            Some("reference-price provider not configured"),
+        );
+    }
+
+    #[test]
+    fn market_reference_price_static_provider_returns_price_source_and_freshness() {
+        let provider = static_alpha_provider(1_000_000);
+        let response =
+            build_reference_price_response(Some(&provider), 1_700_000_000, 1_700_000_010, 99);
+
+        assert!(response.enabled);
+        assert_eq!(response.pair, "OALPHA/PATH.USD");
+        assert_eq!(response.price, Some(U128::from(1_000_000u128)));
+        assert_eq!(response.source.as_deref(), Some("static:alpha"));
+        // Static providers do not anchor to a block; expose the sentinel.
+        assert_eq!(response.as_of_block, Some(U64::from(0u64)));
+        assert_eq!(response.as_of_timestamp, Some(U64::from(1_700_000_000u64)));
+        assert_eq!(response.fresh, Some(true));
+        assert_eq!(response.age_secs, Some(U64::from(10u64)));
+        assert_eq!(response.max_deviation_bps, Some(1_000));
+        assert_eq!(response.max_staleness_secs, Some(0));
+        assert!(response.reason.is_none());
+    }
+
+    #[test]
+    fn market_reference_price_static_provider_marks_stale_after_max_staleness() {
+        let mut provider = static_alpha_provider(1_000_000);
+        provider.max_staleness_secs = 60;
+        let response =
+            build_reference_price_response(Some(&provider), 1_700_000_000, 1_700_000_120, 1);
+
+        assert!(response.enabled);
+        assert_eq!(response.fresh, Some(false));
+        assert_eq!(response.age_secs, Some(U64::from(120u64)));
+        assert_eq!(response.max_staleness_secs, Some(60));
+    }
+
+    #[test]
+    fn market_reference_price_response_serializes_with_camel_case_keys() {
+        let provider = static_alpha_provider(2_500_000);
+        let response =
+            build_reference_price_response(Some(&provider), 1_700_000_000, 1_700_000_005, 7);
+
+        let json = serde_json::to_value(&response).expect("response must serialize");
+        let obj = json.as_object().expect("response must be a JSON object");
+        for required in [
+            "enabled",
+            "pair",
+            "base",
+            "quote",
+            "price",
+            "source",
+            "asOfBlock",
+            "asOfTimestamp",
+            "fresh",
+            "ageSecs",
+            "maxDeviationBps",
+            "maxStalenessSecs",
+            "priceUnit",
+            "disclaimer",
+        ] {
+            assert!(obj.contains_key(required), "missing field `{required}`");
+        }
+        // When enabled the disabled-only `reason` must be absent.
+        assert!(
+            !obj.contains_key("reason"),
+            "enabled responses must not surface `reason`",
+        );
+    }
+
+    #[test]
+    fn market_reference_price_disabled_response_omits_snapshot_fields_in_json() {
+        let response = build_reference_price_response(None, 1_700_000_000, 1_700_000_100, 5);
+        let json = serde_json::to_value(&response).expect("response must serialize");
+        let obj = json.as_object().expect("response must be a JSON object");
+        for omitted in [
+            "price",
+            "source",
+            "asOfBlock",
+            "asOfTimestamp",
+            "fresh",
+            "ageSecs",
+            "maxDeviationBps",
+            "maxStalenessSecs",
+        ] {
+            assert!(
+                !obj.contains_key(omitted),
+                "disabled responses must omit `{omitted}`",
+            );
+        }
+        assert_eq!(obj["enabled"], false);
+        assert!(obj["reason"].is_string());
     }
 }

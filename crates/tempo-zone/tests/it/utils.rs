@@ -2818,6 +2818,7 @@ pub(crate) async fn start_zone_with_private_rpc() -> eyre::Result<PrivateRpcTest
         chain_id,
         max_auth_token_validity: zone::rpc::auth::DEFAULT_MAX_AUTH_TOKEN_VALIDITY,
         zone_portal: Address::ZERO,
+        ref_price_provider: None,
     };
 
     let private_rpc_url = start_private_rpc_url(&zone, config.clone()).await?;
@@ -2883,6 +2884,7 @@ async fn start_zone_with_private_rpc_l1_inner(
         chain_id,
         max_auth_token_validity: zone::rpc::auth::DEFAULT_MAX_AUTH_TOKEN_VALIDITY,
         zone_portal: portal_address,
+        ref_price_provider: None,
     };
 
     let private_rpc_url = start_private_rpc_url(&zone, config.clone()).await?;
