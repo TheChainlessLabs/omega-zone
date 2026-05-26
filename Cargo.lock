@@ -12723,6 +12723,7 @@ dependencies = [
  "alloy-signer-local",
  "alloy-sol-types",
  "alloy-transport",
+ "axum",
  "base64 0.22.1",
  "clap",
  "const-hex",
