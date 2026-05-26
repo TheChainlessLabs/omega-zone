@@ -434,8 +434,7 @@ pub struct ReferencePriceResponse {
 /// Stable identifier for the price-unit and disclaimer strings the public
 /// reference-price methods are required to surface.
 pub const REFERENCE_PRICE_UNIT: &str = "raw integer; quote = baseAmount * price";
-pub const REFERENCE_PRICE_DISCLAIMER: &str =
-    "alpha infrastructure; not a production oracle";
+pub const REFERENCE_PRICE_DISCLAIMER: &str = "alpha infrastructure; not a production oracle";
 
 /// Response payload for `zone_getMidpointHistory`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

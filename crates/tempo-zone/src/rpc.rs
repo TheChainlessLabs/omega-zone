@@ -52,6 +52,7 @@ use crate::abi::{
     DarkpoolReader, TEMPO_STATE_ADDRESS, ZONE_INBOX_ADDRESS, ZONE_OUTBOX_ADDRESS,
     ZONE_TOKEN_ADDRESS, ZoneInbox, ZoneOutbox, ZonePortal,
 };
+use zone_precompiles::refprice::{ReferencePrice, ReferencePriceGuard};
 use zone_rpc::{
     auth::AuthContext,
     darkpool::{self as zone_darkpool, FillRole, HistoryQuery, Page, TransferQuery},
@@ -61,14 +62,12 @@ use zone_rpc::{
         BatchSummary, BoxEyreFut, BoxFut, DepositKind, DepositState, DepositStatusEntry,
         DepositStatusResponse, HistoryAvailability, JsonRpcError, LIST_BATCHES_DEFAULT_LIMIT,
         LIST_BATCHES_MAX_LIMIT, ListBatchesParams, MarketAction, MarketConfigResponse, MarketEntry,
-        MarketToken, MidpointHistoryResponse, MidpointSample, OrderLevel, TopOfBookResponse,
-        WithdrawalState,
+        MarketToken, MidpointHistoryResponse, MidpointSample, OrderLevel,
         REFERENCE_PRICE_DISCLAIMER, REFERENCE_PRICE_UNIT, ReferencePriceResponse,
-        WithdrawalStatusQuery, WithdrawalStatusResponse, ZoneInfoResponse, internal, raw_null,
-        raw_zero, to_raw,
+        TopOfBookResponse, WithdrawalState, WithdrawalStatusQuery, WithdrawalStatusResponse,
+        ZoneInfoResponse, internal, raw_null, raw_zero, to_raw,
     },
 };
-use zone_precompiles::refprice::{ReferencePrice, ReferencePriceGuard};
 
 use crate::midpoint::{
     MIDPOINT_RETENTION, MIDPOINT_SAMPLE_INTERVAL, MidpointHistory, RawSample, SUPPORTED_INTERVALS,
@@ -3472,7 +3471,10 @@ mod tests {
         assert!(response.age_secs.is_none());
         assert!(response.max_deviation_bps.is_none());
         assert!(response.max_staleness_secs.is_none());
-        assert_eq!(response.price_unit, "raw integer; quote = baseAmount * price");
+        assert_eq!(
+            response.price_unit,
+            "raw integer; quote = baseAmount * price"
+        );
         assert_eq!(
             response.disclaimer,
             "alpha infrastructure; not a production oracle"

@@ -138,6 +138,8 @@ pub struct ZoneNode {
     /// Optional pre-configured list of enabled token addresses. When set, the
     /// startup L1 RPC query for `enabledTokenCount`/`enabledTokens` is skipped.
     initial_tokens: Option<Vec<Address>>,
+    /// Whether to start background workers that continuously read from or write to L1.
+    l1_background_tasks: bool,
     /// Private RPC config.
     private_rpc_config: ZonePrivateRpcConfig,
     /// Optional sequencer config. When set, sequencer tasks are spawned.
@@ -182,6 +184,7 @@ impl ZoneNode {
             policy_cache,
             portal_address,
             initial_tokens: None,
+            l1_background_tasks: true,
             private_rpc_config: ZonePrivateRpcConfig::default(),
             sequencer_config: None,
         }
@@ -204,6 +207,12 @@ impl ZoneNode {
     /// When set, the startup L1 RPC query for enabled tokens is skipped.
     pub fn with_initial_tokens(mut self, tokens: Vec<Address>) -> Self {
         self.initial_tokens = Some(tokens);
+        self
+    }
+
+    /// Enable or disable background workers that require a live L1 RPC.
+    pub fn with_l1_background_tasks(mut self, enabled: bool) -> Self {
+        self.l1_background_tasks = enabled;
         self
     }
 
@@ -273,6 +282,8 @@ pub struct ZoneAddOns<N: FullNodeComponents<Types = ZoneNode, Evm = ZoneEvmConfi
     portal_address: Address,
     /// Pre-configured list of initial tokens.
     initial_tokens: Option<Vec<Address>>,
+    /// Whether to start background workers that continuously read from or write to L1.
+    l1_background_tasks: bool,
     /// Private RPC configuration.
     private_rpc_config: ZonePrivateRpcConfig,
     /// Sequencer configuration.
@@ -298,6 +309,7 @@ where
         policy_cache: PolicyCache,
         portal_address: Address,
         initial_tokens: Option<Vec<Address>>,
+        l1_background_tasks: bool,
         private_rpc_config: ZonePrivateRpcConfig,
         sequencer_config: Option<ZoneSequencerAddOnsConfig>,
     ) -> Self {
@@ -314,6 +326,7 @@ where
             policy_cache,
             portal_address,
             initial_tokens,
+            l1_background_tasks,
             private_rpc_config,
             sequencer_config,
         }
@@ -352,8 +365,12 @@ where
             .erased();
 
         self.resolve_and_seed_tokens(&l1_provider).await?;
-        self.spawn_l1_subscriber(&ctx);
-        self.spawn_policy_tasks(&l1_provider, &ctx);
+        if self.l1_background_tasks {
+            self.spawn_l1_subscriber(&ctx);
+            self.spawn_policy_tasks(&l1_provider, &ctx);
+        } else {
+            info!(target: "reth::cli", "L1 background tasks disabled");
+        }
 
         if let Some(ref config) = self.sequencer_config {
             let sequencer_addr = config.sequencer_signer.address();
@@ -383,7 +400,9 @@ where
         )
         .await?;
 
-        if let Some(config) = self.sequencer_config.take() {
+        if let Some(config) = self.sequencer_config.take()
+            && self.l1_background_tasks
+        {
             let sequencer_addr = config.sequencer_signer.address();
 
             Self::launch_sequencer_tasks(
@@ -690,6 +709,7 @@ where
             self.policy_cache.clone(),
             self.portal_address,
             self.initial_tokens.clone(),
+            self.l1_background_tasks,
             self.private_rpc_config.clone(),
             self.sequencer_config.clone(),
         )

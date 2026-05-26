@@ -1584,12 +1584,7 @@ mod tests {
     #[tokio::test]
     async fn rejects_zone_get_reference_price_missing_pair() {
         let api = MockZoneRpcApi::default();
-        let resp = dispatch(
-            &request("zone_getReferencePrice", json!([])),
-            &auth(),
-            &api,
-        )
-        .await;
+        let resp = dispatch(&request("zone_getReferencePrice", json!([])), &auth(), &api).await;
 
         let err = resp.error.expect("missing pair must error");
         assert_eq!(err.code, -32602);

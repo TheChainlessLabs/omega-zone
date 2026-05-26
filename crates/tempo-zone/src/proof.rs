@@ -346,9 +346,7 @@ pub enum ProofProviderError {
     /// The configured attestation service was reachable but rejected the request or
     /// returned a non-success status. Carries the HTTP status and a short body excerpt so
     /// the failure is visible in structured logs without a second request.
-    #[error(
-        "TEE attestation service `{endpoint}` returned an error (status {status}): {detail}"
-    )]
+    #[error("TEE attestation service `{endpoint}` returned an error (status {status}): {detail}")]
     RemoteAttestationFailed {
         /// Endpoint the request targeted.
         endpoint: String,
@@ -815,7 +813,10 @@ impl BatchProofProvider for HttpTeeAttestationProvider {
                 "Requesting batch attestation from configured TEE service"
             );
 
-            let mut req = self.client.post(self.config.endpoint.clone()).json(&request);
+            let mut req = self
+                .client
+                .post(self.config.endpoint.clone())
+                .json(&request);
             if let Some(token) = self.config.bearer_token.as_deref() {
                 req = req.bearer_auth(token);
             }
@@ -830,11 +831,13 @@ impl BatchProofProvider for HttpTeeAttestationProvider {
                         error = %err,
                         "TEE attestation service request failed before producing a response"
                     );
-                    return Err(eyre::Report::new(ProofProviderError::RemoteAttestationFailed {
-                        endpoint,
-                        status,
-                        detail: err.to_string(),
-                    }));
+                    return Err(eyre::Report::new(
+                        ProofProviderError::RemoteAttestationFailed {
+                            endpoint,
+                            status,
+                            detail: err.to_string(),
+                        },
+                    ));
                 }
             };
 
@@ -852,11 +855,13 @@ impl BatchProofProvider for HttpTeeAttestationProvider {
                     detail = %detail,
                     "TEE attestation service returned non-success status"
                 );
-                return Err(eyre::Report::new(ProofProviderError::RemoteAttestationFailed {
-                    endpoint,
-                    status: status.as_u16(),
-                    detail,
-                }));
+                return Err(eyre::Report::new(
+                    ProofProviderError::RemoteAttestationFailed {
+                        endpoint,
+                        status: status.as_u16(),
+                        detail,
+                    },
+                ));
             }
 
             let parsed: TeeAttestationResponse = match response.json().await {
@@ -1195,8 +1200,9 @@ mod tests {
         let commitment = inputs.commitment();
         let mut response = sample_response(commitment);
         response.version = TEE_ATTESTATION_SERVICE_VERSION + 1;
-        let err = HttpTeeAttestationProvider::validate_response("http://test", commitment, &response)
-            .expect_err("wrong version must fail");
+        let err =
+            HttpTeeAttestationProvider::validate_response("http://test", commitment, &response)
+                .expect_err("wrong version must fail");
         assert!(
             matches!(err, ProofProviderError::MalformedAttestationResponse { .. }),
             "expected MalformedAttestationResponse, got: {err}"
@@ -1229,8 +1235,9 @@ mod tests {
         let commitment = inputs.commitment();
         let mut response = sample_response(commitment);
         response.verifier_config = Bytes::new();
-        let err = HttpTeeAttestationProvider::validate_response("http://test", commitment, &response)
-            .expect_err("empty verifier_config must fail");
+        let err =
+            HttpTeeAttestationProvider::validate_response("http://test", commitment, &response)
+                .expect_err("empty verifier_config must fail");
         match err {
             ProofProviderError::MalformedAttestationResponse { reason, .. } => {
                 assert!(reason.contains("verifier_config"), "reason: {reason}");
@@ -1245,8 +1252,9 @@ mod tests {
         let commitment = inputs.commitment();
         let mut response = sample_response(commitment);
         response.proof = Bytes::new();
-        let err = HttpTeeAttestationProvider::validate_response("http://test", commitment, &response)
-            .expect_err("empty proof must fail");
+        let err =
+            HttpTeeAttestationProvider::validate_response("http://test", commitment, &response)
+                .expect_err("empty proof must fail");
         match err {
             ProofProviderError::MalformedAttestationResponse { reason, .. } => {
                 assert!(reason.contains("proof"), "reason: {reason}");
@@ -1395,7 +1403,12 @@ mod tests {
         );
         assert_eq!(payload.proof, Bytes::from_static(b"proof-from-service"));
 
-        let last = captured.lock().unwrap().last.clone().expect("server saw a request");
+        let last = captured
+            .lock()
+            .unwrap()
+            .last
+            .clone()
+            .expect("server saw a request");
         assert_eq!(last.commitment, inputs.commitment());
         assert_eq!(last.public_inputs.portal_address, inputs.portal_address);
         assert_eq!(last.protocol, TeeAttestationRequest::PROTOCOL_TAG);
@@ -1408,9 +1421,7 @@ mod tests {
     async fn http_provider_rejects_commitment_drift_from_local_service() {
         use axum::{Json, Router, routing::post};
 
-        async fn handler(
-            Json(req): Json<TeeAttestationRequest>,
-        ) -> Json<TeeAttestationResponse> {
+        async fn handler(Json(req): Json<TeeAttestationRequest>) -> Json<TeeAttestationResponse> {
             // Sign a *different* commitment than the request — exactly the failure mode
             // `validate_response` is meant to refuse.
             let _ = req;
@@ -1462,7 +1473,10 @@ mod tests {
         use axum::{Router, http::StatusCode, response::IntoResponse, routing::post};
 
         async fn handler() -> impl IntoResponse {
-            (StatusCode::INTERNAL_SERVER_ERROR, "enclave key rotation in progress")
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "enclave key rotation in progress",
+            )
         }
 
         let app = Router::new().route("/attest", post(handler));
@@ -1586,8 +1600,8 @@ mod tests {
         };
 
         let encoded = call.abi_encode();
-        let decoded = submitBatchCall::abi_decode(&encoded)
-            .expect("submitBatch calldata must round-trip");
+        let decoded =
+            submitBatchCall::abi_decode(&encoded).expect("submitBatch calldata must round-trip");
 
         assert_eq!(decoded.verifierConfig, fixture_verifier_config);
         assert_eq!(decoded.proof, fixture_proof);

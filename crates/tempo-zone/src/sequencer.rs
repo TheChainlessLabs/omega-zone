@@ -2,10 +2,11 @@
 
 use std::{sync::Arc, time::Duration};
 
+use alloy_network::Ethereum;
 use alloy_primitives::Address;
 use alloy_provider::{DynProvider, Provider, ProviderBuilder};
 use alloy_signer_local::PrivateKeySigner;
-use tempo_alloy::{TempoNetwork, provider::ext::TempoProviderBuilderExt};
+use tempo_alloy::TempoNetwork;
 use tokio::sync::Notify;
 
 use crate::{
@@ -119,15 +120,17 @@ pub async fn spawn_zone_sequencer(
     // Build a single shared L1 provider with the sequencer wallet.
     // Both the batch submitter (inside the zone monitor) and the withdrawal
     // processor use this provider, ensuring nonces are tracked in one place.
-    let wallet = alloy_network::EthereumWallet::from(signer);
     let l1_provider: DynProvider<TempoNetwork> =
         ProviderBuilder::new_with_network::<TempoNetwork>()
-            .with_nonce_key_filler()
-            .wallet(wallet)
             .connect(&config.l1_rpc_url)
             .await
             .expect("valid L1 RPC URL")
             .erased();
+    let l1_tx_rpc_url = l1_transaction_http_url(&config.l1_rpc_url);
+    let l1_tx_provider: DynProvider<Ethereum> = ProviderBuilder::new()
+        .wallet(signer)
+        .connect_http(l1_tx_rpc_url)
+        .erased();
 
     let withdrawal_store: SharedWithdrawalStore = Default::default();
     let withdrawal_notify = Arc::new(Notify::new());
@@ -152,7 +155,7 @@ pub async fn spawn_zone_sequencer(
 
     let withdrawal_handle = withdrawals::spawn_withdrawal_processor(
         withdrawal_config,
-        l1_provider.clone(),
+        l1_tx_provider.clone(),
         withdrawal_store.clone(),
         withdrawal_notify.clone(),
         withdrawal_repair_notify.clone(),
@@ -160,6 +163,7 @@ pub async fn spawn_zone_sequencer(
     let monitor_handle = spawn_zone_monitor(
         monitor_config,
         l1_provider,
+        l1_tx_provider,
         withdrawal_store,
         withdrawal_notify,
         withdrawal_repair_notify,
@@ -170,4 +174,17 @@ pub async fn spawn_zone_sequencer(
         withdrawal_handle,
         monitor_handle,
     }
+}
+
+fn l1_transaction_http_url(l1_rpc_url: &str) -> url::Url {
+    let mut url: url::Url = l1_rpc_url.parse().expect("valid L1 RPC URL");
+    let tx_scheme = match url.scheme() {
+        "http" | "https" => return url,
+        "ws" => "http",
+        "wss" => "https",
+        other => panic!("unsupported L1 RPC URL scheme for sequencer transactions: {other}"),
+    };
+    url.set_scheme(tx_scheme)
+        .expect("http/https are valid URL schemes");
+    url
 }

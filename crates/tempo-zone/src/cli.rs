@@ -12,7 +12,8 @@ use tempo_chainspec::spec::{TempoChainSpec, TempoChainSpecParser};
 use url::Url;
 
 use crate::{
-    ZoneNode, ZonePrivateRpcConfig, ZoneSequencerAddOnsConfig, evm::ZoneEvmConfig,
+    ZoneNode, ZonePrivateRpcConfig, ZoneSequencerAddOnsConfig,
+    evm::ZoneEvmConfig,
     proof::{ProofBackend, TeeAttestationFormat, TeeProviderOptions},
     rpc::auth::DEFAULT_MAX_AUTH_TOKEN_VALIDITY_SECS,
 };

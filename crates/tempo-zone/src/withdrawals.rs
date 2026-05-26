@@ -31,20 +31,17 @@ use std::{
     time::{Duration, Instant},
 };
 
-use alloy_network::ReceiptResponse;
+use alloy_network::Ethereum;
 use alloy_primitives::{Address, B256};
 use alloy_provider::DynProvider;
 use parking_lot::Mutex;
-use tempo_alloy::TempoNetwork;
 use tokio::sync::Notify;
 use tracing::{debug, error, info, instrument, warn};
 
 use crate::{
     abi::{self, ZonePortal},
     metrics::WithdrawalProcessorMetrics,
-    nonce_keys::PROCESS_WITHDRAWAL_NONCE_KEY,
 };
-use tempo_alloy::rpc::TempoCallBuilderExt;
 
 const PROCESS_WITHDRAWAL_CONFIRM_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -213,7 +210,7 @@ struct StoreSnapshot {
 ///   handle fee accounting.
 pub struct WithdrawalProcessor {
     config: WithdrawalProcessorConfig,
-    portal: ZonePortal::ZonePortalInstance<DynProvider<TempoNetwork>, TempoNetwork>,
+    portal: ZonePortal::ZonePortalInstance<DynProvider<Ethereum>, Ethereum>,
     store: SharedWithdrawalStore,
     notify: Arc<Notify>,
     repair_notify: Arc<Notify>,
@@ -226,7 +223,7 @@ impl WithdrawalProcessor {
     /// The provider must already include the sequencer wallet for signing.
     pub fn new(
         config: WithdrawalProcessorConfig,
-        provider: DynProvider<TempoNetwork>,
+        provider: DynProvider<Ethereum>,
         store: SharedWithdrawalStore,
         notify: Arc<Notify>,
         repair_notify: Arc<Notify>,
@@ -345,6 +342,7 @@ impl WithdrawalProcessor {
         );
         let slot_started_at = Instant::now();
         let slot_queue_hash = abi::Withdrawal::queue_hash(&withdrawals);
+        let sequencer = self.portal.sequencer().call().await?;
 
         for (i, withdrawal) in withdrawals.iter().enumerate() {
             self.metrics.withdrawals_processed_total.increment(1);
@@ -367,7 +365,8 @@ impl WithdrawalProcessor {
             let call = self
                 .portal
                 .processWithdrawal(withdrawal.clone(), remaining_queue)
-                .nonce_key(PROCESS_WITHDRAWAL_NONCE_KEY);
+                .from(sequencer)
+                .gas(2_000_000);
 
             // When the withdrawal has a callback (`gasLimit > 0`), we must
             // override `eth_estimateGas` because the estimate only covers the
@@ -511,7 +510,7 @@ impl WithdrawalProcessor {
 /// The `provider` must already include the sequencer wallet for signing L1 transactions.
 pub fn spawn_withdrawal_processor(
     config: WithdrawalProcessorConfig,
-    provider: DynProvider<TempoNetwork>,
+    provider: DynProvider<Ethereum>,
     store: SharedWithdrawalStore,
     notify: Arc<Notify>,
     repair_notify: Arc<Notify>,
@@ -536,11 +535,10 @@ mod tests {
     use alloy_provider::{Provider, ProviderBuilder};
     use alloy_sol_types::SolValue;
     use alloy_transport::mock::Asserter;
-    use tempo_alloy::TempoNetwork;
     use tokio::time::timeout;
 
-    fn mock_provider(asserter: Asserter) -> DynProvider<TempoNetwork> {
-        ProviderBuilder::new_with_network::<TempoNetwork>()
+    fn mock_provider(asserter: Asserter) -> DynProvider<Ethereum> {
+        ProviderBuilder::new()
             .connect_mocked_client(asserter)
             .erased()
     }
