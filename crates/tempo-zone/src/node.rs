@@ -113,6 +113,9 @@ pub struct ZonePrivateRpcConfig {
     pub zone_id: u32,
     /// Max duration for private RPC auth.
     pub max_auth_token_validity: Duration,
+    /// Optional alpha reference-price provider. `None` keeps the
+    /// `zone_getReferencePrice` method in its safe-by-default disabled state.
+    pub ref_price_provider: Option<zone_rpc::ReferencePriceProviderConfig>,
 }
 
 /// Tempo Zone node type configuration.
@@ -535,6 +538,7 @@ where
             chain_id,
             max_auth_token_validity: config.max_auth_token_validity,
             zone_portal: portal_address,
+            ref_price_provider: config.ref_price_provider.clone(),
         };
         let api: Arc<dyn ZoneRpcApi> =
             Arc::new(TempoZoneRpc::new(eth_handlers, private_rpc_config.clone()).await?);

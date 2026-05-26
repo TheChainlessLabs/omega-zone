@@ -194,6 +194,49 @@ failed (most often: maker zone balances are below `seed_amount`, or
 `MIN_ORDER_AMOUNT = 100` was violated). Re-run that step after topping
 up the maker.
 
+## Public reference price (alpha guardrail, not an oracle)
+
+The private RPC publishes a single public method for the canonical
+`OALPHA/PATH.USD` pair:
+
+```text
+zone_getReferencePrice([{ "base": "<OALPHA>", "quote": "<PATH.USD>" }])
+```
+
+This is **alpha infrastructure**, not a production oracle. When the sequencer
+has configured a reference price, the response includes the current snapshot
+(price, source, block, timestamp), the configured guardrail bounds
+(`maxDeviationBps`, `maxStalenessSecs`), and a `fresh` flag. When no provider
+is configured, the response is `{ "enabled": false, "reason": "…" }` and the
+frontend MUST treat that as "no public reference price available" — do not
+fall back to a private orderbook midpoint and pretend it is an oracle.
+
+### Units
+
+Prices are raw integer values matching the darkpool orderbook precompile.
+For a trade of `baseAmount` base tokens at `price`:
+
+```text
+quoteAmount = baseAmount * price
+```
+
+(No additional decimals scaling — both base and quote are TIP-20 6-decimal
+tokens, and the precompile does not apply implicit decimal adjustments.)
+
+### Guardrail semantics
+
+The guardrail helper in `zone_precompiles::refprice` rejects orders whose
+limit price deviates from the configured reference by more than
+`maxDeviationBps`. `maxStalenessSecs = 0` disables the freshness check, which
+is the natural setting for a static provider during alpha. Frontends can
+pre-flight an order against the published reference; the RPC reports the same
+rejection categories the helper uses (`ProviderDisabled`, `StaleReference`,
+`OutOfRange`, `ZeroReferencePrice`).
+
+The guardrails are advisory in the current build — the precompile does not
+yet reject orders on-chain. Wiring enforcement into the orderbook precompile
+is a separate change once a non-static provider lands.
+
 ## Troubleshooting
 
 | Symptom                                                    | Likely cause / fix                                                                                          |

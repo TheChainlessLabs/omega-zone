@@ -72,6 +72,7 @@ impl ZoneCli {
                 max_auth_token_validity: Duration::from_secs(
                     args.private_rpc_max_auth_token_validity_secs,
                 ),
+                ref_price_provider: None,
             });
 
             if args.enable_sequencer {
