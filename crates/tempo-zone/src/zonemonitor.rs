@@ -26,6 +26,7 @@
 
 use std::{sync::Arc, time::Duration};
 
+use alloy_network::Ethereum;
 use alloy_primitives::{Address, B256};
 use alloy_provider::{DynProvider, Provider, ProviderBuilder};
 use alloy_rpc_client::RpcClient;
@@ -139,6 +140,7 @@ impl ZoneMonitor {
     pub async fn new(
         config: ZoneMonitorConfig,
         l1_provider: DynProvider<TempoNetwork>,
+        l1_tx_provider: DynProvider<Ethereum>,
         withdrawal_store: SharedWithdrawalStore,
         withdrawal_notify: Arc<Notify>,
         repair_notify: Arc<Notify>,
@@ -166,6 +168,7 @@ impl ZoneMonitor {
             config,
             provider,
             l1_provider,
+            l1_tx_provider,
             withdrawal_store,
             withdrawal_notify,
             repair_notify,
@@ -178,6 +181,7 @@ impl ZoneMonitor {
         config: ZoneMonitorConfig,
         provider: DynProvider<TempoNetwork>,
         l1_provider: DynProvider<TempoNetwork>,
+        l1_tx_provider: DynProvider<Ethereum>,
         withdrawal_store: SharedWithdrawalStore,
         withdrawal_notify: Arc<Notify>,
         repair_notify: Arc<Notify>,
@@ -198,6 +202,7 @@ impl ZoneMonitor {
         let batch_submitter = BatchSubmitter::new_with_proof_provider(
             config.portal_address,
             l1_provider,
+            l1_tx_provider,
             genesis_tempo_block_number,
             proof_provider,
         );
@@ -960,6 +965,7 @@ impl ZoneMonitor {
 pub fn spawn_zone_monitor(
     config: ZoneMonitorConfig,
     l1_provider: DynProvider<TempoNetwork>,
+    l1_tx_provider: DynProvider<Ethereum>,
     withdrawal_store: SharedWithdrawalStore,
     withdrawal_notify: Arc<Notify>,
     repair_notify: Arc<Notify>,
@@ -970,6 +976,7 @@ pub fn spawn_zone_monitor(
             match ZoneMonitor::new(
                 config.clone(),
                 l1_provider.clone(),
+                l1_tx_provider.clone(),
                 withdrawal_store.clone(),
                 withdrawal_notify.clone(),
                 repair_notify.clone(),
@@ -1042,6 +1049,12 @@ mod tests {
             .erased()
     }
 
+    fn mock_eth_provider(asserter: Asserter) -> DynProvider<Ethereum> {
+        ProviderBuilder::new()
+            .connect_mocked_client(asserter)
+            .erased()
+    }
+
     fn abi_encode_b256(value: B256) -> Bytes {
         Bytes::copy_from_slice(value.as_slice())
     }
@@ -1080,7 +1093,8 @@ mod tests {
             portal_address,
         };
         let zone_provider = mock_provider(zone);
-        let l1_provider = mock_provider(l1);
+        let l1_provider = mock_provider(l1.clone());
+        let l1_tx_provider = mock_eth_provider(l1);
         let proof_provider: SharedProofProvider = Arc::new(crate::proof::EmptyLegacyProofProvider);
 
         ZoneMonitor {
@@ -1094,6 +1108,7 @@ mod tests {
             batch_submitter: BatchSubmitter::new_with_proof_provider(
                 portal_address,
                 l1_provider,
+                l1_tx_provider,
                 0,
                 proof_provider,
             ),
@@ -1130,6 +1145,7 @@ mod tests {
             config,
             mock_provider(zone.clone()),
             mock_provider(l1.clone()),
+            mock_eth_provider(l1.clone()),
             SharedWithdrawalStore::new(),
             Arc::new(Notify::new()),
             Arc::new(Notify::new()),

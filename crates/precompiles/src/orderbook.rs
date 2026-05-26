@@ -1127,3 +1127,167 @@ pub(crate) const _DARKPOOL_ADDRESS_BYTES: [u8; 20] = [
     0x0B, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     0x00, 0x00, 0x00, 0x01,
 ];
+
+#[cfg(test)]
+mod tests {
+    //! Reference-price guardrail tests for the darkpool orderbook.
+    //!
+    //! The guard itself lives in [`crate::refprice`]; these tests pin the
+    //! behavior the orderbook-side caller relies on (in-range pass,
+    //! out-of-range reject above/below, missing-provider reject, stale-provider
+    //! reject, and the "never stale" shortcut for static providers).
+
+    use alloc::string::ToString;
+
+    use super::MIN_ORDER_AMOUNT;
+    use crate::refprice::{GuardrailRejection, ReferencePrice, ReferencePriceGuard};
+
+    fn alpha_reference(price: u128, as_of_timestamp: u64) -> ReferencePrice {
+        ReferencePrice {
+            price,
+            source: "static:alpha".to_string(),
+            as_of_block: 42,
+            as_of_timestamp,
+        }
+    }
+
+    fn alpha_guard(max_deviation_bps: u32, max_staleness_secs: u64) -> ReferencePriceGuard {
+        ReferencePriceGuard {
+            max_deviation_bps,
+            max_staleness_secs,
+        }
+    }
+
+    #[test]
+    fn orderbook_min_order_amount_is_unchanged() {
+        // Sanity guard against accidental tuning of the darkpool dust floor
+        // while landing the reference-price guardrails.
+        assert_eq!(MIN_ORDER_AMOUNT, 100);
+    }
+
+    #[test]
+    fn orderbook_reference_price_guard_accepts_in_range_order() {
+        let reference = alpha_reference(1_000_000, 1_700_000_000);
+        let guard = alpha_guard(1_000, 0); // ±10%, no staleness check
+
+        // Equal price → 0 bps deviation.
+        guard
+            .check_order_price(Some(&reference), 1_700_000_010, 1_000_000)
+            .expect("equal price must pass");
+
+        // +5% deviation.
+        guard
+            .check_order_price(Some(&reference), 1_700_000_010, 1_050_000)
+            .expect("+5% must pass under a ±10% bound");
+
+        // -5% deviation.
+        guard
+            .check_order_price(Some(&reference), 1_700_000_010, 950_000)
+            .expect("-5% must pass under a ±10% bound");
+    }
+
+    #[test]
+    fn orderbook_reference_price_guard_rejects_out_of_range_order_above() {
+        let reference = alpha_reference(1_000_000, 1_700_000_000);
+        let guard = alpha_guard(1_000, 0); // ±10%
+
+        let err = guard
+            .check_order_price(Some(&reference), 1_700_000_010, 1_200_000)
+            .expect_err("+20% must be rejected under a ±10% bound");
+
+        assert_eq!(
+            err,
+            GuardrailRejection::OutOfRange {
+                reference_price: 1_000_000,
+                order_price: 1_200_000,
+                max_deviation_bps: 1_000,
+                deviation_bps: 2_000,
+            },
+        );
+    }
+
+    #[test]
+    fn orderbook_reference_price_guard_rejects_out_of_range_order_below() {
+        let reference = alpha_reference(1_000_000, 1_700_000_000);
+        let guard = alpha_guard(1_000, 0); // ±10%
+
+        let err = guard
+            .check_order_price(Some(&reference), 1_700_000_010, 800_000)
+            .expect_err("-20% must be rejected under a ±10% bound");
+
+        assert_eq!(
+            err,
+            GuardrailRejection::OutOfRange {
+                reference_price: 1_000_000,
+                order_price: 800_000,
+                max_deviation_bps: 1_000,
+                deviation_bps: 2_000,
+            },
+        );
+    }
+
+    #[test]
+    fn orderbook_reference_price_guard_rejects_when_provider_disabled() {
+        let guard = alpha_guard(1_000, 0);
+        let err = guard
+            .check_order_price(None, 1_700_000_000, 1_000_000)
+            .expect_err("missing provider must reject");
+        assert_eq!(err, GuardrailRejection::ProviderDisabled);
+    }
+
+    #[test]
+    fn orderbook_reference_price_guard_rejects_stale_provider() {
+        let reference = alpha_reference(1_000_000, 1_700_000_000);
+        let guard = alpha_guard(1_000, 60); // ±10%, 60s max staleness
+
+        // 120s after the snapshot — stale.
+        let err = guard
+            .check_order_price(Some(&reference), 1_700_000_120, 1_000_000)
+            .expect_err("stale provider must reject");
+        assert_eq!(
+            err,
+            GuardrailRejection::StaleReference {
+                observed_age_secs: 120,
+                max_age_secs: 60,
+            },
+        );
+
+        // Exactly at the staleness boundary — still fresh.
+        guard
+            .check_order_price(Some(&reference), 1_700_000_060, 1_000_000)
+            .expect("equal-to-bound age must still be fresh");
+    }
+
+    #[test]
+    fn orderbook_reference_price_guard_treats_zero_staleness_window_as_never_stale() {
+        let reference = alpha_reference(1_000_000, 1_000);
+        let guard = alpha_guard(1_000, 0);
+
+        // Snapshot is 1e9 seconds old but the guard is configured to never stale.
+        guard
+            .check_order_price(Some(&reference), 1_000_001_000, 1_000_000)
+            .expect("zero staleness window must mean never stale");
+    }
+
+    #[test]
+    fn orderbook_reference_price_guard_rejects_zero_reference_price() {
+        let reference = alpha_reference(0, 1_700_000_000);
+        let guard = alpha_guard(1_000, 0);
+        let err = guard
+            .check_order_price(Some(&reference), 1_700_000_010, 1_000_000)
+            .expect_err("zero reference price must reject");
+        assert_eq!(err, GuardrailRejection::ZeroReferencePrice);
+    }
+
+    #[test]
+    fn orderbook_reference_price_is_fresh_respects_staleness_window() {
+        let reference = alpha_reference(1_000_000, 1_700_000_000);
+
+        let no_staleness = alpha_guard(1_000, 0);
+        assert!(no_staleness.is_fresh(&reference, 1_700_999_999));
+
+        let bounded = alpha_guard(1_000, 60);
+        assert!(bounded.is_fresh(&reference, 1_700_000_060));
+        assert!(!bounded.is_fresh(&reference, 1_700_000_061));
+    }
+}

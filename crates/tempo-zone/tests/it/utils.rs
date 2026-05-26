@@ -56,6 +56,13 @@ fn next_unique_chain_id() -> u64 {
     NEXT_CHAIN_ID.fetch_add(1, Ordering::Relaxed)
 }
 
+fn dev_signer_from_mnemonic() -> alloy_signer_local::PrivateKeySigner {
+    MnemonicBuilder::<English>::default()
+        .phrase(TEST_MNEMONIC)
+        .build()
+        .expect("valid test mnemonic")
+}
+
 /// Default timeout for polling loops in e2e tests.
 pub(crate) const DEFAULT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
@@ -384,15 +391,13 @@ impl ZoneTestNode {
         let (genesis, genesis_block_number) =
             build_l1_anchored_genesis(l1_http_url, portal_address).await?;
 
-        let throwaway_key = k256::SecretKey::from_slice(&[0x01; 32]).expect("valid throwaway key");
-        let signer = alloy_signer_local::PrivateKeySigner::from_signing_key(throwaway_key.into());
         Self::launch_with_genesis(
             l1_ws_url.to_string(),
             portal_address,
             Some(genesis_block_number),
             next_unique_chain_id(),
             Some(genesis),
-            signer,
+            dev_signer_from_mnemonic(),
         )
         .await
     }
@@ -416,15 +421,13 @@ impl ZoneTestNode {
             build_l1_anchored_genesis_at_block(l1_http_url, portal_address, genesis_block_number)
                 .await?;
 
-        let throwaway_key = k256::SecretKey::from_slice(&[0x01; 32]).expect("valid throwaway key");
-        let signer = alloy_signer_local::PrivateKeySigner::from_signing_key(throwaway_key.into());
         Self::launch_with_genesis(
             l1_ws_url.to_string(),
             portal_address,
             Some(genesis_block_number),
             next_unique_chain_id(),
             Some(genesis),
-            signer,
+            dev_signer_from_mnemonic(),
         )
         .await
     }
@@ -523,6 +526,7 @@ impl ZoneTestNode {
             std::time::Duration::from_millis(100),
         )
         .with_initial_tokens(vec![])
+        .with_l1_background_tasks(!is_local_dummy_l1)
         .with_sequencer(zone::ZoneSequencerAddOnsConfig {
             sequencer_signer,
             zone_id: 0,
@@ -639,10 +643,7 @@ impl L1TestNode {
     /// corresponding to address `0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266`.
     /// The account is pre-funded with pathUSD in `test-genesis.json`.
     pub(crate) fn dev_signer(&self) -> alloy_signer_local::PrivateKeySigner {
-        MnemonicBuilder::<English>::default()
-            .phrase(TEST_MNEMONIC)
-            .build()
-            .expect("valid test mnemonic")
+        dev_signer_from_mnemonic()
     }
 
     /// Returns the address of the pre-funded dev account.
@@ -2818,6 +2819,7 @@ pub(crate) async fn start_zone_with_private_rpc() -> eyre::Result<PrivateRpcTest
         chain_id,
         max_auth_token_validity: zone::rpc::auth::DEFAULT_MAX_AUTH_TOKEN_VALIDITY,
         zone_portal: Address::ZERO,
+        ref_price_provider: None,
     };
 
     let private_rpc_url = start_private_rpc_url(&zone, config.clone()).await?;
@@ -2883,6 +2885,7 @@ async fn start_zone_with_private_rpc_l1_inner(
         chain_id,
         max_auth_token_validity: zone::rpc::auth::DEFAULT_MAX_AUTH_TOKEN_VALIDITY,
         zone_portal: portal_address,
+        ref_price_provider: None,
     };
 
     let private_rpc_url = start_private_rpc_url(&zone, config.clone()).await?;

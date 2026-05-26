@@ -80,27 +80,45 @@ because the configured verifier rejects empty `(verifierConfig, proof)` bytes.
 
    - Devnet / in-process verifier that accepts empty proofs:
      `--proof.backend=empty-legacy`. **Never** use this against Moderato.
-   - Moderato: `--proof.backend=tee`. This wires the
-     [`PendingTeeAttestationProvider`](../crates/tempo-zone/src/proof.rs);
-     until the enclave runtime is connected it still errors with
-     `TempoIntegrationPending` (see [`docs/TEE_PROOF.md`](TEE_PROOF.md)).
+   - Moderato: `--proof.backend=tee`. Behaviour now depends on whether
+     `--proof.tee.endpoint` is set:
+     - **No endpoint** — falls back to
+       [`PendingTeeAttestationProvider`](../crates/tempo-zone/src/proof.rs):
+       logs the commitment that *would* be signed and refuses to submit with
+       `TempoIntegrationPending`. Useful for triage on a fresh deployment.
+     - **Endpoint set** —
+       [`HttpTeeAttestationProvider`](../crates/tempo-zone/src/proof.rs) POSTs
+       each batch to the configured attestation service and forwards the
+       returned `verifierConfig` / `proof` bytes into `submitBatch`. Surfaces
+       `MissingAttestationEndpoint`, `RemoteAttestationFailed`, or
+       `MalformedAttestationResponse` instead of silently submitting if any
+       precondition fails. See [`docs/TEE_PROOF.md`](TEE_PROOF.md) for the
+       request/response contract and the open Tempo verifier questions.
 
 3. **Read the sequencer logs**. Each retry now prints the preflight snapshot
    plus the decoded portal revert reason. With `--proof.backend=tee` you will
-   see:
+   see one of:
 
    - `Portal preflight snapshot phase=submitBatch ...` — exact portal state and
      batch public inputs.
    - `Computed batch public-input commitment commitment=0x...
      expected_withdrawal_batch_index=1 sequencer=0x...` — the commitment the
      enclave would sign.
-   - `TEE provider invoked without a connected enclave runtime; refusing to
-     submit` — confirms the integration is still pending.
+   - Without an endpoint: `TEE provider invoked without a connected enclave
+     runtime; refusing to submit` — diagnostic-only fallback, no L1 traffic.
+   - With an endpoint: `Requesting batch attestation from configured TEE
+     service endpoint=...` followed by either `TEE attestation service
+     returned a verifier payload` (success path) or one of the three structured
+     refusal lines (`TEE attestation service request failed before producing a
+     response`, `TEE attestation service returned non-success status`, `TEE
+     attestation service returned a malformed response`).
 
-4. **Compare the printed commitment with what the enclave would sign**. Once
-   Tempo confirms the canonical `verifierConfig` / `proof` layout (see
-   [`docs/TEE_PROOF.md`](TEE_PROOF.md) §Open questions), wire the enclave
-   runtime into `PendingTeeAttestationProvider::build_proof` and re-run.
+4. **Validate the wire format end-to-end**. Live Moderato success still
+   requires Tempo confirming the canonical `verifierConfig` / `proof` layout
+   (see [`docs/TEE_PROOF.md`](TEE_PROOF.md) §Open questions) *and* the
+   attestation service emitting that exact layout. The sequencer is
+   intentionally proof-agnostic — bytes flow through unchanged once the
+   provider accepts them.
 
 ### Success signal
 
@@ -171,6 +189,12 @@ started reverting. Symptoms:
 
    - Moderato will reject `--proof.backend=empty-legacy`.
    - Devnet may reject `--proof.backend=tee` if no real verifier is wired up.
+   - With `--proof.backend=tee --proof.tee.endpoint=...`, double-check the
+     attestation service is emitting the canonical Moderato `verifierConfig` /
+     `proof` layout (the sequencer is intentionally proof-agnostic and only
+     enforces the request/response envelope shape). Tempo verifier rejections
+     of well-formed bytes look identical from the sequencer side to "service
+     returned junk" — both surface as a portal-side revert on the next batch.
 
 4. **If you suspect a state divergence on L2** — capture the zone L2 head and
    the portal block hash. If `portal.blockHash()` is no longer present on the

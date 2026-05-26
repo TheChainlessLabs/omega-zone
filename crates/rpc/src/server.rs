@@ -422,6 +422,7 @@ mod tests {
             chain_id: CHAIN_ID,
             max_auth_token_validity: crate::auth::DEFAULT_MAX_AUTH_TOKEN_VALIDITY,
             zone_portal: PORTAL,
+            ref_price_provider: None,
         }
     }
 

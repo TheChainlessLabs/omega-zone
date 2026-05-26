@@ -328,7 +328,6 @@ fn classify_restricted_methods() {
         "eth_getCode",
         "eth_getStorageAt",
         "eth_getBlockReceipts",
-        "eth_sendTransaction",
         "eth_createAccessList",
         "eth_getBlockTransactionCountByNumber",
         "eth_getBlockTransactionCountByHash",
@@ -347,6 +346,17 @@ fn classify_restricted_methods() {
             classify_method(method),
             Some(MethodTier::Restricted),
             "expected {method} to be Restricted"
+        );
+    }
+}
+
+#[test]
+fn classify_unsupported_account_management_methods() {
+    for method in ["eth_sendTransaction", "eth_signTransaction"] {
+        assert_eq!(
+            classify_method(method),
+            Some(MethodTier::UnsupportedAccountManagement),
+            "expected {method} to be UnsupportedAccountManagement"
         );
     }
 }

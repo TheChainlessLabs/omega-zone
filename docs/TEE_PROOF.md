@@ -1,10 +1,17 @@
 # TEE-Backed Batch Proofs for Tempo Settlement
 
 Status: **integration in progress**. The Rust surface area in
-`crates/tempo-zone/src/proof.rs` is wired through the submitter, but the
-on-wire `verifierConfig` / `proof` layouts and the enclave runtime are still
-external dependencies. See [Open questions](#open-questions-for-tempo) before
-attempting a live Moderato submission.
+`crates/tempo-zone/src/proof.rs` is wired through the submitter and now exposes
+a configurable HTTP attestation provider
+([`HttpTeeAttestationProvider`](../crates/tempo-zone/src/proof.rs)) selected via
+`--proof.backend=tee` plus `--proof.tee.endpoint`. The provider remains
+**fail-closed**: with no endpoint configured the sequencer keeps the existing
+diagnostic-only [`PendingTeeAttestationProvider`](../crates/tempo-zone/src/proof.rs)
+behaviour, and any malformed response refuses to forward bytes to `submitBatch`.
+The on-wire `verifierConfig` / `proof` byte layouts the attestation service
+must emit, and the enclave runtime itself, are still external dependencies. See
+[Open questions](#open-questions-for-tempo) before attempting a live Moderato
+submission.
 
 Tracks issues:
 
@@ -47,19 +54,114 @@ intact and the operator sees a structured error in the logs.
 |---|---|---|
 | `FailFastProofProvider` | Default | Until the operator opts into a real backend. Surfaces `NoBackendConfigured` and refuses to submit. |
 | `EmptyLegacyProofProvider` | Dev only | Devnet or in-process integration tests whose verifier accepts empty proofs. **Will revert on Moderato.** |
-| `StaticTeeProofProvider` | Test fixture | Replay / unit-test path with a pre-built payload. |
-| `PendingTeeAttestationProvider` | Wiring complete, enclave pending | Selected via `--proof.backend=tee`. Computes the commitment that *would* be signed and logs the proposed `verifierConfig`, but still errors with `TempoIntegrationPending` until the enclave runtime is connected. |
+| `StaticTeeProofProvider` | Test fixture | Replay / unit-test path with a pre-built payload. Used in the unit test that proves `BatchSubmitter` forwards the bytes verbatim into `ZonePortal.submitBatch`. |
+| `PendingTeeAttestationProvider` | Diagnostic-only fallback | Selected via `--proof.backend=tee` when no `--proof.tee.endpoint` is set. Computes the commitment that *would* be signed and logs the proposed `verifierConfig`, but still errors with `TempoIntegrationPending` until an attestation endpoint is configured. |
+| `HttpTeeAttestationProvider` | Configurable, fail-closed | Selected via `--proof.backend=tee` *plus* `--proof.tee.endpoint=<url>`. POSTs each batch's public inputs to the configured attestation service and forwards the returned `verifierConfig` / `proof` bytes into `submitBatch`. Refuses to submit on missing config, transport failures, non-2xx responses, version drift, commitment drift, or empty bytes. |
 
 ### CLI
 
 ```
+# Diagnostic only — logs the proposed commitment, refuses to submit.
 zone --sequencer \
     --proof.backend=tee \
     ...
+
+# Configured — POSTs each batch to https://attestation.example/sign and
+# forwards the returned verifierConfig / proof bytes to ZonePortal.submitBatch.
+zone --sequencer \
+    --proof.backend=tee \
+    --proof.tee.endpoint=https://attestation.example/sign \
+    --proof.tee.auth-bearer=$ATTESTATION_TOKEN \
+    --proof.tee.timeout-secs=15 \
+    --proof.tee.enclave-id=0xdeadbeef... \
+    --proof.tee.domain=0xportal||zoneid \
+    --proof.tee.format=sev-snp \
+    ...
 ```
 
-Backends: `fail-fast` (default), `empty-legacy`, `tee`. Settings: `PROOF_BACKEND`
-env var.
+Backends: `fail-fast` (default), `empty-legacy`, `tee`. TEE knobs (all
+`tee`-only, all also available as env vars):
+
+| Flag | Env var | Default | Purpose |
+|---|---|---|---|
+| `--proof.tee.endpoint` | `PROOF_TEE_ENDPOINT` | _unset_ | URL the sequencer POSTs each `TeeAttestationRequest` to. Leave unset to stay diagnostic-only. |
+| `--proof.tee.auth-bearer` | `PROOF_TEE_AUTH_BEARER` | _unset_ | Optional bearer token. Sent as `Authorization: Bearer <token>`. |
+| `--proof.tee.timeout-secs` | `PROOF_TEE_TIMEOUT_SECS` | `15` | Per-request timeout, in seconds. |
+| `--proof.tee.enclave-id` | `PROOF_TEE_ENCLAVE_ID` | _empty_ | Enclave identity (hex, with or without `0x`). Echoed in the request and returned `verifierConfig`. |
+| `--proof.tee.domain` | `PROOF_TEE_DOMAIN` | _empty_ | Domain separator (hex). Typically `portal_address ‖ zone_id`. |
+| `--proof.tee.format` | `PROOF_TEE_FORMAT` | `unconfirmed` | One of `sev-snp`, `nitro-enclaves`, `intel-tdx`, `unconfirmed`. |
+
+Settings: also exposed via the legacy `PROOF_BACKEND` env var for the backend
+selector itself.
+
+### Attestation service contract
+
+The attestation service the sequencer POSTs to receives a JSON envelope shaped
+like [`TeeAttestationRequest`](../crates/tempo-zone/src/proof.rs) (camelCase keys):
+
+```json
+{
+  "version": 1,
+  "protocol": "tempo-zone-tee-batch-v1",
+  "commitment": "0x...32-byte hex...",
+  "publicInputs": {
+    "portalAddress": "0x...",
+    "sequencerAddress": "0x...",
+    "tempoBlockNumber": 1234,
+    "recentTempoBlockNumber": 0,
+    "prevBlockHash": "0x...",
+    "nextBlockHash": "0x...",
+    "prevProcessedDepositHash": "0x...",
+    "nextProcessedDepositHash": "0x...",
+    "prevDepositNumber": 7,
+    "nextDepositNumber": 9,
+    "withdrawalQueueHash": "0x...",
+    "expectedWithdrawalBatchIndex": 12
+  },
+  "enclaveId": "0x...",
+  "domain": "0x...",
+  "format": "sev-snp"
+}
+```
+
+And must respond with a [`TeeAttestationResponse`](../crates/tempo-zone/src/proof.rs):
+
+```json
+{
+  "version": 1,
+  "commitment": "0x...same 32 bytes...",
+  "verifierConfig": "0x...arbitrary bytes...",
+  "proof": "0x...arbitrary bytes..."
+}
+```
+
+The sequencer refuses to forward the response to `submitBatch` if `version` is
+not `1`, if `commitment` does not exactly match the value it sent (a sanity
+check against attesting to the wrong batch), or if `verifierConfig` / `proof`
+are empty. The failure surfaces as
+[`ProofProviderError::MalformedAttestationResponse`](../crates/tempo-zone/src/proof.rs)
+with a structured log line so operators can tell "remote failure" from
+"remote produced junk" at a glance.
+
+> **Note:** The byte layout of `verifierConfig` and `proof` is whatever the
+> attestation service returns — the sequencer is intentionally proof-agnostic.
+> Live Moderato success still requires Tempo confirming the canonical
+> `verifierConfig` / `proof` wire format (see
+> [Open questions](#open-questions-for-tempo) below) and the attestation
+> service emitting that exact layout.
+
+### Structured logs
+
+Each batch surfaces one of these states so operators can triage settlement
+failures from the log stream alone:
+
+| Outcome | Provider | Log signal |
+|---|---|---|
+| No backend chosen | `FailFastProofProvider` | `proof provider 'fail-fast' refused to produce a proof ... NoBackendConfigured` |
+| TEE endpoint unset | `PendingTeeAttestationProvider` | `TEE provider invoked without a connected enclave runtime` plus `TempoIntegrationPending` |
+| Remote service unreachable / non-2xx | `HttpTeeAttestationProvider` | `TEE attestation service request failed before producing a response` or `TEE attestation service returned non-success status` |
+| Remote service returned junk | `HttpTeeAttestationProvider` | `TEE attestation service returned a malformed response` |
+| Portal verifier rejected the payload | (post-submit) | `submitBatch tx ... was included but reverted on L1` — decoded selector in the retry log |
 
 ## Proposed wire format (placeholder)
 
@@ -160,23 +262,35 @@ included here so the runbook is complete:
 
 ## What landed in this repo
 
-- `crates/tempo-zone/src/proof.rs` — types + providers + `ProofBackend` config.
+- `crates/tempo-zone/src/proof.rs` — types, providers, request/response
+  envelopes (`TeeAttestationRequest`, `TeeAttestationResponse`), the
+  configurable `HttpTeeAttestationProvider`, and the `ProofBackend` /
+  `TeeProviderOptions` plumbing.
 - `crates/tempo-zone/src/batch.rs` — `BatchSubmitter` takes a
   `SharedProofProvider`, builds public inputs, and runs preflight diagnostics
   before signing.
 - `crates/tempo-zone/src/zonemonitor.rs` — improved revert decoder (logs the
   4-byte selector on unknown reverts; reports the decoded reason on every retry,
   not just after exhausting them).
-- `crates/tempo-zone/src/cli.rs` — `--proof.backend` flag.
+- `crates/tempo-zone/src/cli.rs` — `--proof.backend` flag plus
+  `--proof.tee.endpoint`, `--proof.tee.auth-bearer`, `--proof.tee.timeout-secs`,
+  `--proof.tee.enclave-id`, `--proof.tee.domain`, `--proof.tee.format`.
 - `xtask settlement-preflight` — read-only diagnostic that can be run against
   any zone to triage settlement before signing.
 - `docs/RUNBOOK_FIRST_BATCH.md` — fresh-zone and stuck-zone runbook.
 
 ## What is intentionally not implemented
 
-- Real enclave runtime (`PendingTeeAttestationProvider::build_proof` errors).
-  Connecting it depends on resolving the Tempo questions above and on choosing
-  the SEV-SNP / Nitro / TDX stack.
+- The attestation service itself. `HttpTeeAttestationProvider` ships the
+  client-side contract (request shape, response shape, fail-closed validation)
+  but operators are responsible for running the enclave-side counterpart and
+  pointing the sequencer at it via `--proof.tee.endpoint`. Until that endpoint
+  is set, `--proof.backend=tee` stays diagnostic-only via
+  `PendingTeeAttestationProvider`.
+- Canonical `verifierConfig` / `proof` byte layouts. `HttpTeeAttestationProvider`
+  forwards whatever the attestation service returns; the provider doesn't enforce
+  a particular Moderato shape. Live Moderato success still requires Tempo
+  confirming the canonical wire format and the attestation service emitting it.
 - Verifier-side signature verification fixture. Pending an external test
   vector from Tempo.
 - Ancestry-mode header inclusion in the verifier payload. The ancestry headers

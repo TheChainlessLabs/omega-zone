@@ -373,6 +373,69 @@ pub struct MidpointSample {
     pub midpoint: U128,
 }
 
+/// Response payload for `zone_getReferencePrice`.
+///
+/// When the alpha reference-price provider is disabled, `enabled` is `false`
+/// and all snapshot fields are omitted; `reason` explains why. When enabled,
+/// the response carries the current snapshot (price, source, block, timestamp),
+/// the configured guardrail bounds, and a `fresh` flag indicating whether the
+/// snapshot is within the configured staleness window.
+///
+/// This is alpha infrastructure — not a production oracle. Units match the
+/// darkpool orderbook precompile (raw integer price; `quote = baseAmount * price`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReferencePriceResponse {
+    /// Whether the reference-price provider is currently active.
+    pub enabled: bool,
+    /// Display label `"<base>/<quote>"`.
+    pub pair: String,
+    /// Base token address.
+    pub base: Address,
+    /// Quote token address.
+    pub quote: Address,
+    /// Snapshot price (raw integer). Present iff `enabled`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub price: Option<U128>,
+    /// Origin tag (e.g. `"static:alpha"`). Present iff `enabled`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// Zone L2 block at which this snapshot was minted. Present iff `enabled`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub as_of_block: Option<U64>,
+    /// Unix timestamp at which this snapshot was minted. Present iff `enabled`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub as_of_timestamp: Option<U64>,
+    /// `true` when the snapshot is within the configured staleness window.
+    /// Present iff `enabled`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fresh: Option<bool>,
+    /// Snapshot age in seconds at the moment the RPC response was built.
+    /// Present iff `enabled`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub age_secs: Option<U64>,
+    /// Maximum allowed deviation between an order's limit price and the
+    /// reference price, in basis points. Present iff `enabled`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_deviation_bps: Option<u32>,
+    /// Maximum staleness window in seconds; `0` disables the staleness check.
+    /// Present iff `enabled`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_staleness_secs: Option<u64>,
+    /// Description of the price representation.
+    pub price_unit: String,
+    /// Alpha caveat surfaced verbatim to clients.
+    pub disclaimer: String,
+    /// Reason the provider is disabled. Present iff `!enabled`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// Stable identifier for the price-unit and disclaimer strings the public
+/// reference-price methods are required to surface.
+pub const REFERENCE_PRICE_UNIT: &str = "raw integer; quote = baseAmount * price";
+pub const REFERENCE_PRICE_DISCLAIMER: &str = "alpha infrastructure; not a production oracle";
+
 /// Response payload for `zone_getMidpointHistory`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -620,6 +683,7 @@ pub fn classify_method(method: &str) -> Option<MethodTier> {
         | "zone_getBatch"
         | "zone_searchBatch"
         | "zone_getMarketConfig"
+        | "zone_getReferencePrice"
         | "zone_getTopOfBook"
         | "zone_getMidpointHistory"
         | "zone_getMyOrders"
@@ -785,6 +849,10 @@ mod tests {
         ));
         assert!(matches!(
             classify_method("zone_getMidpointHistory"),
+            Some(MethodTier::Public)
+        ));
+        assert!(matches!(
+            classify_method("zone_getReferencePrice"),
             Some(MethodTier::Public)
         ));
     }

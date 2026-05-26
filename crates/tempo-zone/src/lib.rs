@@ -17,6 +17,7 @@ mod executor;
 pub mod l1;
 pub mod l1_state;
 mod metrics;
+pub mod midpoint;
 mod node;
 pub mod nonce_keys;
 pub mod payload;
@@ -39,10 +40,13 @@ pub use l1_state::{L1StateCache, PolicyCache, PolicyProvider};
 pub use node::{ZoneExecutorBuilder, ZoneNode, ZonePrivateRpcConfig, ZoneSequencerAddOnsConfig};
 pub use payload::{ZonePayloadAttributes, ZonePayloadTypes};
 pub use proof::{
-    BatchProofProvider, BatchPublicInputs, EmptyLegacyProofProvider, FailFastProofProvider,
+    BatchProofProvider, BatchPublicInputs, DEFAULT_TEE_ATTESTATION_TIMEOUT,
+    EmptyLegacyProofProvider, FailFastProofProvider, HttpTeeAttestationProvider,
     PendingTeeAttestationProvider, PendingTeeProviderConfig, ProofBackend, ProofProviderError,
-    SharedProofProvider, StaticTeeProofProvider, TeeAttestation, TeeAttestationFormat,
-    TeeProofPayload, TeeVerifierConfig,
+    SharedProofProvider, StaticTeeProofProvider, TEE_ATTESTATION_SERVICE_VERSION, TeeAttestation,
+    TeeAttestationFormat, TeeAttestationPublicInputs, TeeAttestationRequest,
+    TeeAttestationResponse, TeeAttestationServiceConfig, TeeProofPayload, TeeProviderOptions,
+    TeeVerifierConfig,
 };
 pub(crate) use rpc_client::rpc_connection_config;
 pub use sequencer::{ZoneSequencerConfig, ZoneSequencerHandle, spawn_zone_sequencer};

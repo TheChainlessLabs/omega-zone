@@ -217,6 +217,41 @@ pub trait ZoneRpcApi: Send + Sync + 'static {
     /// `zone_getMarketConfig()` — returns canonical market metadata.
     fn zone_get_market_config(&self, auth: AuthContext) -> BoxFut<'_>;
 
+    /// `zone_getReferencePrice(pair)` — returns the public reference-price
+    /// snapshot for `pair` if a provider is configured, or an explicit
+    /// disabled response otherwise.
+    ///
+    /// Default returns disabled with a generic reason so backends that have
+    /// not opted into the provider (e.g. the proxy backend, test mocks) are
+    /// safe-by-default.
+    fn zone_get_reference_price(
+        &self,
+        base: Address,
+        quote: Address,
+        auth: AuthContext,
+    ) -> BoxFut<'_> {
+        let _ = (base, quote, auth);
+        Box::pin(async move {
+            crate::types::to_raw(&crate::types::ReferencePriceResponse {
+                enabled: false,
+                pair: String::new(),
+                base: Address::ZERO,
+                quote: Address::ZERO,
+                price: None,
+                source: None,
+                as_of_block: None,
+                as_of_timestamp: None,
+                fresh: None,
+                age_secs: None,
+                max_deviation_bps: None,
+                max_staleness_secs: None,
+                price_unit: crate::types::REFERENCE_PRICE_UNIT.to_string(),
+                disclaimer: crate::types::REFERENCE_PRICE_DISCLAIMER.to_string(),
+                reason: Some("reference-price provider not configured".to_string()),
+            })
+        })
+    }
+
     /// `zone_getTopOfBook(pair)` — returns aggregate best bid/ask and midpoint.
     fn zone_get_top_of_book(&self, base: Address, quote: Address, auth: AuthContext) -> BoxFut<'_>;
 
@@ -423,6 +458,7 @@ pub async fn dispatch(
             "zone_getMarketConfig",
             api.zone_get_market_config(auth.clone()).await,
         ),
+        "zone_getReferencePrice" => handle_zone_get_reference_price(id, raw, auth, api).await,
         "zone_getTopOfBook" => handle_zone_get_top_of_book(id, raw, auth, api).await,
         "zone_getMidpointHistory" => handle_zone_get_midpoint_history(id, raw, auth, api).await,
         "zone_getMyOrders" => handle_zone_get_my_orders(id, raw, auth, api).await,
@@ -915,6 +951,26 @@ async fn handle_zone_get_top_of_book(
         id,
         "zone_getTopOfBook",
         api.zone_get_top_of_book(pair.base, pair.quote, auth.clone())
+            .await,
+    )
+}
+
+/// Handle `zone_getReferencePrice(pair)`.
+async fn handle_zone_get_reference_price(
+    id: Value,
+    raw: &str,
+    auth: &AuthContext,
+    api: &dyn ZoneRpcApi,
+) -> JsonRpcResponse {
+    let (pair,) = match parse_params::<(MarketPair,)>(raw, &id, "expected [{base, quote}]") {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+
+    api_result(
+        id,
+        "zone_getReferencePrice",
+        api.zone_get_reference_price(pair.base, pair.quote, auth.clone())
             .await,
     )
 }
@@ -1491,6 +1547,48 @@ mod tests {
         assert_eq!(body["quote"], quote);
         assert!(body["bid"].is_null());
         assert!(body["ask"].is_null());
+    }
+
+    #[tokio::test]
+    async fn dispatches_zone_get_reference_price_default_returns_disabled() {
+        // The trait default impl backs the test mock (no override). It should
+        // return an explicit `enabled: false` payload with `reason` set, so
+        // frontends never silently see a placeholder oracle.
+        let api = MockZoneRpcApi::default();
+        let base = format!("{:#x}", Address::repeat_byte(0x11));
+        let quote = format!("{:#x}", Address::repeat_byte(0x22));
+
+        let resp = dispatch(
+            &request(
+                "zone_getReferencePrice",
+                json!([{"base": base, "quote": quote}]),
+            ),
+            &auth(),
+            &api,
+        )
+        .await;
+
+        assert!(resp.error.is_none(), "{:?}", resp.error);
+        let body: serde_json::Value =
+            serde_json::from_str(resp.result.as_ref().unwrap().get()).unwrap();
+        assert_eq!(body["enabled"], false);
+        assert!(body["reason"].as_str().is_some());
+        assert!(body["price"].is_null() || !body.as_object().unwrap().contains_key("price"));
+        assert_eq!(
+            body["disclaimer"],
+            "alpha infrastructure; not a production oracle"
+        );
+        assert_eq!(body["priceUnit"], "raw integer; quote = baseAmount * price");
+    }
+
+    #[tokio::test]
+    async fn rejects_zone_get_reference_price_missing_pair() {
+        let api = MockZoneRpcApi::default();
+        let resp = dispatch(&request("zone_getReferencePrice", json!([])), &auth(), &api).await;
+
+        let err = resp.error.expect("missing pair must error");
+        assert_eq!(err.code, -32602);
+        assert_eq!(err.message, "expected [{base, quote}]");
     }
 
     #[tokio::test]

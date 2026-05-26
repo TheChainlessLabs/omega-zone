@@ -60,6 +60,11 @@ impl SettlementPreflightCmd {
             .await
             .wrap_err_with(|| format!("failed to connect to L1 RPC at {}", self.l1_rpc_url))?
             .erased();
+        let l1_portal_provider = ProviderBuilder::new()
+            .connect(&self.l1_rpc_url)
+            .await
+            .wrap_err_with(|| format!("failed to connect to L1 RPC at {}", self.l1_rpc_url))?
+            .erased();
         let zone_provider = ProviderBuilder::new_with_network::<TempoNetwork>()
             .connect(&self.zone_rpc_url)
             .await
@@ -208,6 +213,7 @@ impl SettlementPreflightCmd {
         let submitter = BatchSubmitter::new_with_proof_provider(
             self.portal_address,
             l1_provider,
+            l1_portal_provider,
             genesis_tempo_block_number,
             Arc::new(EmptyLegacyProofProvider),
         );

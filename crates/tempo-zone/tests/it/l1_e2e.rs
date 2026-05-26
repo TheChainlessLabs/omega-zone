@@ -264,8 +264,20 @@ async fn test_cross_zone_withdrawal() -> eyre::Result<()> {
         .await?;
 
     // --- Step 3: Start both zone nodes ---
-    let zone_a = ZoneTestNode::start_from_l1(l1.http_url(), l1.ws_url(), portal_a).await?;
-    let zone_b = ZoneTestNode::start_from_l1(l1.http_url(), l1.ws_url(), portal_b).await?;
+    let zone_a = ZoneTestNode::start_from_l1_with_sequencer_signer(
+        l1.http_url(),
+        l1.ws_url(),
+        portal_a,
+        seq_a_signer.clone(),
+    )
+    .await?;
+    let zone_b = ZoneTestNode::start_from_l1_with_sequencer_signer(
+        l1.http_url(),
+        l1.ws_url(),
+        portal_b,
+        seq_b_signer.clone(),
+    )
+    .await?;
 
     zone_a.wait_for_l2_tempo_finalized(0, L1_TIMEOUT).await?;
     zone_b.wait_for_l2_tempo_finalized(0, L1_TIMEOUT).await?;
@@ -1190,6 +1202,11 @@ async fn test_blacklisted_sender_transfer_rejected() -> eyre::Result<()> {
         .await?;
     l1.blacklist_address(sender_policy_id, alice).await?;
 
+    let depositor_signer = l1.signer_at(3);
+    let depositor = depositor_signer.address();
+    let deposit_amount: u128 = 1_000_000; // 1 pathUSD
+    l1.fund_user(depositor, deposit_amount).await?;
+
     // Verify on L1: Alice is NOT authorized as sender
     {
         use tempo_contracts::precompiles::ITIP403Registry;
@@ -1234,20 +1251,21 @@ async fn test_blacklisted_sender_transfer_rejected() -> eyre::Result<()> {
     // --- Step 4: Deposit to Alice via the dev account ---
     // Alice is blacklisted as a sender, so she can't transfer pathUSD on L1
     // herself. The dev account deposits on her behalf (recipient = allow-all).
-    let deposit_amount: u128 = 1_000_000; // 1 pathUSD
     {
         use tempo_contracts::precompiles::ITIP20;
         use zone::abi::ZonePortal;
 
-        let dev_provider = l1.dev_provider();
-        ITIP20::new(PATH_USD_ADDRESS, &dev_provider)
+        let depositor_provider = alloy::providers::ProviderBuilder::new()
+            .wallet(depositor_signer)
+            .connect_http(l1.http_url().clone());
+        ITIP20::new(PATH_USD_ADDRESS, &depositor_provider)
             .approve(portal_address, U256::MAX)
             .send()
             .await?
             .get_receipt()
             .await?;
 
-        let portal = ZonePortal::new(portal_address, &dev_provider);
+        let portal = ZonePortal::new(portal_address, &depositor_provider);
         let receipt = portal
             .deposit(PATH_USD_ADDRESS, alice, deposit_amount, B256::ZERO)
             .send()

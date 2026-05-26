@@ -37,17 +37,16 @@ use crate::{
     proof::{BatchPublicInputs, FailFastProofProvider, SharedProofProvider, TeeProofPayload},
 };
 use alloy_consensus::Transaction;
-use alloy_network::ReceiptResponse;
+use alloy_network::Ethereum;
 use alloy_primitives::{Address, B256, Bytes, U256};
 use alloy_provider::{DynProvider, Provider};
 use alloy_rlp::Encodable;
+use alloy_rpc_types_eth::{TransactionInput, TransactionRequest};
 use alloy_sol_types::SolCall;
 use eyre::Result;
 use futures::{StreamExt, TryStreamExt};
-use tempo_alloy::{TempoNetwork, rpc::TempoCallBuilderExt};
+use tempo_alloy::TempoNetwork;
 use tracing::{info, instrument, warn};
-
-use crate::nonce_keys::SUBMIT_BATCH_NONCE_KEY;
 
 /// EIP-2935 stores the last 8192 block hashes (~68 min at 500ms block time).
 const EIP2935_HISTORY_WINDOW: u64 = 8192;
@@ -107,7 +106,9 @@ pub struct BatchSubmitter {
     l1_provider: DynProvider<TempoNetwork>,
     /// ZonePortal contract instance for calling `submitBatch` and reading
     /// on-chain state such as `blockHash()`.
-    portal: ZonePortal::ZonePortalInstance<DynProvider<TempoNetwork>, TempoNetwork>,
+    portal: ZonePortal::ZonePortalInstance<DynProvider<Ethereum>, Ethereum>,
+    /// Plain Ethereum transaction provider used for L1 portal writes.
+    portal_provider: DynProvider<Ethereum>,
     /// The portal's `genesisTempoBlockNumber` — batches with a
     /// `tempo_block_number` below this value will be rejected on-chain.
     genesis_tempo_block_number: u64,
@@ -125,11 +126,13 @@ impl BatchSubmitter {
     pub fn new(
         portal_address: Address,
         l1_provider: DynProvider<TempoNetwork>,
+        portal_provider: DynProvider<Ethereum>,
         genesis_tempo_block_number: u64,
     ) -> Self {
         Self::new_with_proof_provider(
             portal_address,
             l1_provider,
+            portal_provider,
             genesis_tempo_block_number,
             Arc::new(FailFastProofProvider),
         )
@@ -139,14 +142,16 @@ impl BatchSubmitter {
     pub fn new_with_proof_provider(
         portal_address: Address,
         l1_provider: DynProvider<TempoNetwork>,
+        portal_provider: DynProvider<Ethereum>,
         genesis_tempo_block_number: u64,
         proof_provider: SharedProofProvider,
     ) -> Self {
-        let portal = ZonePortal::new(portal_address, l1_provider.clone());
+        let portal = ZonePortal::new(portal_address, portal_provider.clone());
         Self {
             portal_address,
             l1_provider,
             portal,
+            portal_provider,
             genesis_tempo_block_number,
             l1_fetch_concurrency: 16,
             proof_provider,
@@ -245,7 +250,6 @@ impl BatchSubmitter {
             commitment = %public_inputs.commitment(),
             expected_withdrawal_batch_index = public_inputs.expected_withdrawal_batch_index,
             sequencer = %public_inputs.sequencer_address,
-            nonce_key = ?SUBMIT_BATCH_NONCE_KEY,
             "Computed batch public-input commitment"
         );
 
@@ -272,20 +276,24 @@ impl BatchSubmitter {
             "Submitting batch to ZonePortal on L1"
         );
 
-        let pending = self
-            .portal
-            .submitBatch(
-                batch.tempo_block_number,
-                recent_tempo_block_number,
-                block_transition,
-                deposit_transition,
-                batch.withdrawal_queue_hash,
-                verifier_config,
-                proof,
-            )
-            .nonce_key(SUBMIT_BATCH_NONCE_KEY)
-            .send()
-            .await?;
+        let call_data = ZonePortal::submitBatchCall {
+            tempoBlockNumber: batch.tempo_block_number,
+            recentTempoBlockNumber: recent_tempo_block_number,
+            blockTransition: block_transition,
+            depositQueueTransition: deposit_transition,
+            withdrawalQueueHash: batch.withdrawal_queue_hash,
+            verifierConfig: verifier_config,
+            proof,
+        }
+        .abi_encode();
+
+        let tx = TransactionRequest::default()
+            .from(public_inputs.sequencer_address)
+            .to(self.portal_address)
+            .input(TransactionInput::new(Bytes::from(call_data)))
+            .gas_limit(5_000_000);
+
+        let pending = self.portal_provider.send_transaction(tx).await?;
 
         let tx_hash = *pending.tx_hash();
         info!(

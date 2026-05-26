@@ -154,14 +154,14 @@ async fn test_darkpool_resting_bid_escrow_is_not_withdrawable() -> eyre::Result<
     )
     .await?;
 
-    let bid_receipt = darkpool
+    let bid_pending = darkpool
         .place(ALPHA_USD_ADDRESS, amount, price, true)
         .gas_price(TEMPO_T0_BASE_FEE as u128)
         .gas(4_000_000)
         .send()
-        .await?
-        .get_receipt()
         .await?;
+    fixture.inject_empty_block(zone.deposit_queue());
+    let bid_receipt = bid_pending.get_receipt().await?;
     assert!(bid_receipt.status(), "bid placement should succeed");
 
     assert_eq!(
@@ -208,14 +208,14 @@ async fn test_darkpool_resting_bid_escrow_is_not_withdrawable() -> eyre::Result<
         "failed withdrawal must leave escrow reserved"
     );
 
-    let cancel_receipt = darkpool
+    let cancel_pending = darkpool
         .cancel(1)
         .gas_price(TEMPO_T0_BASE_FEE as u128)
         .gas(500_000)
         .send()
-        .await?
-        .get_receipt()
         .await?;
+    fixture.inject_empty_block(zone.deposit_queue());
+    let cancel_receipt = cancel_pending.get_receipt().await?;
     assert!(cancel_receipt.status(), "cancel should release escrow");
     assert_eq!(
         darkpool
@@ -236,14 +236,14 @@ async fn test_darkpool_resting_bid_escrow_is_not_withdrawable() -> eyre::Result<
         "cancelled escrow becomes withdrawable"
     );
 
-    let withdraw_receipt = darkpool
+    let withdraw_pending = darkpool
         .withdraw(PATH_USD_ADDRESS, escrow)
         .gas_price(TEMPO_T0_BASE_FEE as u128)
         .gas(500_000)
         .send()
-        .await?
-        .get_receipt()
         .await?;
+    fixture.inject_empty_block(zone.deposit_queue());
+    let withdraw_receipt = withdraw_pending.get_receipt().await?;
     assert!(withdraw_receipt.status(), "released escrow should withdraw");
     assert_eq!(
         darkpool
