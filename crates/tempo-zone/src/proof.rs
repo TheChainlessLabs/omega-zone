@@ -900,12 +900,19 @@ impl BatchProofProvider for HttpTeeAttestationProvider {
 
 fn truncate_for_log(value: &str, max_len: usize) -> String {
     if value.len() <= max_len {
-        value.to_owned()
-    } else {
-        let mut truncated = value[..max_len].to_owned();
-        truncated.push_str("... (truncated)");
-        truncated
+        return value.to_owned();
     }
+    // Walk back to the nearest UTF-8 char boundary at or below `max_len` so the
+    // slice never lands inside a multibyte codepoint (which would panic).
+    let mut boundary = max_len;
+    while boundary > 0 && !value.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    let suffix = "... (truncated)";
+    let mut truncated = String::with_capacity(boundary + suffix.len());
+    truncated.push_str(&value[..boundary]);
+    truncated.push_str(suffix);
+    truncated
 }
 
 /// Operator-facing selector for the proof backend.
@@ -1492,6 +1499,45 @@ mod tests {
         }
 
         server.abort();
+    }
+
+    #[test]
+    fn truncate_for_log_respects_utf8_boundaries_and_appends_marker() {
+        // Each `é` is 2 bytes; each emoji 4 bytes. A naive byte slice at the
+        // middle of any of these would panic. The function must walk back to a
+        // valid char boundary instead.
+        let body = "é".repeat(64) + "🚀🚀🚀🚀";
+        assert!(body.len() > 100, "test input must exceed the limit");
+
+        // Hits a 2-byte boundary mid-codepoint when limit is odd.
+        let truncated = truncate_for_log(&body, 51);
+        assert!(truncated.ends_with("... (truncated)"));
+        let head = truncated
+            .strip_suffix("... (truncated)")
+            .expect("suffix appended");
+        assert!(head.len() <= 51);
+        assert!(
+            body.starts_with(head),
+            "truncated prefix must match the input"
+        );
+        assert!(
+            body.is_char_boundary(head.len()),
+            "prefix must end on a valid UTF-8 boundary"
+        );
+
+        // Hits a 4-byte emoji split when limit lands inside one.
+        let body2 = "🚀🚀🚀🚀🚀";
+        let truncated2 = truncate_for_log(body2, 7);
+        assert!(truncated2.ends_with("... (truncated)"));
+        let head2 = truncated2
+            .strip_suffix("... (truncated)")
+            .expect("suffix appended");
+        assert!(body2.starts_with(head2));
+        assert!(body2.is_char_boundary(head2.len()));
+
+        // Below-threshold input passes through unchanged with no marker.
+        let short = "hello";
+        assert_eq!(truncate_for_log(short, 256), short);
     }
 
     #[tokio::test]
