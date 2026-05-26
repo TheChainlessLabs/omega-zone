@@ -56,11 +56,11 @@ use zone_rpc::{
     auth::AuthContext,
     darkpool::{self as zone_darkpool, FillRole, HistoryQuery, Page, TransferQuery},
     types::{
-        AuthorizationTokenInfoResponse, BatchListResponse, BatchStatus, BatchSummary, BoxEyreFut,
-        BoxFut, DepositKind, DepositState, DepositStatusEntry, DepositStatusResponse,
-        HistoryAvailability, JsonRpcError, LIST_BATCHES_DEFAULT_LIMIT, LIST_BATCHES_MAX_LIMIT,
-        ListBatchesParams, MarketAction, MarketConfigResponse, MarketEntry, MarketToken,
-        MidpointHistoryResponse, OrderLevel, TopOfBookResponse, WithdrawalState,
+        AuthorizationTokenInfoResponse, BatchAggregateVolume, BatchListResponse, BatchStatus,
+        BatchSummary, BoxEyreFut, BoxFut, DepositKind, DepositState, DepositStatusEntry,
+        DepositStatusResponse, HistoryAvailability, JsonRpcError, LIST_BATCHES_DEFAULT_LIMIT,
+        LIST_BATCHES_MAX_LIMIT, ListBatchesParams, MarketAction, MarketConfigResponse, MarketEntry,
+        MarketToken, MidpointHistoryResponse, OrderLevel, TopOfBookResponse, WithdrawalState,
         WithdrawalStatusQuery, WithdrawalStatusResponse, ZoneInfoResponse, internal, raw_null,
         raw_zero, to_raw,
     },
@@ -439,6 +439,21 @@ impl<Api: EthApiTypes + 'static> TempoZoneRpc<Api> {
                 .map(|block| block.number())
         };
 
+        let aggregates = match (zone_block_from_number, zone_block_to_number) {
+            (Some(prev_or_zero), Some(end)) => {
+                // The reported `zone_block_from` is the *prev* block — already
+                // included in the preceding batch — so the new blocks added by
+                // this batch start at prev+1 (or 0 for the genesis batch).
+                let inclusive_start = if call.blockTransition.prevBlockHash.is_zero() {
+                    0
+                } else {
+                    prev_or_zero.saturating_add(1)
+                };
+                self.fetch_batch_aggregates(inclusive_start, end).await?
+            }
+            _ => BatchAggregates::default(),
+        };
+
         Ok(map_batch_summary(
             &event,
             &call,
@@ -447,7 +462,37 @@ impl<Api: EthApiTypes + 'static> TempoZoneRpc<Api> {
             zone_block_from_number,
             zone_block_to_number,
             sealed_at,
+            aggregates,
         ))
+    }
+
+    /// Fetch darkpool `OrderSubmitted` / `OrderFilled` logs covering the
+    /// inclusive zone-block range `[from, to]` (plus any `OrderSubmitted`
+    /// emitted in earlier blocks, so taker fills against orders placed in a
+    /// prior batch still resolve to the correct trading pair) and reduce them
+    /// to the public, aggregate-only [`BatchAggregates`].
+    async fn fetch_batch_aggregates(
+        &self,
+        from: u64,
+        to: u64,
+    ) -> Result<BatchAggregates, JsonRpcError> {
+        if to < from {
+            return Ok(BatchAggregates::default());
+        }
+        let filter = Filter::new()
+            .address(DARKPOOL_ADDRESS)
+            .from_block(0)
+            .to_block(to)
+            .event_signature(vec![
+                zone_darkpool::OrderSubmitted::SIGNATURE_HASH,
+                zone_darkpool::OrderFilled::SIGNATURE_HASH,
+            ]);
+        let logs = self
+            .zone_provider
+            .get_logs(&filter)
+            .await
+            .map_err(internal)?;
+        Ok(aggregate_batch_events(&logs, (from, to)))
     }
 
     /// Find the `WithdrawalRequested` event matching `query`, scoped to the
@@ -2020,7 +2065,8 @@ fn log_batch_index(log: &alloy_rpc_types_eth::Log) -> Option<u64> {
 }
 
 /// Pure mapping: `BatchSubmitted` event + decoded `submitBatch` calldata +
-/// timing data to aggregate-only [`BatchSummary`].
+/// timing data + precomputed darkpool aggregates → aggregate-only
+/// [`BatchSummary`].
 fn map_batch_summary(
     event: &ZonePortal::BatchSubmitted,
     call: &ZonePortal::submitBatchCall,
@@ -2029,6 +2075,7 @@ fn map_batch_summary(
     zone_block_from: Option<u64>,
     zone_block_to: Option<u64>,
     sealed_at: Option<u64>,
+    aggregates: BatchAggregates,
 ) -> BatchSummary {
     BatchSummary {
         batch_number: U64::from(event.withdrawalBatchIndex),
@@ -2041,12 +2088,137 @@ fn map_batch_summary(
         status: BatchStatus::Submitted,
         sealed_at: sealed_at.map(U64::from),
         settled_at: settled_at.map(U64::from),
-        order_count: U64::ZERO,
-        fill_count: U64::ZERO,
-        aggregate_pairs: Vec::new(),
-        aggregate_volume: Vec::new(),
+        order_count: U64::from(aggregates.order_count),
+        fill_count: U64::from(aggregates.fill_count),
+        aggregate_pairs: aggregates.pair_labels,
+        aggregate_volume: aggregates.volume_by_token,
         settlement_tx_hash,
         proof_ref: None,
+    }
+}
+
+/// Aggregate-only darkpool statistics for a sequencer batch.
+///
+/// Constructed by [`aggregate_batch_events`] from the raw `OrderSubmitted` /
+/// `OrderFilled` logs covering the batch's zone-block range. No owner-,
+/// order-, or fill-id-linked fields are retained.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct BatchAggregates {
+    order_count: u64,
+    fill_count: u64,
+    pair_labels: Vec<String>,
+    volume_by_token: Vec<BatchAggregateVolume>,
+}
+
+/// Human-readable label for `(base, quote)`. The canonical alpha-launch pair
+/// gets its `OALPHA/PATH.USD` label; any other pair falls back to its
+/// `0xBASE/0xQUOTE` hex form so downstream callers can still group volume.
+fn pair_label(base: Address, quote: Address) -> String {
+    if base == alpha::BASE && quote == alpha::QUOTE {
+        alpha::PAIR_LABEL.to_string()
+    } else {
+        format!("{base:#x}/{quote:#x}")
+    }
+}
+
+/// Pure reduction: a slice of darkpool logs spanning `[0, block_range.1]` →
+/// public aggregate counts and per-token settled volume for the inclusive
+/// range `block_range`.
+///
+/// `OrderSubmitted` logs are scanned across the full slice to build an
+/// order-id → pair index, so an `OrderFilled` in `block_range` whose maker
+/// placed the order in an earlier batch still attributes its volume to the
+/// right pair and tokens.
+///
+/// **Privacy:** the returned aggregates never include maker, taker, owner,
+/// order id, or fill id fields — only counts, pair labels, and per-token
+/// totals.
+fn aggregate_batch_events(
+    darkpool_logs: &[alloy_rpc_types_eth::Log],
+    block_range: (u64, u64),
+) -> BatchAggregates {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let (from, to) = block_range;
+    if to < from {
+        return BatchAggregates::default();
+    }
+
+    let mut pair_by_order_id: BTreeMap<u128, (Address, Address)> = BTreeMap::new();
+    for log in darkpool_logs {
+        if log.topic0().copied() != Some(zone_darkpool::OrderSubmitted::SIGNATURE_HASH) {
+            continue;
+        }
+        let Some(block) = log.block_number else {
+            continue;
+        };
+        if block > to {
+            continue;
+        }
+        if let Ok(decoded) = zone_darkpool::OrderSubmitted::decode_log(&log.inner) {
+            pair_by_order_id.insert(decoded.orderId, (decoded.base, decoded.quote));
+        }
+    }
+
+    let mut order_count: u64 = 0;
+    let mut fill_count: u64 = 0;
+    let mut pair_set: BTreeSet<(Address, Address)> = BTreeSet::new();
+    let mut volume_by_token: BTreeMap<Address, U256> = BTreeMap::new();
+
+    for log in darkpool_logs {
+        let Some(block) = log.block_number else {
+            continue;
+        };
+        if block < from || block > to {
+            continue;
+        }
+        let Some(topic0) = log.topic0().copied() else {
+            continue;
+        };
+
+        if topic0 == zone_darkpool::OrderSubmitted::SIGNATURE_HASH {
+            order_count = order_count.saturating_add(1);
+            if let Ok(decoded) = zone_darkpool::OrderSubmitted::decode_log(&log.inner) {
+                pair_set.insert((decoded.base, decoded.quote));
+            }
+        } else if topic0 == zone_darkpool::OrderFilled::SIGNATURE_HASH {
+            fill_count = fill_count.saturating_add(1);
+            if let Ok(decoded) = zone_darkpool::OrderFilled::decode_log(&log.inner)
+                && let Some(&(base, quote)) = pair_by_order_id.get(&decoded.orderId)
+            {
+                pair_set.insert((base, quote));
+                let base_amount = U256::from(decoded.amountFilled);
+                // `quote = baseAmount * price` per the alpha market config.
+                let quote_amount = base_amount.saturating_mul(U256::from(decoded.price));
+                volume_by_token
+                    .entry(base)
+                    .and_modify(|v| *v = v.saturating_add(base_amount))
+                    .or_insert(base_amount);
+                volume_by_token
+                    .entry(quote)
+                    .and_modify(|v| *v = v.saturating_add(quote_amount))
+                    .or_insert(quote_amount);
+            }
+        }
+    }
+
+    let mut pair_labels: Vec<String> = pair_set
+        .iter()
+        .map(|&(base, quote)| pair_label(base, quote))
+        .collect();
+    pair_labels.sort();
+    pair_labels.dedup();
+
+    let volume_by_token = volume_by_token
+        .into_iter()
+        .map(|(token, amount)| BatchAggregateVolume { token, amount })
+        .collect();
+
+    BatchAggregates {
+        order_count,
+        fill_count,
+        pair_labels,
+        volume_by_token,
     }
 }
 
@@ -2488,6 +2660,7 @@ mod tests {
             Some(8),
             Some(20),
             Some(456),
+            BatchAggregates::default(),
         );
 
         assert_eq!(summary.batch_number, U64::from(42));
@@ -2505,7 +2678,7 @@ mod tests {
     }
 
     #[test]
-    fn map_batch_summary_emits_aggregate_only_fields() {
+    fn map_batch_summary_with_default_aggregates_is_zeroed_and_owner_free() {
         let event = sample_batch_event(7);
         let call = sample_batch_call(50);
         let summary = map_batch_summary(
@@ -2516,6 +2689,7 @@ mod tests {
             None,
             None,
             None,
+            BatchAggregates::default(),
         );
 
         let json = serde_json::to_value(&summary).expect("summary should serialize");
@@ -2531,6 +2705,9 @@ mod tests {
             "fillId",
             "trader",
             "userAddress",
+            "maker",
+            "taker",
+            "account",
         ] {
             assert!(
                 !obj.contains_key(forbidden),
@@ -2542,6 +2719,228 @@ mod tests {
         assert_eq!(summary.fill_count, U64::ZERO);
         assert!(summary.aggregate_pairs.is_empty());
         assert!(summary.aggregate_volume.is_empty());
+    }
+
+    #[test]
+    fn map_batch_summary_propagates_aggregates_without_leaking_owners() {
+        let event = sample_batch_event(99);
+        let call = sample_batch_call(2_000);
+        let aggregates = BatchAggregates {
+            order_count: 3,
+            fill_count: 2,
+            pair_labels: vec![alpha::PAIR_LABEL.to_string()],
+            volume_by_token: vec![
+                BatchAggregateVolume {
+                    token: alpha::BASE,
+                    amount: U256::from(500u64),
+                },
+                BatchAggregateVolume {
+                    token: alpha::QUOTE,
+                    amount: U256::from(2_500u64),
+                },
+            ],
+        };
+        let summary = map_batch_summary(
+            &event,
+            &call,
+            B256::repeat_byte(0x77),
+            Some(10),
+            Some(0),
+            Some(99),
+            Some(20),
+            aggregates,
+        );
+
+        assert_eq!(summary.order_count, U64::from(3));
+        assert_eq!(summary.fill_count, U64::from(2));
+        assert_eq!(summary.aggregate_pairs, vec![alpha::PAIR_LABEL.to_string()]);
+        assert_eq!(summary.aggregate_volume.len(), 2);
+
+        let json = serde_json::to_value(&summary).expect("summary should serialize");
+        let obj = json.as_object().expect("summary must be a JSON object");
+        for forbidden in [
+            "maker",
+            "taker",
+            "account",
+            "owner",
+            "orderId",
+            "fillId",
+            "counterparty",
+            "trader",
+            "userAddress",
+            "sender",
+            "recipient",
+        ] {
+            assert!(
+                !obj.contains_key(forbidden),
+                "batch summary leaked owner-linked field `{forbidden}`",
+            );
+        }
+    }
+
+    /// Build a darkpool [`alloy_rpc_types_eth::Log`] for an `OrderSubmitted`
+    /// event at `block` with the alpha pair, used to seed the pair index in
+    /// aggregation tests.
+    fn alpha_submitted_log(
+        block: u64,
+        order_id: u128,
+        amount: u128,
+        price: u128,
+    ) -> alloy_rpc_types_eth::Log {
+        let event = zone_darkpool::OrderSubmitted {
+            orderId: order_id,
+            maker: Address::repeat_byte(0xaa),
+            base: alpha::BASE,
+            quote: alpha::QUOTE,
+            amount,
+            price,
+            isBid: true,
+        };
+        wrap_log(DARKPOOL_ADDRESS, event.encode_log_data(), block)
+    }
+
+    fn alpha_filled_log(
+        block: u64,
+        order_id: u128,
+        amount: u128,
+        price: u128,
+    ) -> alloy_rpc_types_eth::Log {
+        let event = zone_darkpool::OrderFilled {
+            orderId: order_id,
+            maker: Address::repeat_byte(0xaa),
+            taker: Address::repeat_byte(0xbb),
+            amountFilled: amount,
+            price,
+        };
+        wrap_log(DARKPOOL_ADDRESS, event.encode_log_data(), block)
+    }
+
+    fn wrap_log(
+        address: Address,
+        data: alloy_primitives::LogData,
+        block: u64,
+    ) -> alloy_rpc_types_eth::Log {
+        alloy_rpc_types_eth::Log {
+            inner: alloy_primitives::Log { address, data },
+            block_hash: None,
+            block_number: Some(block),
+            block_timestamp: None,
+            transaction_hash: None,
+            transaction_index: None,
+            log_index: None,
+            removed: false,
+        }
+    }
+
+    #[test]
+    fn aggregate_batch_events_counts_orders_and_fills_in_range() {
+        let logs = vec![
+            alpha_submitted_log(10, 1, 1_000, 5),
+            alpha_filled_log(10, 1, 400, 5),
+            alpha_submitted_log(11, 2, 800, 6),
+            alpha_filled_log(11, 2, 800, 6),
+        ];
+        let agg = aggregate_batch_events(&logs, (10, 11));
+
+        assert_eq!(agg.order_count, 2, "two OrderSubmitted events in range");
+        assert_eq!(agg.fill_count, 2, "two OrderFilled events in range");
+        assert_eq!(agg.pair_labels, vec![alpha::PAIR_LABEL.to_string()]);
+    }
+
+    #[test]
+    fn aggregate_batch_events_includes_alpha_pair_when_traded() {
+        let logs = vec![
+            alpha_submitted_log(5, 1, 1_000, 7),
+            alpha_filled_log(5, 1, 1_000, 7),
+        ];
+        let agg = aggregate_batch_events(&logs, (5, 5));
+        assert_eq!(agg.pair_labels, vec!["OALPHA/PATH.USD".to_string()]);
+    }
+
+    #[test]
+    fn aggregate_batch_events_aggregates_volume_per_token() {
+        // Two fills on the alpha pair: 400 base @ price 5 → +2_000 quote;
+        // 800 base @ price 6 → +4_800 quote. Totals: base 1_200, quote 6_800.
+        let logs = vec![
+            alpha_submitted_log(10, 1, 1_000, 5),
+            alpha_filled_log(10, 1, 400, 5),
+            alpha_submitted_log(11, 2, 800, 6),
+            alpha_filled_log(11, 2, 800, 6),
+        ];
+        let agg = aggregate_batch_events(&logs, (10, 11));
+
+        let base_volume = agg
+            .volume_by_token
+            .iter()
+            .find(|v| v.token == alpha::BASE)
+            .expect("base volume present");
+        let quote_volume = agg
+            .volume_by_token
+            .iter()
+            .find(|v| v.token == alpha::QUOTE)
+            .expect("quote volume present");
+        assert_eq!(base_volume.amount, U256::from(1_200u64));
+        assert_eq!(quote_volume.amount, U256::from(6_800u64));
+    }
+
+    #[test]
+    fn aggregate_batch_events_uses_earlier_order_submitted_for_pair_lookup() {
+        // OrderSubmitted lives in block 5; OrderFilled hits in block 12 — the
+        // pair index must still resolve the fill to the alpha pair even
+        // though the submission is outside the [from, to] range.
+        let logs = vec![
+            alpha_submitted_log(5, 42, 1_000, 4),
+            alpha_filled_log(12, 42, 1_000, 4),
+        ];
+        let agg = aggregate_batch_events(&logs, (10, 15));
+
+        assert_eq!(agg.order_count, 0, "submission is outside [from, to]");
+        assert_eq!(agg.fill_count, 1, "fill is inside [from, to]");
+        assert_eq!(agg.pair_labels, vec![alpha::PAIR_LABEL.to_string()]);
+        let base_volume = agg
+            .volume_by_token
+            .iter()
+            .find(|v| v.token == alpha::BASE)
+            .expect("base volume present");
+        assert_eq!(base_volume.amount, U256::from(1_000u64));
+    }
+
+    #[test]
+    fn aggregate_batch_events_skips_events_outside_range() {
+        let logs = vec![
+            alpha_submitted_log(1, 1, 1_000, 5),
+            alpha_filled_log(1, 1, 1_000, 5),
+            alpha_submitted_log(100, 2, 500, 3),
+            alpha_filled_log(100, 2, 500, 3),
+        ];
+        let agg = aggregate_batch_events(&logs, (10, 20));
+
+        assert_eq!(agg.order_count, 0);
+        assert_eq!(agg.fill_count, 0);
+        assert!(agg.pair_labels.is_empty());
+        assert!(agg.volume_by_token.is_empty());
+    }
+
+    #[test]
+    fn aggregate_batch_events_returns_default_for_inverted_range() {
+        let logs = vec![alpha_submitted_log(10, 1, 1_000, 5)];
+        let agg = aggregate_batch_events(&logs, (10, 5));
+        assert_eq!(agg, BatchAggregates::default());
+    }
+
+    #[test]
+    fn pair_label_uses_canonical_label_for_alpha_pair() {
+        assert_eq!(pair_label(alpha::BASE, alpha::QUOTE), "OALPHA/PATH.USD");
+    }
+
+    #[test]
+    fn pair_label_falls_back_to_hex_form_for_unknown_pairs() {
+        let base = Address::repeat_byte(0x12);
+        let quote = Address::repeat_byte(0x34);
+        let label = pair_label(base, quote);
+        assert!(label.contains("0x121212"));
+        assert!(label.contains("0x343434"));
+        assert!(label.contains('/'));
     }
 
     #[test]
