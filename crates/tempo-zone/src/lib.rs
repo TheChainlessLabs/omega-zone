@@ -17,6 +17,7 @@ mod executor;
 pub mod l1;
 pub mod l1_state;
 mod metrics;
+pub mod midpoint;
 mod node;
 pub mod nonce_keys;
 pub mod payload;

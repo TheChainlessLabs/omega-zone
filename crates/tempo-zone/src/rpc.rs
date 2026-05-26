@@ -60,10 +60,15 @@ use zone_rpc::{
         BoxFut, DepositKind, DepositState, DepositStatusEntry, DepositStatusResponse,
         HistoryAvailability, JsonRpcError, LIST_BATCHES_DEFAULT_LIMIT, LIST_BATCHES_MAX_LIMIT,
         ListBatchesParams, MarketAction, MarketConfigResponse, MarketEntry, MarketToken,
-        MidpointHistoryResponse, OrderLevel, TopOfBookResponse, WithdrawalState,
+        MidpointHistoryResponse, MidpointSample, OrderLevel, TopOfBookResponse, WithdrawalState,
         WithdrawalStatusQuery, WithdrawalStatusResponse, ZoneInfoResponse, internal, raw_null,
         raw_zero, to_raw,
     },
+};
+
+use crate::midpoint::{
+    MIDPOINT_RETENTION, MIDPOINT_SAMPLE_INTERVAL, MidpointHistory, RawSample, SUPPORTED_INTERVALS,
+    interval_seconds,
 };
 
 type RpcBlock = Block<alloy_rpc_types_eth::Transaction<TempoTxEnvelope>, TempoHeaderResponse>;
@@ -170,6 +175,10 @@ pub struct TempoZoneRpc<Api: EthApiTypes> {
     /// Maps filter IDs to the authenticated account that created them.
     /// The reth filter registry remains the source of truth for filter liveness.
     filter_owners: Arc<Mutex<HashMap<FilterId, Address>>>,
+    /// In-memory aggregate midpoint history backing
+    /// [`zone_get_midpoint_history`](Self::zone_get_midpoint_history).
+    /// Written by a background sampler; never sees owner data.
+    midpoint_history: Arc<MidpointHistory>,
 }
 
 impl<Api: EthApiTypes + 'static> TempoZoneRpc<Api> {
@@ -204,8 +213,10 @@ impl<Api: EthApiTypes + 'static> TempoZoneRpc<Api> {
             zone_provider,
             tempo_state,
             filter_owners: Arc::new(Mutex::new(HashMap::new())),
+            midpoint_history: Arc::new(MidpointHistory::new(MIDPOINT_RETENTION)),
         };
         rpc.spawn_filter_owner_pruner();
+        rpc.spawn_midpoint_sampler();
         Ok(rpc)
     }
 
@@ -236,6 +247,53 @@ impl<Api: EthApiTypes + 'static> TempoZoneRpc<Api> {
                 };
 
                 prune_filter_owners(&filter, &owners).await;
+            }
+        });
+    }
+
+    /// Spawn the background midpoint sampler. It polls the darkpool
+    /// precompile's aggregate top-of-book at [`MIDPOINT_SAMPLE_INTERVAL`]
+    /// and records a midpoint sample whenever both sides of the book are
+    /// non-empty. Reads only aggregate values — no owner data crosses this
+    /// boundary.
+    fn spawn_midpoint_sampler(&self)
+    where
+        Api: Send + Sync + 'static,
+    {
+        let provider = self.zone_provider.clone();
+        let history: Weak<MidpointHistory> = Arc::downgrade(&self.midpoint_history);
+        tokio::spawn(async move {
+            let mut tick = interval(MIDPOINT_SAMPLE_INTERVAL);
+            tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+            loop {
+                tick.tick().await;
+
+                let Some(history) = history.upgrade() else {
+                    break;
+                };
+
+                let darkpool = DarkpoolReader::new(DARKPOOL_ADDRESS, &provider);
+                let Ok(best_bid) = darkpool.bestBid(alpha::BASE).call().await else {
+                    continue;
+                };
+                let Ok(best_ask) = darkpool.bestAsk(alpha::BASE).call().await else {
+                    continue;
+                };
+
+                if best_bid.price == 0
+                    || best_bid.quantity == 0
+                    || best_ask.price == 0
+                    || best_ask.quantity == 0
+                {
+                    continue;
+                }
+
+                let midpoint = best_bid.price.saturating_add(best_ask.price) / 2;
+                history.record(RawSample {
+                    timestamp: unix_now_secs(),
+                    midpoint,
+                });
             }
         });
     }
@@ -1470,26 +1528,39 @@ where
         base: Address,
         quote: Address,
         interval: String,
-        _limit: u32,
-        _cursor: Option<String>,
+        limit: u32,
+        cursor: Option<String>,
         _auth: AuthContext,
     ) -> BoxFut<'_> {
         Box::pin(async move {
             ensure_canonical_pair(base, quote)?;
 
-            to_raw(&MidpointHistoryResponse {
-                pair: alpha::PAIR_LABEL.to_string(),
+            let interval_secs = interval_seconds(&interval).ok_or_else(|| {
+                JsonRpcError::invalid_params(format!(
+                    "unsupported interval `{interval}`; expected one of: {}",
+                    SUPPORTED_INTERVALS.join(", "),
+                ))
+            })?;
+
+            let cursor_ts = parse_midpoint_cursor(cursor.as_deref())?;
+
+            let (page, next_cursor) = self.midpoint_history.query(interval_secs, limit, cursor_ts);
+
+            let samples = page
+                .into_iter()
+                .map(|s| MidpointSample {
+                    timestamp: U64::from(s.bucket_end),
+                    midpoint: U128::from(s.midpoint),
+                })
+                .collect();
+
+            to_raw(&build_midpoint_history_response(
                 base,
                 quote,
                 interval,
-                samples: Vec::new(),
-                next_cursor: None,
-                history: HistoryAvailability {
-                    enabled: false,
-                    reason: "midpoint history aggregation is not yet enabled for alpha; frontends should keep the chart disabled and use zone_getTopOfBook for live aggregate values"
-                        .to_string(),
-                },
-            })
+                samples,
+                next_cursor,
+            ))
         })
     }
 
@@ -2205,6 +2276,48 @@ fn ensure_canonical_pair(base: Address, quote: Address) -> Result<(), JsonRpcErr
     }
 }
 
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn parse_midpoint_cursor(cursor: Option<&str>) -> Result<Option<u64>, JsonRpcError> {
+    match cursor {
+        None => Ok(None),
+        Some(raw) => U64::from_str(raw)
+            .map(|u| Some(u.to::<u64>()))
+            .map_err(|_| JsonRpcError::invalid_params("cursor must be a hex quantity")),
+    }
+}
+
+fn build_midpoint_history_response(
+    base: Address,
+    quote: Address,
+    interval: String,
+    samples: Vec<MidpointSample>,
+    next_cursor: Option<u64>,
+) -> MidpointHistoryResponse {
+    MidpointHistoryResponse {
+        pair: alpha::PAIR_LABEL.to_string(),
+        base,
+        quote,
+        interval,
+        samples,
+        next_cursor: next_cursor.map(|ts| format!("0x{ts:x}")),
+        history: HistoryAvailability {
+            enabled: true,
+            reason: format!(
+                "in-process midpoint sampler online; polls top-of-book every {}s, retains \
+                 ~{} raw samples",
+                MIDPOINT_SAMPLE_INTERVAL.as_secs(),
+                MIDPOINT_RETENTION,
+            ),
+        },
+    }
+}
+
 fn canonical_alpha_market_config() -> MarketConfigResponse {
     MarketConfigResponse {
         darkpool: DARKPOOL_ADDRESS,
@@ -2706,5 +2819,118 @@ mod tests {
             format!("{:#x}", alpha::QUOTE),
             "0x20c0000000000000000000000000000000000000"
         );
+    }
+
+    #[test]
+    fn rpc_midpoint_cursor_accepts_hex_and_decimal() {
+        assert_eq!(parse_midpoint_cursor(None).unwrap(), None);
+        assert_eq!(parse_midpoint_cursor(Some("0x180")).unwrap(), Some(384));
+        assert_eq!(parse_midpoint_cursor(Some("180")).unwrap(), Some(180));
+    }
+
+    #[test]
+    fn rpc_midpoint_cursor_rejects_garbage_with_invalid_params() {
+        let err =
+            parse_midpoint_cursor(Some("not-a-number")).expect_err("garbage cursor must error");
+        assert_eq!(err.code, -32602);
+        assert_eq!(err.message, "cursor must be a hex quantity");
+    }
+
+    #[test]
+    fn rpc_midpoint_history_response_advertises_enabled_sampler() {
+        let response = build_midpoint_history_response(
+            alpha::BASE,
+            alpha::QUOTE,
+            "1m".to_string(),
+            Vec::new(),
+            None,
+        );
+
+        assert_eq!(response.pair, alpha::PAIR_LABEL);
+        assert_eq!(response.base, alpha::BASE);
+        assert_eq!(response.quote, alpha::QUOTE);
+        assert_eq!(response.interval, "1m");
+        assert!(response.samples.is_empty());
+        assert!(response.next_cursor.is_none());
+        assert!(
+            response.history.enabled,
+            "sampler must advertise enabled=true once the backing store exists"
+        );
+        assert!(
+            response.history.reason.contains("sampler"),
+            "reason should document the sampler; got {:?}",
+            response.history.reason
+        );
+    }
+
+    #[test]
+    fn rpc_midpoint_history_response_encodes_next_cursor_as_hex() {
+        let response = build_midpoint_history_response(
+            alpha::BASE,
+            alpha::QUOTE,
+            "5m".to_string(),
+            vec![MidpointSample {
+                timestamp: U64::from(1_700u64),
+                midpoint: U128::from(42u128),
+            }],
+            Some(0x180),
+        );
+
+        assert_eq!(response.next_cursor.as_deref(), Some("0x180"));
+    }
+
+    #[test]
+    fn rpc_midpoint_history_response_emits_aggregate_only_fields() {
+        let response = build_midpoint_history_response(
+            alpha::BASE,
+            alpha::QUOTE,
+            "1m".to_string(),
+            vec![
+                MidpointSample {
+                    timestamp: U64::from(120u64),
+                    midpoint: U128::from(100u128),
+                },
+                MidpointSample {
+                    timestamp: U64::from(180u64),
+                    midpoint: U128::from(110u128),
+                },
+            ],
+            None,
+        );
+
+        let json = serde_json::to_value(&response).expect("response must serialize");
+        let obj = json.as_object().expect("response must be a JSON object");
+        for forbidden in [
+            "account",
+            "owner",
+            "trader",
+            "maker",
+            "taker",
+            "user",
+            "userAddress",
+            "counterparty",
+            "fill",
+            "fillId",
+            "orderId",
+            "from",
+            "to",
+            "sender",
+            "recipient",
+        ] {
+            assert!(
+                !obj.contains_key(forbidden),
+                "midpoint history leaked owner-linked field `{forbidden}`",
+            );
+        }
+
+        let samples = json["samples"]
+            .as_array()
+            .expect("samples must be a JSON array");
+        for sample in samples {
+            let sample = sample.as_object().expect("sample must be a JSON object");
+            assert_eq!(sample.len(), 2);
+            assert!(sample.contains_key("timestamp"));
+            assert!(sample.contains_key("midpoint"));
+        }
     }
 }

@@ -194,6 +194,45 @@ failed (most often: maker zone balances are below `seed_amount`, or
 `MIN_ORDER_AMOUNT = 100` was violated). Re-run that step after topping
 up the maker.
 
+## Midpoint chart history (`zone_getMidpointHistory`)
+
+The private RPC backs the alpha frontend chart with an in-memory aggregate
+midpoint sampler. It reads the darkpool's aggregate top-of-book
+(`bestBid` / `bestAsk`) on a fixed cadence and stores `(timestamp, midpoint)`
+samples — no account, order id, maker, taker, or fill-level data.
+
+Response contract:
+
+- `history.enabled` is `true` whenever the sampler is wired (i.e., the
+  private RPC has booted). The frontend can render the chart.
+- `samples` is empty when the book has never had two-sided liquidity since
+  process start — the sampler skips writes when either side is missing.
+- `pair`, `base`, and `quote` echo the canonical alpha market.
+
+Supported `interval` labels (bucket size in parentheses):
+
+| Label | Bucket |
+|-------|--------|
+| `"1m"` | 60 s   |
+| `"5m"` | 300 s  |
+| `"1h"` | 3600 s |
+
+Any other value returns `invalid_params`. Within a bucket the last observed
+midpoint wins.
+
+Retention: the store keeps roughly 12 hours of raw samples at the default
+15-second sampler cadence, then evicts oldest-first. History is in-process
+and **does not survive a node restart** — for alpha that is acceptable;
+post-alpha the indexer should persist samples.
+
+Pagination: `next_cursor` is a hex `U64` of the oldest `bucket_end` in the
+current page when older buckets exist. Re-issue the call with that value as
+`cursor` to walk further back. Limits cap at `5000` samples per page; the
+default is `500`.
+
+Unsupported pairs (anything other than `OALPHA/PATH.USD`) still return the
+existing unsupported-pair `invalid_params` error.
+
 ## Troubleshooting
 
 | Symptom                                                    | Likely cause / fix                                                                                          |
