@@ -237,6 +237,32 @@ The guardrails are advisory in the current build — the precompile does not
 yet reject orders on-chain. Wiring enforcement into the orderbook precompile
 is a separate change once a non-static provider lands.
 
+### Enabling the static provider
+
+The alpha node defaults to the disabled state (no provider). Operators opt
+in via CLI flags / env vars on `tempo-zone`:
+
+| Flag                                | Env var                          | Default          | Notes                                                                  |
+|-------------------------------------|----------------------------------|------------------|------------------------------------------------------------------------|
+| `--ref-price.static-price <u128>`   | `REF_PRICE_STATIC_PRICE`         | unset (disabled) | When unset, `zone_getReferencePrice` returns `enabled: false`.         |
+| `--ref-price.source <string>`       | `REF_PRICE_SOURCE`               | `static:alpha`   | Origin tag surfaced verbatim to clients.                               |
+| `--ref-price.max-deviation-bps <u32>` | `REF_PRICE_MAX_DEVIATION_BPS`  | `1000` (±10%)    | Order-vs-reference bound in basis points.                              |
+| `--ref-price.max-staleness-secs <u64>` | `REF_PRICE_MAX_STALENESS_SECS` | `0` (no expiry)  | `0` is the natural setting for a static provider.                      |
+
+Example: pin the OALPHA/PATH.USD static reference at `1` with the default
+±10% bound:
+
+```bash
+tempo-zone \
+  --ref-price.static-price 1 \
+  --ref-price.source static:alpha \
+  --ref-price.max-deviation-bps 1000 \
+  ...
+```
+
+Omitting `--ref-price.static-price` keeps the provider disabled. The other
+three flags are inert until a price is supplied.
+
 ## Troubleshooting
 
 | Symptom                                                    | Likely cause / fix                                                                                          |
