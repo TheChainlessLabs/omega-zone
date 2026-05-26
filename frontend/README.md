@@ -1,17 +1,16 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Omega Zone Frontend
+
+Small Next.js dashboard for exercising a local or testnet Omega Zone. It is not
+the canonical trading app; `omega-interface` consumes the production UX. This
+frontend is useful for zone bring-up, private RPC checks, alpha market sanity,
+and quick operator diagnostics while the zone backend is moving.
 
 ## Getting Started
 
-First, run the development server:
+Start the zone first, then run the frontend:
 
 ```bash
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
 Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
@@ -21,21 +20,35 @@ Before `dev`, `build`, or `start`, the frontend syncs its zone-related
 `frontend/.env.local`. If more than one generated zone exists, pick one with
 `OMEGA_ZONE_NAME=<name> npm run dev`.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+For the Omega private-alpha path, see:
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+- [`../docs/ALPHA.md`](../docs/ALPHA.md) for OALPHA / PATH.USD setup
+- [`../docs/TEE_PROOF.md`](../docs/TEE_PROOF.md) for proof-provider state
+- [`../docs/RUNBOOK_FIRST_BATCH.md`](../docs/RUNBOOK_FIRST_BATCH.md) for settlement diagnostics
 
-## Learn More
+## What This Frontend Expects
 
-To learn more about Next.js, take a look at the following resources:
+- public zone RPC on `NEXT_PUBLIC_ZONE_RPC_URL`
+- private RPC auth through the signed zone auth-token flow
+- raw signed transactions; browser flows should not rely on server-side signing
+- the alpha darkpool precompile at `NEXT_PUBLIC_DARKPOOL_ADDRESS`
+- owner-scoped reads through the `zone_getMy*` methods
+- aggregate-only batch reads through `zone_listBatches`, `zone_getBatch`, and `zone_searchBatch`
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+## Useful Scripts
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+```bash
+npm run dev
+npm run build
+npm run lint
+```
 
-## Deploy on Vercel
+Use the repo-level alpha recipes when you need to seed balances, market state,
+and resting liquidity before opening the dashboard:
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+```bash
+just alpha-setup
+```
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+The production UI work happens in `TheChainlessLabs/omega-interface`; keep this
+app focused on zone validation and diagnostics.

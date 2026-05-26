@@ -1,8 +1,8 @@
 # Alpha darkpool implementation: keep the Rust precompile
 
-**Status:** Decision proposed. Pending review for issue #9.
+**Status:** Accepted for alpha. Issue #9 remains open only for follow-up hardening and documentation.
 
-**Date:** 2026-05-25.
+**Date:** 2026-05-25. Updated 2026-05-26 after PR #1 and the follow-up alpha RPC/proof/settlement PRs merged.
 
 **Milestone:** Tempo testnet batching & settlement (alpha integration freeze).
 
@@ -15,7 +15,7 @@ distraction than the wallet/tooling pain it removes, because:
    problems — they were keychain, gas-estimation, balance privacy, and access-
    key signing problems, all of which would carry forward to a Solidity port.
 2. The precompile's outstanding correctness bug (storage persistence on first
-   call) is small, well-scoped, and already proposed in
+   call) was small, well-scoped, and fixed by
    [PR #1](https://github.com/TheChainlessLabs/omega-zone/pull/1).
 3. With this branch's `zone_getMyOrders` / `zone_getMyFills` /
    `zone_getMyTransfers` / `zone_getOrder` private RPC methods, the
@@ -62,7 +62,7 @@ term:
 1. **Merge the storage init fix.** PR #1 lazily initializes the darkpool
    precompile account on first non-static call so its storage persists.
    Without this, mutating calls succeed but state is dropped — every
-   frontend session sees an empty book. Blocking.
+   frontend session sees an empty book. **Done.**
 2. **Owner-scoped history APIs.** Delivered by this branch:
    - `zone_getMyOrders(query?)`
    - `zone_getMyFills(query?)`
@@ -129,12 +129,25 @@ term:
   - cancel order — covered by `cancel(orderId)`.
   - market buy / sell — covered by `marketBuy` / `marketSell`.
   - owner-scoped history / indexing — covered by `zone_getMy*` this branch.
-- [ ] PR #1 (storage-init fix) merged. Out of scope for this branch by
-      instruction; tracked in PR #1.
+- [x] PR #1 (storage-init fix) merged.
 - [ ] Multi-maker / partial-fill / cancel-after-fill test coverage. File
       as a follow-up issue after the freeze.
 
-## How this branch contributes
+## What landed after this decision
+
+As of `main` on 2026-05-26, the alpha backend also includes:
+
+- storage persistence fix for the darkpool precompile (PR #1)
+- owner-scoped darkpool history and aggregate batch explorer APIs
+- withdrawal and deposit status methods
+- market config, top-of-book, midpoint history, and reference-price RPC surfaces
+- configurable TEE proof provider plumbing and first-batch settlement diagnostics
+
+Issue #9 should now be narrowed to hardening the accepted precompile path:
+multi-maker/multi-taker fill-order tests, partial-fill reconstruction tests,
+cancel-after-partial-fill coverage, and ABI/selector/units/collateral docs.
+
+## Historical branch contribution
 
 This branch implements the API surface described under "Owner-scoped
 history APIs". Files added / changed:
