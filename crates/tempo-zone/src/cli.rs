@@ -2,17 +2,19 @@
 
 use std::{sync::Arc, time::Duration};
 
-use alloy_primitives::Address;
+use alloy_primitives::{Address, Bytes};
 use alloy_signer_local::PrivateKeySigner;
 use clap::{Args, Parser};
 use reth_consensus::noop::NoopConsensus;
 use reth_ethereum::cli::Cli;
 use reth_tracing::tracing::info;
 use tempo_chainspec::spec::{TempoChainSpec, TempoChainSpecParser};
+use url::Url;
 
 use crate::{
     ZoneNode, ZonePrivateRpcConfig, ZoneSequencerAddOnsConfig, evm::ZoneEvmConfig,
-    proof::ProofBackend, rpc::auth::DEFAULT_MAX_AUTH_TOKEN_VALIDITY_SECS,
+    proof::{ProofBackend, TeeAttestationFormat, TeeProviderOptions},
+    rpc::auth::DEFAULT_MAX_AUTH_TOKEN_VALIDITY_SECS,
 };
 
 const MAX_LOGS_PER_RESPONSE: u64 = 1_000_000;
@@ -59,6 +61,8 @@ impl ZoneCli {
             builder.config_mut().rpc.rpc_max_logs_per_response = MAX_LOGS_PER_RESPONSE.into();
             builder.config_mut().rpc.rpc_max_blocks_per_filter = MAX_BLOCKS_PER_FILTER.into();
 
+            let tee_options = args.tee_provider_options()?;
+
             let mut node = ZoneNode::new(
                 args.l1_rpc_url,
                 args.portal_address,
@@ -79,6 +83,10 @@ impl ZoneCli {
                     .sequencer_key
                     .parse()
                     .expect("invalid sequencer private key");
+                let proof_provider = args
+                    .proof_backend
+                    .into_provider(tee_options)
+                    .map_err(|err| eyre::eyre!("failed to construct proof provider: {err}"))?;
                 node = node.with_sequencer(ZoneSequencerAddOnsConfig {
                     sequencer_signer,
                     zone_id: args.zone_id,
@@ -87,7 +95,7 @@ impl ZoneCli {
                     withdrawal_poll_interval: Duration::from_secs(
                         args.withdrawal_poll_interval_secs,
                     ),
-                    proof_provider: args.proof_backend.into_provider(),
+                    proof_provider,
                 });
             }
 
@@ -192,14 +200,83 @@ pub struct ZoneArgs {
     /// Proof backend used to build `verifierConfig` / `proof` bytes for each
     /// batch. `fail-fast` (default) refuses to submit until an operator opts
     /// in; `empty-legacy` keeps the pre-TEE behaviour for permissive dev
-    /// verifiers; `tee` wires the (still-incomplete) TEE attestation provider
-    /// so logs surface the commitment that *would* be signed.
+    /// verifiers; `tee` enables the TEE attestation provider — with an
+    /// `--proof.tee.endpoint` set the sequencer POSTs each batch's public
+    /// inputs to that service and forwards the returned `verifierConfig` /
+    /// `proof` bytes; without an endpoint it stays diagnostic-only (logs the
+    /// commitment that *would* be signed and refuses to submit).
     #[arg(
         long = "proof.backend",
         env = "PROOF_BACKEND",
         default_value = "fail-fast"
     )]
     pub proof_backend: ProofBackend,
+
+    /// HTTP(S) endpoint of the TEE attestation service the sequencer will
+    /// POST [`TeeAttestationRequest`] payloads to. Leaving this unset with
+    /// `--proof.backend=tee` keeps the diagnostic-only
+    /// `PendingTeeAttestationProvider` behaviour (no L1 submission).
+    #[arg(long = "proof.tee.endpoint", env = "PROOF_TEE_ENDPOINT")]
+    pub proof_tee_endpoint: Option<Url>,
+
+    /// Optional bearer token forwarded to the attestation service as the
+    /// `Authorization` header. Only honoured when `--proof.tee.endpoint` is set.
+    #[arg(long = "proof.tee.auth-bearer", env = "PROOF_TEE_AUTH_BEARER")]
+    pub proof_tee_auth_bearer: Option<String>,
+
+    /// Per-request timeout for the attestation service, in seconds.
+    #[arg(
+        long = "proof.tee.timeout-secs",
+        env = "PROOF_TEE_TIMEOUT_SECS",
+        default_value_t = 15
+    )]
+    pub proof_tee_timeout_secs: u64,
+
+    /// Enclave identity hash to advertise in the request (hex string, with or
+    /// without `0x` prefix). Echoed back in the response's `verifierConfig`.
+    #[arg(long = "proof.tee.enclave-id", env = "PROOF_TEE_ENCLAVE_ID")]
+    pub proof_tee_enclave_id: Option<String>,
+
+    /// Domain separator to bind into the request (hex string, with or without
+    /// `0x` prefix). Typically the portal address concatenated with the zone id.
+    #[arg(long = "proof.tee.domain", env = "PROOF_TEE_DOMAIN")]
+    pub proof_tee_domain: Option<String>,
+
+    /// Best-known attestation flavour the service produces. Tags the request so
+    /// the service can refuse early on a mismatch. One of `sev-snp`,
+    /// `nitro-enclaves`, `intel-tdx`, or `unconfirmed` (default).
+    #[arg(
+        long = "proof.tee.format",
+        env = "PROOF_TEE_FORMAT",
+        default_value = "unconfirmed"
+    )]
+    pub proof_tee_format: TeeAttestationFormat,
+}
+
+impl ZoneArgs {
+    /// Collapse the `--proof.tee.*` flags into a [`TeeProviderOptions`].
+    pub(crate) fn tee_provider_options(&self) -> eyre::Result<TeeProviderOptions> {
+        let enclave_id = parse_optional_hex(self.proof_tee_enclave_id.as_deref(), "--proof.tee.enclave-id")?;
+        let domain = parse_optional_hex(self.proof_tee_domain.as_deref(), "--proof.tee.domain")?;
+        Ok(TeeProviderOptions {
+            endpoint: self.proof_tee_endpoint.clone(),
+            bearer_token: self.proof_tee_auth_bearer.clone(),
+            request_timeout: Some(Duration::from_secs(self.proof_tee_timeout_secs)),
+            enclave_id,
+            domain,
+            format: self.proof_tee_format,
+        })
+    }
+}
+
+fn parse_optional_hex(value: Option<&str>, flag: &str) -> eyre::Result<Bytes> {
+    let Some(raw) = value else {
+        return Ok(Bytes::new());
+    };
+    let trimmed = raw.trim_start_matches("0x").trim_start_matches("0X");
+    let decoded = const_hex::decode(trimmed)
+        .map_err(|err| eyre::eyre!("{flag}: invalid hex value `{raw}`: {err}"))?;
+    Ok(Bytes::from(decoded))
 }
 
 fn prepend_log_filter(filter: &mut String, directives: &str) {

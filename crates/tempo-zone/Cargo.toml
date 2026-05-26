@@ -69,6 +69,7 @@ revm.workspace = true
 
 # misc
 clap = { workspace = true, optional = true }
+const-hex = { workspace = true, optional = true }
 metrics.workspace = true
 k256.workspace = true
 reth-consensus = { workspace = true, optional = true }
@@ -77,10 +78,11 @@ reth-ethereum = { workspace = true, features = [
   "cli",
 ], optional = true }
 reth-tracing = { workspace = true, optional = true }
-url = "2"
+url = { version = "2", features = ["serde"] }
 derive_more = { workspace = true, features = ["deref", "deref_mut"] }
 either.workspace = true
 eyre.workspace = true
+reqwest.workspace = true
 serde = { workspace = true, features = ["derive"] }
 futures.workspace = true
 parking_lot.workspace = true
@@ -98,6 +100,7 @@ alloy = { workspace = true, features = [
   "signer-mnemonic-all-languages",
   "rpc-types",
 ] }
+axum.workspace = true
 alloy-contract.workspace = true
 alloy-primitives.workspace = true
 alloy-rpc-types-engine.workspace = true
@@ -112,9 +115,8 @@ reth-node-core.workspace = true
 reth-rpc-builder.workspace = true
 reth-tracing.workspace = true
 serde = { workspace = true, features = ["derive"] }
-alloy-signer.workspace = true
-reqwest.workspace = true
 serde_json.workspace = true
+alloy-signer.workspace = true
 thiserror.workspace = true
 tempo-chainspec.workspace = true
 tempo-contracts.workspace = true
@@ -128,6 +130,7 @@ tokio-tungstenite.workspace = true
 default = []
 cli = [
   "dep:clap",
+  "dep:const-hex",
   "dep:reth-consensus",
   "dep:reth-ethereum",
   "dep:reth-tracing",
