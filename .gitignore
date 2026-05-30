@@ -16,6 +16,7 @@ profile.json.gz
 localnet/**
 generated/
 tasks/
+frontend/
 
 .claude/
 !docs/.claude/
