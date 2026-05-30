@@ -140,7 +140,9 @@ What it does:
    resting ask (price=2) for OALPHA against pathUSD on the alpha darkpool.
 6. `alpha-state` — prints USER/MAKER L1 and zone balances plus
    `bestBid(OALPHA)` / `bestAsk(OALPHA)` so the tester can confirm the UI
-   has a market to trade against.
+   has a market to trade against. Top-of-book is a temporary alpha
+   readiness surface, not a strict darkpool privacy claim; see
+   `docs/darkpool-alpha-decision.md`.
 
 Defaults (override as positional args to `just alpha-setup`):
 

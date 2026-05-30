@@ -3,13 +3,18 @@
 //! A privacy-preserving central limit order book where orders match against
 //! resting liquidity using price-time priority. Key properties:
 //!
-//! - **Hidden orderbook** — no public price level or orderbook view functions.
+//! - **Owner-scoped order history** — live order reads are maker-gated, and
+//!   full history is reconstructed through private RPC.
 //! - **Owner-scoped reads** — only the maker can view their own orders.
 //! - **Price-time priority** — same-side orders sorted by best price first,
 //!   then by insertion time (lower order ID = earlier).
 //! - **Internal balances** — users deposit tokens once and trade gas-efficiently
 //!   without repeated TIP-20 transfers. Withdrawals push tokens back to the
 //!   user's TIP-20 wallet.
+//!
+//! `bestBid` / `bestAsk` are exposed as temporary aggregate alpha-readiness
+//! helpers. Strict darkpool/privacy claims should not rely on public
+//! top-of-book visibility.
 //!
 //! Matching happens eagerly on placement: a new bid matches against the best
 //! ask first (and vice versa), with price improvement refunded to the taker

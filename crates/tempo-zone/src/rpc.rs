@@ -1797,10 +1797,10 @@ where
             fills.sort_by(|a, b| {
                 b.block_number
                     .cmp(&a.block_number)
-                    .then_with(|| b.tx_hash.cmp(&a.tx_hash))
+                    .then_with(|| b.log_index.cmp(&a.log_index))
             });
             fills.dedup_by(|a, b| {
-                a.tx_hash == b.tx_hash && a.order_id == b.order_id && a.role == b.role
+                a.tx_hash == b.tx_hash && a.log_index == b.log_index && a.role == b.role
             });
 
             let next_cursor = zone_darkpool::next_fill_cursor(&fills, limit);
