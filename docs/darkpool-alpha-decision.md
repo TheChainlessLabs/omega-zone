@@ -1,8 +1,8 @@
 # Alpha darkpool implementation: keep the Rust precompile
 
-**Status:** Decision proposed. Pending review for issue #9.
+**Status:** Accepted for alpha. Issue #9 is now a hardening tracker.
 
-**Date:** 2026-05-25.
+**Date:** 2026-05-26.
 
 **Milestone:** Tempo testnet batching & settlement (alpha integration freeze).
 
@@ -15,8 +15,9 @@ distraction than the wallet/tooling pain it removes, because:
    problems — they were keychain, gas-estimation, balance privacy, and access-
    key signing problems, all of which would carry forward to a Solidity port.
 2. The precompile's outstanding correctness bug (storage persistence on first
-   call) is small, well-scoped, and already proposed in
-   [PR #1](https://github.com/TheChainlessLabs/omega-zone/pull/1).
+   call) was fixed by
+   [PR #1](https://github.com/TheChainlessLabs/omega-zone/pull/1), so the
+   account initializes on first non-static call and its state persists.
 3. With this branch's `zone_getMyOrders` / `zone_getMyFills` /
    `zone_getMyTransfers` / `zone_getOrder` private RPC methods, the
    precompile's existing indexed events are sufficient to reconstruct
@@ -89,21 +90,72 @@ term:
      handler-specific logic.
 4. **Durable precompile tests.** The existing integration tests in
    `crates/tempo-zone/tests/it/precompiles.rs` cover availability,
-   resting-bid escrow, and self-crossing limit-order matching. Still
-   missing — file as follow-up after the freeze:
-   - Multi-maker / multi-taker fill ordering test.
-   - Partial-fill across two `place` calls with reconstruction-via-events
-     verification.
-   - Cancel after partial fill — proves `cancelTxHash` propagates into
-     the reconstructed `OrderEntry`.
+   resting-bid escrow, self-crossing limit-order matching, multi-maker /
+   multi-taker fill ordering, partial-fill reconstruction, and cancel after
+   partial fill.
 5. **ABI / selector / units doc.** The `sol!` block in
    `crates/precompiles/src/orderbook.rs` is the canonical ABI; the events
    are mirrored verbatim in `crates/rpc/src/darkpool.rs` for off-chain
-   decoding. Price is raw integer quote-per-base; the frontend handles
-   decimals. Collateral rules: bid escrow = `amount * price` in quote;
-   ask escrow = `amount` in base. These need a one-page doc — file as
-   follow-up. Not a freeze blocker; the frontend already encodes them
-   correctly per `tasks/todo.md` review notes.
+   decoding. The alpha-facing reference is recorded below.
+
+## Alpha ABI, selectors, units, and collateral
+
+The alpha darkpool lives at
+`0x0b00000000000000000000000000000000000001` on the zone. It is an
+in-process zone precompile with marker bytecode for persistence, not deployed
+Solidity bytecode.
+
+Canonical write selectors:
+
+| Selector | Signature | Notes |
+|---|---|---|
+| `0xb3fb6564` | `deposit(address,uint128)` | Pulls `amount` of `token` into the caller's internal darkpool balance. |
+| `0x08fab167` | `withdraw(address,uint128)` | Withdraws available internal balance back to the caller's zone TIP-20 wallet. |
+| `0xee60dde5` | `place(address,uint128,uint128,bool)` | Places a limit order for `base, amount, price, isBid`; returns the accepted order id. |
+| `0x81649d06` | `cancel(uint128)` | Cancels a resting order owned by the caller. |
+| `0x7345f144` | `marketBuy(address,uint128,uint128)` | Buys exact `amount` of base, spending up to `maxQuoteIn`. |
+| `0xf005c804` | `marketSell(address,uint128,uint128)` | Sells exact `amount` of base, receiving at least `minQuoteOut`. |
+
+Canonical read selectors:
+
+| Selector | Signature | Notes |
+|---|---|---|
+| `0x117d4128` | `getOrder(uint128)` | Owner-scoped live resting-order read; filled/cancelled orders are reconstructed through private RPC history. |
+| `0xf7888aec` | `balanceOf(address,address)` | Owner-scoped total internal balance. |
+| `0x2a7575ee` | `availableBalanceOf(address,address)` | Owner-scoped internal balance minus resting-order escrow. |
+| `0xcd27ca82` | `pairKey(address,address)` | Pure pair-key helper. |
+| `0x9ccb0744` | `createPair(address)` | Explicit pair creation; `place` also lazily creates pairs. |
+| `0x835801d7` | `bestBid(address)` | Aggregate top bid for alpha readiness only. |
+| `0x64d5a61c` | `bestAsk(address)` | Aggregate top ask for alpha readiness only. |
+| `0x40bf2aa4` | `MIN_ORDER_AMOUNT()` | Dust floor, currently `100`. |
+
+Prices are raw integer quote-per-base units. The precompile does not apply
+token decimals; callers and frontends format decimals at the edge. For the
+alpha OALPHA/pathUSD pair, `base` is OALPHA and `quote` is pathUSD.
+
+Collateral is reserved by side:
+
+- Bid escrow: `amount * price` in quote token.
+- Ask escrow: `amount` in base token.
+- Filled bid takers pay the resting maker's price, not necessarily their
+  submitted limit price.
+- `availableBalanceOf` excludes all resting escrow. Cancelling a partially
+  filled order releases only the unfilled residual.
+
+Accepted limit orders emit `OrderSubmitted` before matching. Residual resting
+orders additionally emit `OrderPlaced`. Each consumed resting leg emits
+`OrderFilled`, and limit-order matches also emit `OrderMatched` to link the
+maker order id and taker submission id for owner-scoped history.
+
+## Top-of-book stance for alpha
+
+`bestBid`, `bestAsk`, and private RPC `zone_getTopOfBook` remain temporary
+alpha readiness surfaces. They exist so the frontend and runbooks can confirm
+seed liquidity and live crossing behavior without a standalone indexer.
+
+Strict darkpool/privacy claims must not depend on public top-of-book
+visibility. Before beta, either remove/gate the aggregate surface or explicitly
+productize it as a public market-data feature with updated privacy language.
 
 ## What we defer
 
@@ -129,10 +181,9 @@ term:
   - cancel order — covered by `cancel(orderId)`.
   - market buy / sell — covered by `marketBuy` / `marketSell`.
   - owner-scoped history / indexing — covered by `zone_getMy*` this branch.
-- [ ] PR #1 (storage-init fix) merged. Out of scope for this branch by
-      instruction; tracked in PR #1.
-- [ ] Multi-maker / partial-fill / cancel-after-fill test coverage. File
-      as a follow-up issue after the freeze.
+- [x] PR #1 (storage-init fix) merged.
+- [x] Multi-maker / partial-fill / cancel-after-fill test coverage added.
+- [x] ABI, selector, unit, collateral, and top-of-book alpha stance documented.
 
 ## How this branch contributes
 
@@ -145,9 +196,9 @@ history APIs". Files added / changed:
 - `crates/rpc/src/handlers.rs` — adds `zone_get_my_orders`,
   `zone_get_my_fills`, `zone_get_my_transfers`, `zone_get_order` to the
   `ZoneRpcApi` trait, the dispatch, and the test mock.
-- `crates/rpc/src/proxy.rs` — `ProxyZoneRpc` implementation of the four
-  methods using upstream `eth_getLogs` with caller-scoped topic filters
-  and client-side post-filtering.
+- `crates/rpc/src/proxy.rs` — proxy backend intentionally rejects
+  zone-specific darkpool methods; the in-process zone RPC path is canonical
+  for alpha.
 - `crates/rpc/src/types.rs` — adds the four method names to the
   `Public` classification tier.
 - `crates/rpc/tests/it/ws.rs` — mock impls for the four methods.
