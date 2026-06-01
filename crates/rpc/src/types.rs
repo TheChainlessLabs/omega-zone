@@ -540,7 +540,7 @@ pub struct WithdrawalStatusResponse {
 #[serde(rename_all = "lowercase")]
 pub enum BatchStatus {
     /// Batch was sealed by the sequencer but no L1 `BatchSubmitted` event has
-    /// been observed yet. Reserved; listing endpoints only surface L1 batches.
+    /// been observed yet.
     Pending,
     /// `BatchSubmitted` was observed on L1.
     Submitted,
@@ -602,7 +602,8 @@ pub struct BatchSummary {
     /// Aggregate per-token volume settled by the batch.
     pub aggregate_volume: Vec<BatchAggregateVolume>,
     /// L1 transaction hash that emitted `BatchSubmitted`.
-    pub settlement_tx_hash: B256,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub settlement_tx_hash: Option<B256>,
     /// Reference to the settlement proof, when known.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proof_ref: Option<String>,

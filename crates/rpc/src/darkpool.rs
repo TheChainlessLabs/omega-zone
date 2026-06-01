@@ -214,6 +214,8 @@ pub struct FillEntry {
     pub block_number: U256,
     /// Tx hash of the fill.
     pub tx_hash: B256,
+    /// Per-block log index, for stable ordering and cursor pagination.
+    pub log_index: U256,
 }
 
 /// A single TIP-20 transfer involving the authenticated caller.
@@ -551,6 +553,7 @@ pub fn reconstruct_orders<'a, I: IntoIterator<Item = &'a Log>>(logs: I) -> Vec<O
             if let Ok(decoded) = OrderCancelled::decode_log(&log.inner) {
                 if let Some(entry) = by_id.get_mut(&decoded.orderId) {
                     entry.status = OrderStatus::Cancelled;
+                    entry.remaining = U128::ZERO;
                     entry.cancel_tx_hash = Some(tx_hash);
                     entry.updated_at_block = block;
                 }
@@ -695,6 +698,7 @@ pub fn fill_entry_from_log(log: &Log, role: FillRole, pair_index: &PairIndex) ->
         price: U128::from(decoded.price),
         block_number: block,
         tx_hash,
+        log_index: log.log_index.map(U256::from).unwrap_or(U256::ZERO),
     })
 }
 
@@ -771,10 +775,11 @@ pub fn next_fill_cursor(fills: &[FillEntry], limit: u32) -> Option<String> {
         .block_number
         .try_into()
         .unwrap_or(0);
+    let log_index: u64 = fills[limit as usize - 1].log_index.try_into().unwrap_or(0);
     Some(
         Cursor {
             block_number: block,
-            log_index: 0,
+            log_index,
         }
         .encode(),
     )
@@ -917,6 +922,25 @@ mod tests {
             Some(block),
             Some(tx_hash),
         )
+    }
+
+    fn make_order_cancelled_log(maker: Address, order_id: u128, block: u64, tx_hash: B256) -> Log {
+        make_log_full(
+            DARKPOOL_ADDRESS,
+            vec![
+                OrderCancelled::SIGNATURE_HASH,
+                order_id_topic(order_id),
+                topic_addr(&maker),
+            ],
+            Bytes::new(),
+            Some(block),
+            Some(tx_hash),
+        )
+    }
+
+    fn with_log_index(mut log: Log, log_index: u64) -> Log {
+        log.log_index = Some(log_index);
+        log
     }
 
     /// Cross-check the alloy-derived constants against keccak256 of the
@@ -1139,6 +1163,7 @@ mod tests {
             price: U128::ZERO,
             block_number: U256::ZERO,
             tx_hash: B256::ZERO,
+            log_index: U256::ZERO,
         };
         let json = serde_json::to_string(&entry).unwrap();
         assert!(
@@ -1234,6 +1259,43 @@ mod tests {
     }
 
     #[test]
+    fn reconstruct_orders_tracks_partial_fill_then_cancel_tx_hash() {
+        let maker = address!("0x000000000000000000000000000000000000beef");
+        let taker_one = address!("0x0000000000000000000000000000000000000001");
+        let taker_two = address!("0x0000000000000000000000000000000000000002");
+        let base = address!("0x0000000000000000000000000000000000ba51e1");
+        let quote = address!("0x0000000000000000000000000000000000600073");
+        let submit_tx = B256::with_last_byte(0xa1);
+        let fill_one_tx = B256::with_last_byte(0xa2);
+        let fill_two_tx = B256::with_last_byte(0xa3);
+        let cancel_tx = B256::with_last_byte(0xa4);
+
+        let logs = vec![
+            make_order_submitted_log(maker, 7, base, quote, 1_000_000, 2, false, 10, submit_tx),
+            make_order_filled_log(7, maker, taker_one, 300_000, 2, 11, fill_one_tx),
+            make_order_filled_log(7, maker, taker_two, 400_000, 2, 12, fill_two_tx),
+            make_order_cancelled_log(maker, 7, 13, cancel_tx),
+        ];
+
+        let orders = reconstruct_orders(logs.iter());
+        assert_eq!(orders.len(), 1);
+        let order = &orders[0];
+        assert_eq!(order.order_id, U128::from(7u128));
+        assert_eq!(order.side, Side::Ask);
+        assert_eq!(order.status, OrderStatus::Cancelled);
+        assert_eq!(order.amount, U128::from(1_000_000u128));
+        assert_eq!(order.filled, U128::from(700_000u128));
+        assert_eq!(
+            order.remaining,
+            U128::ZERO,
+            "cancelled orders should not retain a resting remainder"
+        );
+        assert_eq!(order.cancel_tx_hash, Some(cancel_tx));
+        assert_eq!(order.created_tx_hash, submit_tx);
+        assert_eq!(order.updated_at_block, U256::from(13u64));
+    }
+
+    #[test]
     fn fill_entry_taker_side_resolves_callers_own_order_id_via_tx_hash() {
         // For taker fills, OrderFilled.orderId is the counterparty's resting
         // order — exposing it would leak counterparty info. The caller's
@@ -1268,6 +1330,74 @@ mod tests {
         );
         assert_eq!(entry.base_token, base);
         assert_eq!(entry.quote_token, quote);
+    }
+
+    #[test]
+    fn fill_entry_preserves_log_index_for_same_tx_multi_fill_rows() {
+        let caller = address!("0x000000000000000000000000000000000000beef");
+        let maker_one = address!("0x0000000000000000000000000000000000000001");
+        let maker_two = address!("0x0000000000000000000000000000000000000002");
+        let base = address!("0x0000000000000000000000000000000000ba51e1");
+        let quote = address!("0x0000000000000000000000000000000000600073");
+        let same_tx = B256::with_last_byte(0xc3);
+
+        let taker_submission =
+            make_order_submitted_log(caller, 42, base, quote, 700_000, 2, true, 20, same_tx);
+        let maker_one_submission = make_order_submitted_log(
+            maker_one,
+            1,
+            base,
+            quote,
+            300_000,
+            2,
+            false,
+            10,
+            B256::with_last_byte(0xa1),
+        );
+        let maker_two_submission = make_order_submitted_log(
+            maker_two,
+            2,
+            base,
+            quote,
+            400_000,
+            2,
+            false,
+            11,
+            B256::with_last_byte(0xa2),
+        );
+        let index = build_pair_index(
+            [
+                &taker_submission,
+                &maker_one_submission,
+                &maker_two_submission,
+            ],
+            &caller,
+        );
+
+        let fill_one = with_log_index(
+            make_order_filled_log(1, maker_one, caller, 300_000, 2, 20, same_tx),
+            4,
+        );
+        let fill_two = with_log_index(
+            make_order_filled_log(2, maker_two, caller, 400_000, 2, 20, same_tx),
+            6,
+        );
+
+        let entry_one =
+            fill_entry_from_log(&fill_one, FillRole::Taker, &index).expect("first fill resolves");
+        let entry_two =
+            fill_entry_from_log(&fill_two, FillRole::Taker, &index).expect("second fill resolves");
+
+        assert_eq!(entry_one.order_id, Some(U128::from(42u128)));
+        assert_eq!(entry_two.order_id, Some(U128::from(42u128)));
+        assert_eq!(entry_one.tx_hash, same_tx);
+        assert_eq!(entry_two.tx_hash, same_tx);
+        assert_ne!(
+            entry_one.log_index, entry_two.log_index,
+            "log index keeps same-tx fill rows distinct"
+        );
+        assert_eq!(entry_one.log_index, U256::from(4u64));
+        assert_eq!(entry_two.log_index, U256::from(6u64));
     }
 
     #[test]

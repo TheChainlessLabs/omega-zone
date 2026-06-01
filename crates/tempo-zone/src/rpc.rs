@@ -408,6 +408,82 @@ impl<Api: EthApiTypes + 'static> TempoZoneRpc<Api> {
             .map_err(internal)
     }
 
+    /// Read the portal's currently accepted zone block hash.
+    async fn portal_block_hash(&self) -> Result<B256, JsonRpcError> {
+        if self.config.zone_portal.is_zero() {
+            return Err(JsonRpcError::internal("zone portal not configured"));
+        }
+        ZonePortal::new(self.config.zone_portal, self.l1_provider.clone())
+            .blockHash()
+            .call()
+            .await
+            .map_err(internal)
+    }
+
+    /// Return the newest local zone block as `(number, hash)`.
+    async fn latest_zone_block(&self) -> Result<Option<(u64, B256)>, JsonRpcError> {
+        let block = self
+            .zone_provider
+            .get_block_by_number(BlockNumberOrTag::Latest)
+            .await
+            .map_err(internal)?;
+        Ok(block.map(|block| (block.number(), block.header.hash)))
+    }
+
+    /// Resolve the L1 portal's accepted zone hash back to a local zone block.
+    async fn submitted_zone_block_number(
+        &self,
+        portal_block_hash: B256,
+    ) -> Result<Option<u64>, JsonRpcError> {
+        if portal_block_hash.is_zero() {
+            return Ok(Some(0));
+        }
+        self.zone_provider
+            .get_block_by_hash(portal_block_hash)
+            .await
+            .map(|block| block.map(|block| block.number()))
+            .map_err(internal)
+    }
+
+    /// Build a public pending batch row from local zone blocks that have not
+    /// landed on L1 yet.
+    async fn pending_batch_summary(
+        &self,
+        latest_batch_number: u64,
+    ) -> Result<Option<BatchSummary>, JsonRpcError> {
+        let (portal_block_hash, latest_zone_block, tempo_block_number) =
+            tokio::try_join!(self.portal_block_hash(), self.latest_zone_block(), async {
+                self.tempo_state
+                    .tempoBlockNumber()
+                    .call()
+                    .await
+                    .map_err(internal)
+            },)?;
+
+        let Some((latest_zone_block_number, latest_zone_block_hash)) = latest_zone_block else {
+            return Ok(None);
+        };
+
+        let submitted_zone_block_number = self
+            .submitted_zone_block_number(portal_block_hash)
+            .await?
+            .filter(|submitted| latest_zone_block_number > *submitted);
+
+        let Some(submitted_zone_block_number) = submitted_zone_block_number else {
+            return Ok(None);
+        };
+
+        Ok(Some(map_pending_batch_summary(
+            latest_batch_number.saturating_add(1),
+            submitted_zone_block_number.checked_add(1),
+            latest_zone_block_number,
+            tempo_block_number,
+            portal_block_hash,
+            latest_zone_block_hash,
+            BatchAggregates::default(),
+        )))
+    }
+
     /// Fetch a single `BatchSubmitted` log by indexed `withdrawalBatchIndex`.
     async fn fetch_batch_log(
         &self,
@@ -1423,10 +1499,22 @@ where
                 .max(1);
 
             let latest = self.latest_batch_number().await?;
-            if latest == 0 {
+            let mut batches = Vec::new();
+            let include_pending = params.cursor.is_none();
+            if include_pending && let Some(pending) = self.pending_batch_summary(latest).await? {
+                batches.push(pending);
+            }
+
+            let remaining_limit = limit.saturating_sub(batches.len() as u32);
+            if latest == 0 || remaining_limit == 0 {
+                let next_cursor = if latest > 0 && remaining_limit == 0 {
+                    Some(U64::from(latest.saturating_add(1)))
+                } else {
+                    None
+                };
                 return to_raw(&BatchListResponse {
-                    batches: Vec::new(),
-                    next_cursor: None,
+                    batches,
+                    next_cursor,
                 });
             }
 
@@ -1444,15 +1532,18 @@ where
                 None => latest,
             };
 
-            let start = end.saturating_sub((limit as u64).saturating_sub(1)).max(1);
+            let start = end
+                .saturating_sub((remaining_limit as u64).saturating_sub(1))
+                .max(1);
             let logs = self.fetch_batch_logs_in_range(start, end).await?;
 
             let futures = logs
                 .into_iter()
                 .map(|log| self.build_batch_summary(log))
                 .collect::<Vec<_>>();
-            let mut batches = futures::future::try_join_all(futures).await?;
-            batches.sort_by(|a, b| b.batch_number.cmp(&a.batch_number));
+            let mut submitted_batches = futures::future::try_join_all(futures).await?;
+            submitted_batches.sort_by(|a, b| b.batch_number.cmp(&a.batch_number));
+            batches.extend(submitted_batches);
 
             let next_cursor = if start > 1 {
                 Some(U64::from(start))
@@ -1952,10 +2043,10 @@ where
             fills.sort_by(|a, b| {
                 b.block_number
                     .cmp(&a.block_number)
-                    .then_with(|| b.tx_hash.cmp(&a.tx_hash))
+                    .then_with(|| b.log_index.cmp(&a.log_index))
             });
             fills.dedup_by(|a, b| {
-                a.tx_hash == b.tx_hash && a.order_id == b.order_id && a.role == b.role
+                a.tx_hash == b.tx_hash && a.log_index == b.log_index && a.role == b.role
             });
 
             let next_cursor = zone_darkpool::next_fill_cursor(&fills, limit);
@@ -2202,7 +2293,38 @@ fn map_batch_summary(
         fill_count: U64::from(aggregates.fill_count),
         aggregate_pairs: aggregates.pair_labels,
         aggregate_volume: aggregates.volume_by_token,
-        settlement_tx_hash,
+        settlement_tx_hash: Some(settlement_tx_hash),
+        proof_ref: None,
+    }
+}
+
+/// Pure mapping for the local zone blocks that have been produced but have not
+/// landed in a `BatchSubmitted` L1 event yet.
+fn map_pending_batch_summary(
+    batch_number: u64,
+    zone_block_from: Option<u64>,
+    zone_block_to: u64,
+    tempo_block_number: u64,
+    prev_block_hash: B256,
+    next_block_hash: B256,
+    aggregates: BatchAggregates,
+) -> BatchSummary {
+    BatchSummary {
+        batch_number: U64::from(batch_number),
+        zone_block_from: zone_block_from.map(U64::from),
+        zone_block_to: Some(U64::from(zone_block_to)),
+        tempo_block_number: U64::from(tempo_block_number),
+        root: B256::ZERO,
+        prev_block_hash,
+        next_block_hash,
+        status: BatchStatus::Pending,
+        sealed_at: None,
+        settled_at: None,
+        order_count: U64::from(aggregates.order_count),
+        fill_count: U64::from(aggregates.fill_count),
+        aggregate_pairs: aggregates.pair_labels,
+        aggregate_volume: aggregates.volume_by_token,
+        settlement_tx_hash: None,
         proof_ref: None,
     }
 }
@@ -2897,7 +3019,7 @@ mod tests {
         assert_eq!(summary.status, BatchStatus::Submitted);
         assert_eq!(summary.sealed_at, Some(U64::from(456)));
         assert_eq!(summary.settled_at, Some(U64::from(123)));
-        assert_eq!(summary.settlement_tx_hash, settlement_tx);
+        assert_eq!(summary.settlement_tx_hash, Some(settlement_tx));
         assert_eq!(summary.proof_ref, None);
     }
 
@@ -3000,6 +3122,51 @@ mod tests {
                 "batch summary leaked owner-linked field `{forbidden}`",
             );
         }
+    }
+
+    #[test]
+    fn map_pending_batch_summary_omits_l1_settlement_fields() {
+        let aggregates = BatchAggregates {
+            order_count: 2,
+            fill_count: 1,
+            pair_labels: vec![alpha::PAIR_LABEL.to_string()],
+            volume_by_token: vec![BatchAggregateVolume {
+                token: alpha::BASE,
+                amount: U256::from(500u64),
+            }],
+        };
+
+        let summary = map_pending_batch_summary(
+            43,
+            Some(101),
+            150,
+            2_500,
+            B256::repeat_byte(0x11),
+            B256::repeat_byte(0x22),
+            aggregates,
+        );
+
+        assert_eq!(summary.batch_number, U64::from(43));
+        assert_eq!(summary.zone_block_from, Some(U64::from(101)));
+        assert_eq!(summary.zone_block_to, Some(U64::from(150)));
+        assert_eq!(summary.tempo_block_number, U64::from(2_500));
+        assert_eq!(summary.root, B256::ZERO);
+        assert_eq!(summary.prev_block_hash, B256::repeat_byte(0x11));
+        assert_eq!(summary.next_block_hash, B256::repeat_byte(0x22));
+        assert_eq!(summary.status, BatchStatus::Pending);
+        assert_eq!(summary.sealed_at, None);
+        assert_eq!(summary.settled_at, None);
+        assert_eq!(summary.order_count, U64::from(2));
+        assert_eq!(summary.fill_count, U64::from(1));
+        assert_eq!(summary.aggregate_pairs, vec![alpha::PAIR_LABEL.to_string()]);
+        assert_eq!(summary.aggregate_volume.len(), 1);
+        assert_eq!(summary.settlement_tx_hash, None);
+        assert_eq!(summary.proof_ref, None);
+
+        let json = serde_json::to_value(&summary).expect("summary should serialize");
+        let obj = json.as_object().expect("summary must be a JSON object");
+        assert!(!obj.contains_key("settlementTxHash"));
+        assert!(!obj.contains_key("proofRef"));
     }
 
     /// Build a darkpool [`alloy_rpc_types_eth::Log`] for an `OrderSubmitted`
