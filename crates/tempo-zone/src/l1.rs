@@ -10,7 +10,7 @@ use alloy_eips::NumHash;
 use alloy_primitives::{Address, B256, Bytes, U256, keccak256};
 use alloy_provider::{DynProvider, Provider, ProviderBuilder};
 use alloy_rpc_client::RpcClient;
-use alloy_rpc_types_eth::{BlockId, Log};
+use alloy_rpc_types_eth::{BlockId, Filter, Log};
 use alloy_sol_types::{SolEvent, SolEventInterface, SolValue};
 use alloy_transport::Authorization;
 use futures::{Stream, StreamExt, TryStreamExt as _};
@@ -229,6 +229,7 @@ impl L1Subscriber {
                         Item = eyre::Result<(
                             <TempoNetwork as alloy_network::Network>::HeaderResponse,
                             Vec<<TempoNetwork as alloy_network::Network>::ReceiptResponse>,
+                            Vec<Log>,
                         )>,
                     > + Send
                     + 'a,
@@ -238,33 +239,47 @@ impl L1Subscriber {
         let header_stream = self.header_stream(provider).await?;
         let concurrency = self.config.l1_fetch_concurrency.max(1);
         let subscriber_metrics = self.subscriber_metrics.clone();
+        let portal_address = self.config.portal_address;
+        let l1_rpc_url = self.config.l1_rpc_url.clone();
         let stream = header_stream
             .map_ok(move |header| {
                 let provider = provider;
                 let subscriber_metrics = subscriber_metrics.clone();
+                let l1_rpc_url = l1_rpc_url.clone();
                 async move {
                     let block_number = header.number();
                     let start = std::time::Instant::now();
                     let fetch_failures = &subscriber_metrics.fetch_failures;
-                    let receipts = provider
-                        .get_block_receipts(BlockId::number(block_number))
-                        .await
-                        .map_err(eyre::Report::from)
-                        .and_then(|receipts| {
-                            receipts
+                    let (receipts, portal_logs) = tokio::try_join!(
+                        async {
+                            provider
+                                .get_block_receipts(BlockId::number(block_number))
+                                .await
+                                .map_err(eyre::Report::from)?
                                 .ok_or_else(|| eyre::eyre!("no receipts for block {block_number}"))
-                        })
-                        .inspect_err(|_| {
-                            fetch_failures.increment(1);
-                        })?;
+                        },
+                        async {
+                            Self::get_portal_logs(
+                                provider,
+                                &l1_rpc_url,
+                                portal_address,
+                                block_number,
+                            )
+                            .await
+                        },
+                    )
+                    .inspect_err(|_| {
+                        fetch_failures.increment(1);
+                    })?;
                     let elapsed = start.elapsed();
                     debug!(
                         block_number,
                         elapsed_ms = elapsed.as_millis() as u64,
                         receipts = receipts.len(),
-                        "Fetched live block receipts"
+                        portal_logs = portal_logs.len(),
+                        "Fetched live block receipts and portal logs"
                     );
-                    Ok::<_, eyre::Report>((header, receipts))
+                    Ok::<_, eyre::Report>((header, receipts, portal_logs))
                 }
             })
             .try_buffered(concurrency);
@@ -374,19 +389,22 @@ impl L1Subscriber {
     ) -> eyre::Result<()> {
         use futures::stream;
 
-        // Backfill sends 2 requests per block (receipts + header), so halve
+        // Backfill sends multiple requests per block (receipts + header + logs), so halve
         // the concurrency to stay within the configured fetch budget.
         let concurrency = (self.config.l1_fetch_concurrency / 2).max(1);
         let subscriber_metrics = self.subscriber_metrics.clone();
+        let portal_address = self.config.portal_address;
+        let l1_rpc_url = self.config.l1_rpc_url.clone();
 
         let mut fetched = stream::iter(from..=to)
             .map(move |block_number| {
                 let provider = l1_provider;
                 let subscriber_metrics = subscriber_metrics.clone();
+                let l1_rpc_url = l1_rpc_url.clone();
                 async move {
                     let start = std::time::Instant::now();
                     let fetch_failures = &subscriber_metrics.fetch_failures;
-                    let (receipts, header_resp) = tokio::try_join!(
+                    let (receipts, header_resp, portal_logs) = tokio::try_join!(
                         async {
                             provider
                                 .get_block_receipts(BlockId::number(block_number))
@@ -402,6 +420,15 @@ impl L1Subscriber {
                                     eyre::eyre!("L1 header not found for block {block_number}")
                                 })
                         },
+                        async {
+                            Self::get_portal_logs(
+                                provider,
+                                &l1_rpc_url,
+                                portal_address,
+                                block_number,
+                            )
+                            .await
+                        },
                     )
                     .inspect_err(|_| {
                         fetch_failures.increment(1);
@@ -411,10 +438,11 @@ impl L1Subscriber {
                         block_number,
                         elapsed_ms = elapsed.as_millis() as u64,
                         receipts = receipts.len(),
+                        portal_logs = portal_logs.len(),
                         "Fetched L1 block data"
                     );
                     let header = header_resp.inner.inner;
-                    Ok::<_, eyre::Report>((header, receipts))
+                    Ok::<_, eyre::Report>((header, receipts, portal_logs))
                 }
             })
             .buffered(concurrency);
@@ -422,9 +450,13 @@ impl L1Subscriber {
         let mut enqueued = 0u64;
         let backfill_start = std::time::Instant::now();
 
-        while let Some((header, receipts)) = fetched.try_next().await? {
+        while let Some((header, receipts, portal_logs)) = fetched.try_next().await? {
             let block_number = header.number();
-            let (events, policy_events) = self.extract_events(block_number, &receipts);
+            let (mut events, policy_events) = self.extract_events(block_number, &receipts);
+            let events_from_logs = self.extract_portal_events_from_logs(block_number, &portal_logs);
+            if !events_from_logs.is_empty() {
+                events = events_from_logs;
+            }
             self.record_seen_block(block_number, to.saturating_sub(block_number));
 
             let sealed = SealedHeader::seal_slow(header);
@@ -504,12 +536,16 @@ impl L1Subscriber {
             self.subscriber_metrics
                 .stream_try_next_duration_seconds
                 .record(stream_wait_start.elapsed().as_secs_f64());
-            let Some((header, receipts)) = next else {
+            let Some((header, receipts, portal_logs)) = next else {
                 break;
             };
             let block_number = header.number();
             let sealed = SealedHeader::seal_slow(header.inner.into_consensus());
-            let (events, policy_events) = self.extract_events(block_number, &receipts);
+            let (mut events, policy_events) = self.extract_events(block_number, &receipts);
+            let events_from_logs = self.extract_portal_events_from_logs(block_number, &portal_logs);
+            if !events_from_logs.is_empty() {
+                events = events_from_logs;
+            }
             self.record_seen_block(block_number, 0);
 
             // If we have a buffered tip, check if the new block confirms it.
@@ -611,6 +647,72 @@ impl L1Subscriber {
 
         self.record_portal_event_metrics(&portal_events);
         (portal_events, policy_events)
+    }
+
+    fn extract_portal_events_from_logs(&self, block_number: u64, logs: &[Log]) -> L1PortalEvents {
+        let mut portal_events = L1PortalEvents::default();
+        if !logs.is_empty() {
+            info!(
+                block_number,
+                portal_logs = logs.len(),
+                "Fetched portal logs via eth_getLogs"
+            );
+        }
+        for log in logs {
+            if let Err(e) = portal_events.push_log(log, block_number) {
+                warn!(block_number, %e, "Failed to decode portal event from eth_getLogs");
+            }
+        }
+        self.record_portal_event_metrics(&portal_events);
+        portal_events
+    }
+
+    async fn get_portal_logs(
+        provider: &impl Provider<TempoNetwork>,
+        l1_rpc_url: &str,
+        portal_address: Address,
+        block_number: u64,
+    ) -> eyre::Result<Vec<Log>> {
+        let filter = Filter::new()
+            .address(portal_address)
+            .from_block(block_number)
+            .to_block(block_number)
+            .event_signature(L1PortalEvents::SIGNATURE_HASHES.to_vec());
+
+        if !l1_rpc_url.starts_with("http://") && !l1_rpc_url.starts_with("https://") {
+            return provider.get_logs(&filter).await.map_err(eyre::Report::from);
+        }
+
+        let block = format!("0x{block_number:x}");
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "eth_getLogs",
+            "params": [{
+                "fromBlock": block,
+                "toBlock": block,
+                "address": portal_address.to_string(),
+            }],
+        });
+
+        let response = reqwest::Client::new()
+            .post(l1_rpc_url)
+            .json(&request)
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<serde_json::Value>()
+            .await?;
+
+        if let Some(error) = response.get("error") {
+            return Err(eyre::eyre!("eth_getLogs failed: {error}"));
+        }
+
+        let result = response
+            .get("result")
+            .cloned()
+            .ok_or_else(|| eyre::eyre!("eth_getLogs response missing result"))?;
+        serde_json::from_value(result).map_err(eyre::Report::from)
     }
 
     fn record_seen_block(&self, block_number: u64, lag_blocks: u64) {
@@ -999,12 +1101,21 @@ impl L1PortalEvents {
         }
     }
 
+    fn is_empty(&self) -> bool {
+        self.deposits.is_empty()
+            && self.enabled_tokens.is_empty()
+            && self.sequencer_events.is_empty()
+    }
+
     /// Decode a portal log and add the event to this container.
     ///
     /// Logs whose topic0 does not match a known portal event are skipped.
     /// Known events that fail to decode return an error.
     pub fn push_log(&mut self, log: &Log, block_number: u64) -> eyre::Result<()> {
         if !Self::is_known_event(log) {
+            if Self::is_observed_deposit_made(log) {
+                return self.push_observed_deposit_made(log, block_number);
+            }
             debug!(
                 l1_block = block_number,
                 topic0 = ?log.topic0(),
@@ -1100,6 +1211,41 @@ impl L1PortalEvents {
         log.topic0()
             .is_some_and(|t| Self::SIGNATURE_HASHES.contains(t))
     }
+
+    fn is_observed_deposit_made(log: &Log) -> bool {
+        log.topic0().is_some_and(|t| {
+            *t == keccak256(b"DepositMade(bytes32,address,address,address,uint128,uint128,bytes32)")
+        })
+    }
+
+    fn push_observed_deposit_made(&mut self, log: &Log, block_number: u64) -> eyre::Result<()> {
+        let topics = log.topics();
+        eyre::ensure!(topics.len() >= 3, "DepositMade log missing indexed topics");
+        let sender = topic_to_address(&topics[2]);
+        let (token, to, amount, fee, memo) =
+            <(Address, Address, u128, u128, B256)>::abi_decode(log.data().data.as_ref())?;
+        info!(
+            l1_block = block_number,
+            token = %token,
+            sender = %sender,
+            to = %to,
+            amount = %amount,
+            "💰 Deposit from L1"
+        );
+        self.deposits.push(L1Deposit::Regular(Deposit {
+            token,
+            sender,
+            to,
+            amount,
+            fee,
+            memo,
+        }));
+        Ok(())
+    }
+}
+
+fn topic_to_address(topic: &B256) -> Address {
+    Address::from_slice(&topic.as_slice()[12..])
 }
 
 /// An L1 block's header paired with the deposits found in that block.
