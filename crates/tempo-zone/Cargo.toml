@@ -84,6 +84,7 @@ either.workspace = true
 eyre.workspace = true
 reqwest.workspace = true
 serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
 futures.workspace = true
 parking_lot.workspace = true
 thiserror.workspace = true
@@ -115,7 +116,6 @@ reth-node-core.workspace = true
 reth-rpc-builder.workspace = true
 reth-tracing.workspace = true
 serde = { workspace = true, features = ["derive"] }
-serde_json.workspace = true
 alloy-signer.workspace = true
 thiserror.workspace = true
 tempo-chainspec.workspace = true

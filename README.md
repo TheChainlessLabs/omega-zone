@@ -15,7 +15,7 @@
 
 Zones are private blockchains anchored to [Tempo](https://github.com/tempoxyz/tempo) *(currently available in testnet only),* with native support for confidential balances and transactions. Zones inherit compliance via TIP403 policies from Tempo and support interoperability with Tempo for moving assets in and out of Zones.
 
-You can get started today by [deploying a Zone](#getting-started) on Tempo testnet, reading the [Zones documentation](https://docs.tempo.xyz/guide/private-zones), or exploring the [Zone spec](specs/ref-impls/zone_spec.md).
+You can get started today by [deploying a Zone](#getting-started) on Tempo testnet, reading the [Zones documentation](https://docs.tempo.xyz/guide/private-zones), or exploring the [Zone spec](specs/spec.md).
 
 <br>
 
@@ -100,6 +100,25 @@ just check-balance-private my-zone <token-address>
 
 
 See [docs/ZONES.md](docs/ZONES.md) for the full guide on deposits, withdrawals, private RPC, router demos, TIP-403 policy flows, and command references.
+
+## Omega Private-Alpha Notes
+
+The Omega alpha path uses this repo as the backend target for a Tempo Zone with:
+
+- authenticated private RPC on `:8544`
+- public zone RPC on `:8546`
+- OALPHA / PATH.USD as the pinned alpha market
+- `DarkpoolOrderbook` at `0x0B00000000000000000000000000000000000001`
+- owner-scoped order, fill, transfer, deposit, and withdrawal reads
+- batch explorer methods that expose aggregate-only settlement metadata
+- configurable TEE proof-provider plumbing for `ZonePortal.submitBatch`
+
+Relevant docs:
+
+- [docs/ALPHA.md](docs/ALPHA.md) — private-alpha OALPHA / PATH.USD setup
+- [docs/TEE_PROOF.md](docs/TEE_PROOF.md) — proof provider and live-verifier blockers
+- [docs/RUNBOOK_FIRST_BATCH.md](docs/RUNBOOK_FIRST_BATCH.md) — settlement preflight and first-batch runbook
+- [docs/darkpool-alpha-decision.md](docs/darkpool-alpha-decision.md) — accepted alpha darkpool implementation decision
 
 <br> 
 

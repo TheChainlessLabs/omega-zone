@@ -63,7 +63,7 @@ term:
 1. **Merge the storage init fix.** PR #1 lazily initializes the darkpool
    precompile account on first non-static call so its storage persists.
    Without this, mutating calls succeed but state is dropped — every
-   frontend session sees an empty book. Blocking.
+   frontend session sees an empty book. **Done.**
 2. **Owner-scoped history APIs.** Delivered by this branch:
    - `zone_getMyOrders(query?)`
    - `zone_getMyFills(query?)`
@@ -185,7 +185,19 @@ productize it as a public market-data feature with updated privacy language.
 - [x] Multi-maker / partial-fill / cancel-after-fill test coverage added.
 - [x] ABI, selector, unit, collateral, and top-of-book alpha stance documented.
 
-## How this branch contributes
+## What landed after this decision
+
+As of `main` on 2026-05-30, the alpha backend also includes:
+
+- storage persistence fix for the darkpool precompile (PR #1)
+- owner-scoped darkpool history and aggregate batch explorer APIs
+- withdrawal and deposit status methods
+- market config, top-of-book, midpoint history, and reference-price RPC surfaces
+- configurable TEE proof provider plumbing and first-batch settlement diagnostics
+- multi-maker / partial-fill / cancel-after-fill test coverage
+- ABI, selector, unit, collateral, and top-of-book alpha stance documentation
+
+## Historical branch contribution
 
 This branch implements the API surface described under "Owner-scoped
 history APIs". Files added / changed:
