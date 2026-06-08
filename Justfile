@@ -267,6 +267,7 @@ zone-up name reset="false" profile="dev" args="":
                       --http.api all \
                       --datadir "$DATADIR" \
                       --log.file.directory "$DATADIR/logs" \
+                      --sequencer \
                       --sequencer-key "$SEQ_KEY" \
                       {{args}}
 
@@ -598,7 +599,7 @@ token-policy token rpc="":
 [group('zone')]
 [doc('Checks TIP-20 token balance for an account on the zone (port 8546)')]
 check-balance account token="0x20C0000000000000000000000000000000000000" rpc=zone_rpc:
-    @printf "Balance of {{account}}: " && cast call "{{token}}" "balanceOf(address)(uint256)" "{{account}}" --rpc-url "{{rpc}}"
+    @printf "Balance of {{account}}: " && cast call "{{token}}" "balanceOf(address)(uint256)" "{{account}}" --from "{{account}}" --rpc-url "{{rpc}}"
 
 [group('zone')]
 [doc('Generates a signed auth token for the private zone RPC. Requires PRIVATE_KEY env var. Reads zone metadata from generated/<name>/zone.json.')]
