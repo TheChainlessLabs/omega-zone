@@ -25,6 +25,9 @@ target/debug/tempo-xtask set-encryption-key --l1-rpc-url "$HTTP_RPC" --portal "$
 RUST_LOG=warn just zone-up my-zone false release
 ```
 
+The `zone-up` recipe starts `tempo-zone` with both `--sequencer` and
+`--sequencer-key`; block production will not advance with the key alone.
+
 Health check:
 
 ```bash
