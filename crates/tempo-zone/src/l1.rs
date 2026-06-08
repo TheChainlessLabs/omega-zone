@@ -36,6 +36,21 @@ use crate::{
     l1_state::{cache::L1StateCacheInner, tip403::PolicyEvent},
 };
 
+mod legacy_portal_abi {
+    alloy_sol_types::sol! {
+        #[derive(Debug)]
+        event DepositMade(
+            bytes32 indexed newCurrentDepositQueueHash,
+            address indexed sender,
+            address token,
+            address to,
+            uint128 netAmount,
+            uint128 fee,
+            bytes32 memo
+        );
+    }
+}
+
 /// Poll interval for the HTTP block filter fallback (500ms, matching L1 block time).
 const HTTP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
@@ -908,6 +923,19 @@ impl Deposit {
         }
     }
 
+    /// Create a new deposit from a legacy portal event that predates
+    /// `depositNumber`.
+    fn from_legacy_event(event: legacy_portal_abi::DepositMade) -> Self {
+        Self {
+            token: event.token,
+            sender: event.sender,
+            to: event.to,
+            amount: event.netAmount,
+            fee: event.fee,
+            memo: event.memo,
+        }
+    }
+
     /// Create a bounce-back deposit from an event.
     pub fn from_bounce_back(event: BounceBack, portal_address: Address) -> Self {
         Self {
@@ -1084,8 +1112,9 @@ impl EnabledToken {
 
 impl L1PortalEvents {
     /// Event signature hashes that this container knows how to decode.
-    const SIGNATURE_HASHES: [B256; 6] = [
+    const SIGNATURE_HASHES: [B256; 7] = [
         DepositMade::SIGNATURE_HASH,
+        legacy_portal_abi::DepositMade::SIGNATURE_HASH,
         EncryptedDepositMade::SIGNATURE_HASH,
         BounceBack::SIGNATURE_HASH,
         TokenEnabled::SIGNATURE_HASH,
@@ -1113,14 +1142,25 @@ impl L1PortalEvents {
     /// Known events that fail to decode return an error.
     pub fn push_log(&mut self, log: &Log, block_number: u64) -> eyre::Result<()> {
         if !Self::is_known_event(log) {
-            if Self::is_observed_deposit_made(log) {
-                return self.push_observed_deposit_made(log, block_number);
-            }
             debug!(
                 l1_block = block_number,
                 topic0 = ?log.topic0(),
                 "Skipping unknown portal event"
             );
+            return Ok(());
+        }
+        if log.topic0() == Some(&legacy_portal_abi::DepositMade::SIGNATURE_HASH) {
+            let event = legacy_portal_abi::DepositMade::decode_log(&log.inner)?.data;
+            info!(
+                l1_block = block_number,
+                token = %event.token,
+                sender = %event.sender,
+                to = %event.to,
+                amount = %event.netAmount,
+                "💰 Legacy deposit from L1"
+            );
+            self.deposits
+                .push(L1Deposit::Regular(Deposit::from_legacy_event(event)));
             return Ok(());
         }
         match ZonePortalEvents::decode_log(&log.inner)?.data {
@@ -1211,41 +1251,6 @@ impl L1PortalEvents {
         log.topic0()
             .is_some_and(|t| Self::SIGNATURE_HASHES.contains(t))
     }
-
-    fn is_observed_deposit_made(log: &Log) -> bool {
-        log.topic0().is_some_and(|t| {
-            *t == keccak256(b"DepositMade(bytes32,address,address,address,uint128,uint128,bytes32)")
-        })
-    }
-
-    fn push_observed_deposit_made(&mut self, log: &Log, block_number: u64) -> eyre::Result<()> {
-        let topics = log.topics();
-        eyre::ensure!(topics.len() >= 3, "DepositMade log missing indexed topics");
-        let sender = topic_to_address(&topics[2]);
-        let (token, to, amount, fee, memo) =
-            <(Address, Address, u128, u128, B256)>::abi_decode(log.data().data.as_ref())?;
-        info!(
-            l1_block = block_number,
-            token = %token,
-            sender = %sender,
-            to = %to,
-            amount = %amount,
-            "💰 Deposit from L1"
-        );
-        self.deposits.push(L1Deposit::Regular(Deposit {
-            token,
-            sender,
-            to,
-            amount,
-            fee,
-            memo,
-        }));
-        Ok(())
-    }
-}
-
-fn topic_to_address(topic: &B256) -> Address {
-    Address::from_slice(&topic.as_slice()[12..])
 }
 
 /// An L1 block's header paired with the deposits found in that block.
@@ -2172,6 +2177,43 @@ mod tests {
             B256::ZERO,
             "bounce-back deposits should clear memo"
         );
+    }
+
+    #[test]
+    fn test_push_log_decodes_legacy_deposit_made() {
+        let portal_address = address!("0x0000000000000000000000000000000000000ABC");
+        let sender = address!("0x00000000000000000000000000000000000000A1");
+        let recipient = address!("0x00000000000000000000000000000000000000B2");
+        let token = address!("0x0000000000000000000000000000000000002000");
+        let event = legacy_portal_abi::DepositMade {
+            newCurrentDepositQueueHash: B256::with_last_byte(0x42),
+            sender,
+            token,
+            to: recipient,
+            netAmount: 123_456,
+            fee: 789,
+            memo: B256::with_last_byte(0x99),
+        };
+        let amount = event.netAmount;
+        let fee = event.fee;
+        let memo = event.memo;
+        let log = make_portal_log(portal_address, event);
+
+        let mut events = L1PortalEvents::default();
+        events
+            .push_log(&log, 123)
+            .expect("legacy DepositMade should decode");
+
+        assert_eq!(events.deposits.len(), 1, "should enqueue one deposit");
+        let L1Deposit::Regular(deposit) = &events.deposits[0] else {
+            panic!("legacy DepositMade should be mapped to a regular deposit");
+        };
+        assert_eq!(deposit.token, token);
+        assert_eq!(deposit.sender, sender);
+        assert_eq!(deposit.to, recipient);
+        assert_eq!(deposit.amount, amount);
+        assert_eq!(deposit.fee, fee);
+        assert_eq!(deposit.memo, memo);
     }
 
     #[test]
