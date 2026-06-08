@@ -48,6 +48,34 @@ use futures::{StreamExt, TryStreamExt};
 use tempo_alloy::TempoNetwork;
 use tracing::{info, instrument, warn};
 
+mod legacy_portal_abi {
+    alloy_sol_types::sol! {
+        #[derive(Debug)]
+        struct BlockTransition {
+            bytes32 prevBlockHash;
+            bytes32 nextBlockHash;
+        }
+
+        #[derive(Debug)]
+        struct DepositQueueTransition {
+            bytes32 prevProcessedHash;
+            bytes32 nextProcessedHash;
+        }
+
+        contract ZonePortal {
+            function submitBatch(
+                uint64 tempoBlockNumber,
+                uint64 recentTempoBlockNumber,
+                BlockTransition calldata blockTransition,
+                DepositQueueTransition calldata depositQueueTransition,
+                bytes32 withdrawalQueueHash,
+                bytes calldata verifierConfig,
+                bytes calldata proof
+            ) external;
+        }
+    }
+}
+
 /// EIP-2935 stores the last 8192 block hashes (~68 min at 500ms block time).
 const EIP2935_HISTORY_WINDOW: u64 = 8192;
 
@@ -224,6 +252,12 @@ impl BatchSubmitter {
         let anchor_mode = self.resolve_anchor_mode(batch.tempo_block_number).await?;
         let recent_tempo_block_number = anchor_mode.recent_block_number();
 
+        if !self.portal_supports_deposit_numbers().await? {
+            return self
+                .submit_legacy_batch(batch, recent_tempo_block_number, &anchor_mode)
+                .await;
+        }
+
         // Preflight: gather portal state and warn on mismatches before signing.
         let preflight = self
             .preflight_report(batch, recent_tempo_block_number)
@@ -287,8 +321,106 @@ impl BatchSubmitter {
         }
         .abi_encode();
 
+        self.send_submit_batch_transaction(call_data, public_inputs.sequencer_address)
+            .await
+    }
+
+    async fn submit_legacy_batch(
+        &self,
+        batch: &BatchData,
+        recent_tempo_block_number: u64,
+        anchor_mode: &AnchorMode,
+    ) -> Result<B256> {
+        let portal_block_hash_fut = self.read_portal_block_hash();
+        let sequencer_fut = self.read_portal_sequencer();
+        let withdrawal_batch_index_fut = self.read_portal_withdrawal_batch_index();
+        let (portal_block_hash, sequencer, withdrawal_batch_index) = tokio::try_join!(
+            portal_block_hash_fut,
+            sequencer_fut,
+            withdrawal_batch_index_fut,
+        )?;
+
+        if portal_block_hash != batch.prev_block_hash {
+            warn!(
+                portal_block_hash = %portal_block_hash,
+                batch_prev_block_hash = %batch.prev_block_hash,
+                "Legacy portal block hash does not match batch prev hash before submitBatch"
+            );
+        }
+
+        let public_inputs = BatchPublicInputs {
+            portal_address: self.portal_address,
+            sequencer_address: sequencer,
+            tempo_block_number: batch.tempo_block_number,
+            recent_tempo_block_number,
+            prev_block_hash: batch.prev_block_hash,
+            next_block_hash: batch.next_block_hash,
+            prev_processed_deposit_hash: batch.prev_processed_deposit_hash,
+            next_processed_deposit_hash: batch.next_processed_deposit_hash,
+            prev_deposit_number: batch.prev_deposit_number,
+            next_deposit_number: batch.next_deposit_number,
+            withdrawal_queue_hash: batch.withdrawal_queue_hash,
+            expected_withdrawal_batch_index: withdrawal_batch_index.saturating_add(1),
+        };
+
+        info!(
+            commitment = %public_inputs.commitment(),
+            expected_withdrawal_batch_index = public_inputs.expected_withdrawal_batch_index,
+            sequencer = %public_inputs.sequencer_address,
+            "Computed legacy batch public-input commitment"
+        );
+
+        let TeeProofPayload {
+            verifier_config,
+            proof,
+        } = self
+            .proof_provider
+            .build_proof(&public_inputs)
+            .await
+            .map_err(|err| {
+                eyre::eyre!(
+                    "proof provider `{}` refused to produce a proof for legacy batch \
+                     tempo_block_number={}: {err}",
+                    self.proof_provider.name(),
+                    batch.tempo_block_number
+                )
+            })?;
+
+        info!(
+            verifier_config_len = verifier_config.len(),
+            proof_len = proof.len(),
+            ?anchor_mode,
+            "Submitting legacy batch to ZonePortal on L1"
+        );
+
+        let call_data = legacy_portal_abi::ZonePortal::submitBatchCall {
+            tempoBlockNumber: batch.tempo_block_number,
+            recentTempoBlockNumber: recent_tempo_block_number,
+            blockTransition: legacy_portal_abi::BlockTransition {
+                prevBlockHash: batch.prev_block_hash,
+                nextBlockHash: batch.next_block_hash,
+            },
+            depositQueueTransition: legacy_portal_abi::DepositQueueTransition {
+                prevProcessedHash: batch.prev_processed_deposit_hash,
+                nextProcessedHash: batch.next_processed_deposit_hash,
+            },
+            withdrawalQueueHash: batch.withdrawal_queue_hash,
+            verifierConfig: verifier_config,
+            proof,
+        }
+        .abi_encode();
+
+        self.send_submit_batch_transaction(call_data, public_inputs.sequencer_address)
+            .await
+    }
+
+    async fn send_submit_batch_transaction(
+        &self,
+        call_data: Vec<u8>,
+        sequencer_address: Address,
+    ) -> Result<B256> {
         let tx = TransactionRequest::default()
-            .from(public_inputs.sequencer_address)
+            .from(sequencer_address)
             .to(self.portal_address)
             .input(TransactionInput::new(Bytes::from(call_data)))
             .gas_limit(5_000_000);
@@ -331,6 +463,20 @@ impl BatchSubmitter {
         info!(%tx_hash, "Batch submitted to L1");
 
         Ok(tx_hash)
+    }
+
+    async fn portal_supports_deposit_numbers(&self) -> Result<bool> {
+        match self.read_portal_last_processed_deposit_number().await {
+            Ok(_) => Ok(true),
+            Err(err) if is_missing_deposit_number_view(&err) => {
+                warn!(
+                    error = %err,
+                    "Portal does not expose deposit-number settlement ABI; using legacy submitBatch"
+                );
+                Ok(false)
+            }
+            Err(err) => Err(err),
+        }
     }
 
     /// Classify whether `tempo_block_number` can be submitted directly or
@@ -1102,6 +1248,11 @@ pub(crate) fn log_query_ranges(from: u64, to: u64) -> impl Iterator<Item = (u64,
     })
 }
 
+fn is_missing_deposit_number_view(err: &eyre::Report) -> bool {
+    let message = err.to_string();
+    message.contains("execution reverted")
+}
+
 /// Classification of the EIP-2935 gap, returned by
 /// [`BatchSubmitter::classify_anchor_gap`].
 #[derive(Debug)]
@@ -1367,6 +1518,18 @@ mod tests {
             )
         );
         assert_eq!(ranges[2], (100 + (LOG_QUERY_BLOCK_CHUNK * 2), end));
+    }
+
+    #[test]
+    fn legacy_submit_batch_selector_matches_deployed_portal_shape() {
+        assert_eq!(
+            legacy_portal_abi::ZonePortal::submitBatchCall::SELECTOR,
+            [0x11, 0x47, 0x31, 0x19]
+        );
+        assert_eq!(
+            abi::ZonePortal::submitBatchCall::SELECTOR,
+            [0x0d, 0x0c, 0x74, 0x3e]
+        );
     }
 
     fn test_batch_event(withdrawal_queue_hash: B256) -> abi::ZonePortal::BatchSubmitted {

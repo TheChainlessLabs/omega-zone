@@ -413,14 +413,14 @@ pub fn build_darkpool_filter(
     cursor: Option<Cursor>,
 ) -> Filter {
     use alloy_rpc_types_eth::BlockNumberOrTag;
-    let mut filter = Filter::default();
+    let start_block = cursor
+        .map(|cursor| BlockNumberOrTag::Number(cursor.block_number))
+        .unwrap_or(BlockNumberOrTag::Earliest);
+    let mut filter = Filter::default().from_block(start_block);
     filter.address = FilterSet::from(DARKPOOL_ADDRESS);
     filter.topics[0] = FilterSet::from(topic0.to_vec());
     if let Some(topic) = maker_topic {
         filter.topics[2] = FilterSet::from(topic);
-    }
-    if let Some(cursor) = cursor {
-        filter = filter.from_block(BlockNumberOrTag::Number(cursor.block_number));
     }
     filter
 }
@@ -428,11 +428,13 @@ pub fn build_darkpool_filter(
 /// Build a darkpool filter for `OrderFilled` scoped to a single order id and
 /// owner. Used by `zone_getOrder`.
 pub fn build_order_filter(order_id: u128, owner: &Address) -> Filter {
+    use alloy_rpc_types_eth::BlockNumberOrTag;
     let mut filter = Filter::default();
     filter.address = FilterSet::from(DARKPOOL_ADDRESS);
     filter.topics[0] = FilterSet::from(DARKPOOL_TOPICS.to_vec());
     filter.topics[1] = FilterSet::from(order_id_topic(order_id));
     filter.topics[2] = FilterSet::from(topic_for_address(owner));
+    filter = filter.from_block(BlockNumberOrTag::Earliest);
     filter
 }
 
@@ -447,7 +449,10 @@ pub fn build_tip20_filter(
     as_from: bool,
 ) -> Filter {
     use alloy_rpc_types_eth::BlockNumberOrTag;
-    let mut filter = Filter::default();
+    let start_block = cursor
+        .map(|cursor| BlockNumberOrTag::Number(cursor.block_number))
+        .unwrap_or(BlockNumberOrTag::Earliest);
+    let mut filter = Filter::default().from_block(start_block);
     filter.topics[0] = FilterSet::from(topic0.to_vec());
     if let Some(topic) = owner_topic {
         if as_from {
@@ -455,9 +460,6 @@ pub fn build_tip20_filter(
         } else {
             filter.topics[2] = FilterSet::from(topic);
         }
-    }
-    if let Some(cursor) = cursor {
-        filter = filter.from_block(BlockNumberOrTag::Number(cursor.block_number));
     }
     filter
 }
@@ -1017,6 +1019,54 @@ mod tests {
         assert!(Cursor::decode("not-a-cursor").is_err());
         assert!(Cursor::decode("abc:def").is_err());
         assert!(Cursor::decode("12345").is_err());
+    }
+
+    #[test]
+    fn history_filters_start_at_earliest_without_cursor() {
+        use alloy_rpc_types_eth::BlockNumberOrTag;
+
+        let owner = address!("0x000000000000000000000000000000000000beef");
+        let owner_topic = topic_for_address(&owner);
+
+        let darkpool =
+            build_darkpool_filter(&[OrderSubmitted::SIGNATURE_HASH], Some(owner_topic), None);
+        assert_eq!(
+            darkpool.block_option.get_from_block(),
+            Some(&BlockNumberOrTag::Earliest)
+        );
+
+        let order = build_order_filter(1, &owner);
+        assert_eq!(
+            order.block_option.get_from_block(),
+            Some(&BlockNumberOrTag::Earliest)
+        );
+
+        let tip20 = build_tip20_filter(&[filter::TRANSFER_TOPIC], Some(owner_topic), None, true);
+        assert_eq!(
+            tip20.block_option.get_from_block(),
+            Some(&BlockNumberOrTag::Earliest)
+        );
+    }
+
+    #[test]
+    fn cursor_filters_start_at_cursor_block() {
+        use alloy_rpc_types_eth::BlockNumberOrTag;
+
+        let cursor = Some(Cursor {
+            block_number: 12345,
+            log_index: 7,
+        });
+        let darkpool = build_darkpool_filter(&[OrderSubmitted::SIGNATURE_HASH], None, cursor);
+        assert_eq!(
+            darkpool.block_option.get_from_block(),
+            Some(&BlockNumberOrTag::Number(12345))
+        );
+
+        let tip20 = build_tip20_filter(&[filter::TRANSFER_TOPIC], None, cursor, false);
+        assert_eq!(
+            tip20.block_option.get_from_block(),
+            Some(&BlockNumberOrTag::Number(12345))
+        );
     }
 
     #[test]

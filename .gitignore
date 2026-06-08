@@ -17,6 +17,8 @@ localnet/**
 generated/
 tasks/
 frontend/
+e2e/.account.json
+e2e/*.env
 
 .claude/
 !docs/.claude/
