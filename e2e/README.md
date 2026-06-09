@@ -3,12 +3,14 @@
 Runs a live account flow against a running zone:
 
 1. create or reuse an account
-2. request faucet funds on L1
+2. create or reuse a maker account for resting market-order liquidity
+3. request faucet funds on L1
 3. approve and deposit `pathUSD` and `alphaUSD`
-4. place one sell order and one buy order on the zone darkpool
-5. withdraw half of the deposited token amounts
-6. wait for L1 withdrawal settlement and `WithdrawalProcessed` events
-7. print public status plus private-RPC account data
+4. place maker liquidity and fill it with one market buy and one market sell
+5. place one sell order and one buy order on the zone darkpool
+6. withdraw half of the deposited token amounts
+7. wait for L1 withdrawal settlement and `WithdrawalProcessed` events
+8. print public status plus private-RPC account data
 
 ## Prerequisites
 
@@ -42,6 +44,10 @@ If `PRIVATE_KEY` is not set, the script creates a new wallet and stores it in
 PRIVATE_KEY=0x... ./e2e/account-flow.sh
 ```
 
+If `MAKER_PRIVATE_KEY` is not set, the script creates a second wallet and
+stores it in `e2e/.maker-account.json`. The maker account deposits enough
+liquidity to seed one ask for `marketBuy` and one bid for `marketSell`.
+
 If you are not using `ZONE_NAME`, provide all metadata needed for private RPC
 authorization:
 
@@ -60,6 +66,13 @@ ALPHAUSD_AMOUNT=10000000 \
 ORDER_AMOUNT=1000000 \
 SELL_PRICE=2 \
 BUY_PRICE=1 \
+MARKET_ORDER_AMOUNT=1000000 \
+MARKET_ASK_PRICE=2 \
+MARKET_BID_PRICE=3 \
+MARKET_BUY_MAX_QUOTE_IN=2000000 \
+MARKET_SELL_MIN_QUOTE_OUT=3000000 \
+MAKER_PATHUSD_AMOUNT=5000000 \
+MAKER_ALPHAUSD_AMOUNT=1000000 \
 ./e2e/account-flow.sh
 ```
 

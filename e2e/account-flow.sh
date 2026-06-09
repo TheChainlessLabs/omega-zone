@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ACCOUNT_FILE="${ACCOUNT_FILE:-$ROOT_DIR/e2e/.account.json}"
+MAKER_ACCOUNT_FILE="${MAKER_ACCOUNT_FILE:-$ROOT_DIR/e2e/.maker-account.json}"
 
 PATHUSD="${PATHUSD:-0x20C0000000000000000000000000000000000000}"
 ALPHAUSD="${ALPHAUSD:-0x20C0000000000000000000000000000000000001}"
@@ -17,6 +18,14 @@ ALPHAUSD_AMOUNT="${ALPHAUSD_AMOUNT:-10000000}"
 ORDER_AMOUNT="${ORDER_AMOUNT:-1000000}"
 SELL_PRICE="${SELL_PRICE:-2}"
 BUY_PRICE="${BUY_PRICE:-1}"
+MARKET_ORDER_AMOUNT="${MARKET_ORDER_AMOUNT:-$ORDER_AMOUNT}"
+MARKET_ASK_PRICE="${MARKET_ASK_PRICE:-2}"
+MARKET_BID_PRICE="${MARKET_BID_PRICE:-3}"
+MARKET_BUY_MAX_QUOTE_IN="${MARKET_BUY_MAX_QUOTE_IN:-$((MARKET_ORDER_AMOUNT * MARKET_ASK_PRICE))}"
+MARKET_SELL_MIN_QUOTE_OUT="${MARKET_SELL_MIN_QUOTE_OUT:-$((MARKET_ORDER_AMOUNT * MARKET_BID_PRICE))}"
+MAKER_FEE_BUFFER="${MAKER_FEE_BUFFER:-2000000}"
+MAKER_PATHUSD_AMOUNT="${MAKER_PATHUSD_AMOUNT:-$((MARKET_ORDER_AMOUNT * MARKET_BID_PRICE + MAKER_FEE_BUFFER))}"
+MAKER_ALPHAUSD_AMOUNT="${MAKER_ALPHAUSD_AMOUNT:-$MARKET_ORDER_AMOUNT}"
 WITHDRAW_PATHUSD_AMOUNT="${WITHDRAW_PATHUSD_AMOUNT:-$((PATHUSD_AMOUNT / 2))}"
 WITHDRAW_ALPHAUSD_AMOUNT="${WITHDRAW_ALPHAUSD_AMOUNT:-$((ALPHAUSD_AMOUNT / 2))}"
 
@@ -126,22 +135,35 @@ word_bool() {
     fi
 }
 
-wallet_private_key() {
-    if [[ -n "${PRIVATE_KEY:-}" ]]; then
-        echo "$PRIVATE_KEY"
+wallet_private_key_for() {
+    local env_name="$1"
+    local file="$2"
+    local label="$3"
+    local env_value="${!env_name:-}"
+
+    if [[ -n "$env_value" ]]; then
+        echo "$env_value"
         return
     fi
 
-    if [[ -f "$ACCOUNT_FILE" ]]; then
-        jq -r '.private_key' "$ACCOUNT_FILE"
+    if [[ -f "$file" ]]; then
+        jq -r '.private_key' "$file"
         return
     fi
 
-    warn "Creating account"
-    mkdir -p "$(dirname "$ACCOUNT_FILE")"
+    warn "Creating $label account"
+    mkdir -p "$(dirname "$file")"
     umask 077
-    cast wallet new --json | jq '.[0]' > "$ACCOUNT_FILE"
-    jq -r '.private_key' "$ACCOUNT_FILE"
+    cast wallet new --json | jq '.[0]' > "$file"
+    jq -r '.private_key' "$file"
+}
+
+wallet_private_key() {
+    wallet_private_key_for PRIVATE_KEY "$ACCOUNT_FILE" "main"
+}
+
+maker_private_key() {
+    wallet_private_key_for MAKER_PRIVATE_KEY "$MAKER_ACCOUNT_FILE" "maker"
 }
 
 load_zone_metadata() {
@@ -693,21 +715,82 @@ print_specific_order_status() {
     echo "    zone_getOrder: status=$order_status remaining=$order_remaining filled=$order_filled"
 }
 
+validate_market_fill_status() {
+    local label="$1"
+    local tx_hash="$2"
+    local expected_maker="$3"
+    local expected_taker="$4"
+    local expected_amount="$5"
+    local expected_price="$6"
+    local receipt filled_topic submitted_topic matched_topic darkpool_lower
+    local total_filled=0 fill_count=0
+
+    filled_topic="$(cast keccak "OrderFilled(uint128,address,address,uint128,uint128)")"
+    submitted_topic="$(cast keccak "OrderSubmitted(uint128,address,address,address,uint128,uint128,bool)")"
+    matched_topic="$(cast keccak "OrderMatched(uint128,uint128,address,address,uint128,uint128)")"
+    darkpool_lower="$(echo "$DARKPOOL" | tr '[:upper:]' '[:lower:]')"
+    receipt="$(cast receipt "$tx_hash" --rpc-url "$ZONE_RPC_URL" --json)"
+
+    while IFS= read -r log_entry; do
+        local topic0 maker taker data amount price
+        topic0="$(echo "$log_entry" | jq -r '.topics[0]')"
+        case "$topic0" in
+            "$submitted_topic")
+                fail "$label market order unexpectedly emitted OrderSubmitted"
+                ;;
+            "$matched_topic")
+                fail "$label market order unexpectedly emitted OrderMatched"
+                ;;
+            "$filled_topic")
+                maker="$(word_address "$(echo "$log_entry" | jq -r '.topics[2]')")"
+                taker="$(word_address "$(echo "$log_entry" | jq -r '.topics[3]')")"
+                assert_address_equal "$label OrderFilled maker" "$maker" "$expected_maker"
+                assert_address_equal "$label OrderFilled taker" "$taker" "$expected_taker"
+                data="$(echo "$log_entry" | jq -r '.data')"
+                amount="$(normalize_uint "$(data_word "$data" 0)")"
+                price="$(normalize_uint "$(data_word "$data" 1)")"
+                assert_uint_equal "$label OrderFilled price" "$price" "$expected_price"
+                total_filled=$((total_filled + amount))
+                fill_count=$((fill_count + 1))
+                ;;
+        esac
+    done < <(echo "$receipt" | jq -c --arg addr "$darkpool_lower" '.logs[] | select((.address | ascii_downcase) == $addr)')
+
+    if (( fill_count == 0 )); then
+        fail "$label market order emitted no OrderFilled events"
+    fi
+    assert_uint_equal "$label total market fill amount" "$total_filled" "$expected_amount"
+
+    echo "  $label market fill:"
+    echo "    tx:       $tx_hash"
+    echo "    maker:    $expected_maker"
+    echo "    taker:    $expected_taker"
+    echo "    fills:    $fill_count"
+    echo "    amount:   $total_filled"
+    echo "    price:    $expected_price"
+}
+
 main() {
     require_cmd cast
     require_cmd jq
     require_cmd curl
     load_zone_metadata
 
-    local private_key account
+    local private_key account maker_key maker_account
     private_key="$(wallet_private_key)"
     account="$(cast wallet address "$private_key")"
+    maker_key="$(maker_private_key)"
+    maker_account="$(cast wallet address "$maker_key")"
     local auth
     auth="$(build_auth_token "$private_key")"
+    local maker_auth
+    maker_auth="$(build_auth_token "$maker_key")"
 
     log "Configuration"
     echo "  account:        $account"
     echo "  account file:   $ACCOUNT_FILE"
+    echo "  maker:          $maker_account"
+    echo "  maker file:     $MAKER_ACCOUNT_FILE"
     echo "  L1 RPC:         $HTTP_L1_RPC"
     echo "  zone RPC:       $ZONE_RPC_URL"
     echo "  private RPC:    $PRIVATE_ZONE_RPC_URL"
@@ -715,12 +798,14 @@ main() {
     echo "  pathUSD:        $PATHUSD amount=$PATHUSD_AMOUNT"
     echo "  alphaUSD:       $ALPHAUSD amount=$ALPHAUSD_AMOUNT"
     echo "  orders:         sell $ORDER_AMOUNT @ $SELL_PRICE, buy $ORDER_AMOUNT @ $BUY_PRICE"
+    echo "  market orders:  buy $MARKET_ORDER_AMOUNT maxQuote=$MARKET_BUY_MAX_QUOTE_IN, sell $MARKET_ORDER_AMOUNT minQuote=$MARKET_SELL_MIN_QUOTE_OUT"
+    echo "  maker deposits: pathUSD=$MAKER_PATHUSD_AMOUNT alphaUSD=$MAKER_ALPHAUSD_AMOUNT"
     echo "  L1 settlement:  $VERIFY_L1_WITHDRAWAL_SETTLEMENT"
     echo "  gas fallbacks:  approve=$APPROVE_GAS_FALLBACK deposit=$DEPOSIT_GAS_FALLBACK order=$ORDER_GAS_FALLBACK withdraw=$WITHDRAW_GAS_FALLBACK"
 
     local required_path_available required_alpha_available
-    required_path_available=$((ORDER_AMOUNT * BUY_PRICE + WITHDRAW_PATHUSD_AMOUNT))
-    required_alpha_available=$((ORDER_AMOUNT + WITHDRAW_ALPHAUSD_AMOUNT))
+    required_path_available=$((ORDER_AMOUNT * BUY_PRICE + MARKET_BUY_MAX_QUOTE_IN + WITHDRAW_PATHUSD_AMOUNT))
+    required_alpha_available=$((ORDER_AMOUNT + MARKET_ORDER_AMOUNT + WITHDRAW_ALPHAUSD_AMOUNT))
     if (( PATHUSD_AMOUNT < required_path_available )); then
         echo "ERROR: PATHUSD_AMOUNT must cover buy escrow plus withdrawal." >&2
         echo "       Need at least $required_path_available, got $PATHUSD_AMOUNT." >&2
@@ -731,34 +816,60 @@ main() {
         echo "       Need at least $required_alpha_available, got $ALPHAUSD_AMOUNT." >&2
         exit 1
     fi
+    if (( MAKER_PATHUSD_AMOUNT < MARKET_ORDER_AMOUNT * MARKET_BID_PRICE )); then
+        echo "ERROR: MAKER_PATHUSD_AMOUNT must cover market-sell bid liquidity." >&2
+        echo "       Need at least $((MARKET_ORDER_AMOUNT * MARKET_BID_PRICE)), got $MAKER_PATHUSD_AMOUNT." >&2
+        exit 1
+    fi
+    if (( MAKER_ALPHAUSD_AMOUNT < MARKET_ORDER_AMOUNT )); then
+        echo "ERROR: MAKER_ALPHAUSD_AMOUNT must cover market-buy ask liquidity." >&2
+        echo "       Need at least $MARKET_ORDER_AMOUNT, got $MAKER_ALPHAUSD_AMOUNT." >&2
+        exit 1
+    fi
 
     ensure_portal_token_enabled "$PATHUSD" "pathUSD"
     ensure_portal_token_enabled "$ALPHAUSD" "alphaUSD"
 
     log "Requesting faucet funds"
     cast rpc tempo_fundAddress "$account" --rpc-url "$HTTP_L1_RPC" || true
+    cast rpc tempo_fundAddress "$maker_account" --rpc-url "$HTTP_L1_RPC" || true
 
-    local l1_path l1_alpha
+    local l1_path l1_alpha maker_l1_path maker_l1_alpha
     l1_path="$(tip20_balance "$HTTP_L1_RPC" "$PATHUSD" "$account")"
     l1_alpha="$(tip20_balance "$HTTP_L1_RPC" "$ALPHAUSD" "$account")"
+    maker_l1_path="$(tip20_balance "$HTTP_L1_RPC" "$PATHUSD" "$maker_account")"
+    maker_l1_alpha="$(tip20_balance "$HTTP_L1_RPC" "$ALPHAUSD" "$maker_account")"
     echo "  L1 pathUSD:  $l1_path"
     echo "  L1 alphaUSD: $l1_alpha"
+    echo "  maker L1 pathUSD:  $maker_l1_path"
+    echo "  maker L1 alphaUSD: $maker_l1_alpha"
     if (( l1_path < PATHUSD_AMOUNT || l1_alpha < ALPHAUSD_AMOUNT )); then
         echo "ERROR: account lacks deposit funds after faucet request." >&2
         echo "       Need pathUSD=$PATHUSD_AMOUNT and alphaUSD=$ALPHAUSD_AMOUNT." >&2
         echo "       If this faucet does not mint alphaUSD, pre-fund $account and rerun." >&2
         exit 1
     fi
+    if (( maker_l1_path < MAKER_PATHUSD_AMOUNT || maker_l1_alpha < MAKER_ALPHAUSD_AMOUNT )); then
+        echo "ERROR: maker account lacks deposit funds after faucet request." >&2
+        echo "       Need pathUSD=$MAKER_PATHUSD_AMOUNT and alphaUSD=$MAKER_ALPHAUSD_AMOUNT." >&2
+        echo "       If this faucet does not mint alphaUSD, pre-fund $maker_account and rerun." >&2
+        exit 1
+    fi
 
     local zone_path_before zone_alpha_before target_path target_alpha
+    local maker_zone_path_before maker_zone_alpha_before maker_target_path maker_target_alpha
     zone_path_before="$(tip20_balance "$ZONE_RPC_URL" "$PATHUSD" "$account" 2>/dev/null || echo 0)"
     zone_alpha_before="$(tip20_balance "$ZONE_RPC_URL" "$ALPHAUSD" "$account" 2>/dev/null || echo 0)"
+    maker_zone_path_before="$(tip20_balance "$ZONE_RPC_URL" "$PATHUSD" "$maker_account" 2>/dev/null || echo 0)"
+    maker_zone_alpha_before="$(tip20_balance "$ZONE_RPC_URL" "$ALPHAUSD" "$maker_account" 2>/dev/null || echo 0)"
     target_path=$((zone_path_before + PATHUSD_AMOUNT))
     target_alpha=$((zone_alpha_before + ALPHAUSD_AMOUNT))
+    maker_target_path=$((maker_zone_path_before + MAKER_PATHUSD_AMOUNT))
+    maker_target_alpha=$((maker_zone_alpha_before + MAKER_ALPHAUSD_AMOUNT))
 
     log "Approving portal"
-    local path_approval_tx alpha_approval_tx
-    local path_approval_gas alpha_approval_gas
+    local path_approval_tx alpha_approval_tx maker_path_approval_tx maker_alpha_approval_tx
+    local path_approval_gas alpha_approval_gas maker_path_approval_gas maker_alpha_approval_gas
     path_approval_gas="$(buffered_gas_limit "$APPROVE_GAS_FALLBACK" "$HTTP_L1_RPC" "$account" \
         "$PATHUSD" "approve(address,uint256)" "$L1_PORTAL_ADDRESS" "$(cast max-uint)")"
     alpha_approval_gas="$(buffered_gas_limit "$APPROVE_GAS_FALLBACK" "$HTTP_L1_RPC" "$account" \
@@ -769,13 +880,25 @@ main() {
     alpha_approval_tx="$(send_checked "alphaUSD portal approval" \
         cast send "$ALPHAUSD" "approve(address,uint256)" "$L1_PORTAL_ADDRESS" "$(cast max-uint)" \
         --rpc-url "$HTTP_L1_RPC" --private-key "$private_key" --gas-limit "$alpha_approval_gas")"
+    maker_path_approval_gas="$(buffered_gas_limit "$APPROVE_GAS_FALLBACK" "$HTTP_L1_RPC" "$maker_account" \
+        "$PATHUSD" "approve(address,uint256)" "$L1_PORTAL_ADDRESS" "$(cast max-uint)")"
+    maker_alpha_approval_gas="$(buffered_gas_limit "$APPROVE_GAS_FALLBACK" "$HTTP_L1_RPC" "$maker_account" \
+        "$ALPHAUSD" "approve(address,uint256)" "$L1_PORTAL_ADDRESS" "$(cast max-uint)")"
+    maker_path_approval_tx="$(send_checked "maker pathUSD portal approval" \
+        cast send "$PATHUSD" "approve(address,uint256)" "$L1_PORTAL_ADDRESS" "$(cast max-uint)" \
+        --rpc-url "$HTTP_L1_RPC" --private-key "$maker_key" --gas-limit "$maker_path_approval_gas")"
+    maker_alpha_approval_tx="$(send_checked "maker alphaUSD portal approval" \
+        cast send "$ALPHAUSD" "approve(address,uint256)" "$L1_PORTAL_ADDRESS" "$(cast max-uint)" \
+        --rpc-url "$HTTP_L1_RPC" --private-key "$maker_key" --gas-limit "$maker_alpha_approval_gas")"
     echo "  pathUSD approval tx:  $path_approval_tx (gas $path_approval_gas)"
     echo "  alphaUSD approval tx: $alpha_approval_tx (gas $alpha_approval_gas)"
+    echo "  maker pathUSD approval tx:  $maker_path_approval_tx (gas $maker_path_approval_gas)"
+    echo "  maker alphaUSD approval tx: $maker_alpha_approval_tx (gas $maker_alpha_approval_gas)"
 
     log "Depositing to zone"
     local memo="0x0000000000000000000000000000000000000000000000000000000000000000"
-    local path_deposit_tx alpha_deposit_tx
-    local path_deposit_gas alpha_deposit_gas
+    local path_deposit_tx alpha_deposit_tx maker_path_deposit_tx maker_alpha_deposit_tx
+    local path_deposit_gas alpha_deposit_gas maker_path_deposit_gas maker_alpha_deposit_gas
     path_deposit_gas="$(buffered_gas_limit "$DEPOSIT_GAS_FALLBACK" "$HTTP_L1_RPC" "$account" \
         "$L1_PORTAL_ADDRESS" "deposit(address,address,uint128,bytes32)" "$PATHUSD" "$account" "$PATHUSD_AMOUNT" "$memo")"
     alpha_deposit_gas="$(buffered_gas_limit "$DEPOSIT_GAS_FALLBACK" "$HTTP_L1_RPC" "$account" \
@@ -786,17 +909,71 @@ main() {
     alpha_deposit_tx="$(send_checked "alphaUSD deposit" \
         cast send "$L1_PORTAL_ADDRESS" "deposit(address,address,uint128,bytes32)" "$ALPHAUSD" "$account" "$ALPHAUSD_AMOUNT" "$memo" \
         --rpc-url "$HTTP_L1_RPC" --private-key "$private_key" --gas-limit "$alpha_deposit_gas")"
+    maker_path_deposit_gas="$(buffered_gas_limit "$DEPOSIT_GAS_FALLBACK" "$HTTP_L1_RPC" "$maker_account" \
+        "$L1_PORTAL_ADDRESS" "deposit(address,address,uint128,bytes32)" "$PATHUSD" "$maker_account" "$MAKER_PATHUSD_AMOUNT" "$memo")"
+    maker_alpha_deposit_gas="$(buffered_gas_limit "$DEPOSIT_GAS_FALLBACK" "$HTTP_L1_RPC" "$maker_account" \
+        "$L1_PORTAL_ADDRESS" "deposit(address,address,uint128,bytes32)" "$ALPHAUSD" "$maker_account" "$MAKER_ALPHAUSD_AMOUNT" "$memo")"
+    maker_path_deposit_tx="$(send_checked "maker pathUSD deposit" \
+        cast send "$L1_PORTAL_ADDRESS" "deposit(address,address,uint128,bytes32)" "$PATHUSD" "$maker_account" "$MAKER_PATHUSD_AMOUNT" "$memo" \
+        --rpc-url "$HTTP_L1_RPC" --private-key "$maker_key" --gas-limit "$maker_path_deposit_gas")"
+    maker_alpha_deposit_tx="$(send_checked "maker alphaUSD deposit" \
+        cast send "$L1_PORTAL_ADDRESS" "deposit(address,address,uint128,bytes32)" "$ALPHAUSD" "$maker_account" "$MAKER_ALPHAUSD_AMOUNT" "$memo" \
+        --rpc-url "$HTTP_L1_RPC" --private-key "$maker_key" --gas-limit "$maker_alpha_deposit_gas")"
     echo "  pathUSD deposit tx:  $path_deposit_tx (gas $path_deposit_gas)"
     echo "  alphaUSD deposit tx: $alpha_deposit_tx (gas $alpha_deposit_gas)"
+    echo "  maker pathUSD deposit tx:  $maker_path_deposit_tx (gas $maker_path_deposit_gas)"
+    echo "  maker alphaUSD deposit tx: $maker_alpha_deposit_tx (gas $maker_alpha_deposit_gas)"
 
     log "Waiting for zone deposit balances"
     wait_for_zone_balance_at_least "$PATHUSD" "$account" "$target_path" "pathUSD"
     wait_for_zone_balance_at_least "$ALPHAUSD" "$account" "$target_alpha" "alphaUSD"
+    wait_for_zone_balance_at_least "$PATHUSD" "$maker_account" "$maker_target_path" "maker pathUSD"
+    wait_for_zone_balance_at_least "$ALPHAUSD" "$maker_account" "$maker_target_alpha" "maker alphaUSD"
+
+    log "Testing market orders"
+    local maker_ask_tx market_buy_tx maker_bid_tx market_sell_tx
+    local maker_ask_gas market_buy_gas maker_bid_gas market_sell_gas
+    local zone_path_fees=0
+
+    maker_ask_gas="$(buffered_gas_limit "$ORDER_GAS_FALLBACK" "$ZONE_RPC_URL" "$maker_account" \
+        "$DARKPOOL" "place(address,uint128,uint128,bool)" "$ALPHAUSD" "$MARKET_ORDER_AMOUNT" "$MARKET_ASK_PRICE" false)"
+    maker_ask_tx="$(send_checked "maker ask for market buy" \
+        cast send "$DARKPOOL" "place(address,uint128,uint128,bool)" "$ALPHAUSD" "$MARKET_ORDER_AMOUNT" "$MARKET_ASK_PRICE" false \
+        --rpc-url "$ZONE_RPC_URL" --private-key "$maker_key" --gas-limit "$maker_ask_gas")"
+    echo "  maker ask tx: $maker_ask_tx (gas $maker_ask_gas)"
+    print_specific_order_status "maker ask for market buy" "$maker_ask_tx" "$maker_auth" "sell" "$MARKET_ORDER_AMOUNT" "$MARKET_ASK_PRICE"
+
+    market_buy_gas="$(buffered_gas_limit "$ORDER_GAS_FALLBACK" "$ZONE_RPC_URL" "$account" \
+        "$DARKPOOL" "marketBuy(address,uint128,uint128)" "$ALPHAUSD" "$MARKET_ORDER_AMOUNT" "$MARKET_BUY_MAX_QUOTE_IN")"
+    market_buy_tx="$(send_checked "market buy" \
+        cast send "$DARKPOOL" "marketBuy(address,uint128,uint128)" "$ALPHAUSD" "$MARKET_ORDER_AMOUNT" "$MARKET_BUY_MAX_QUOTE_IN" \
+        --rpc-url "$ZONE_RPC_URL" --private-key "$private_key" --gas-limit "$market_buy_gas")"
+    zone_path_fees=$((zone_path_fees + $(zone_path_fee_paid "$market_buy_tx" "$account")))
+    echo "  market buy tx: $market_buy_tx (gas $market_buy_gas)"
+    validate_market_fill_status "market buy" "$market_buy_tx" "$maker_account" "$account" "$MARKET_ORDER_AMOUNT" "$MARKET_ASK_PRICE"
+    print_order_status "market buy" "$account" "$auth" "$market_buy_tx"
+
+    maker_bid_gas="$(buffered_gas_limit "$ORDER_GAS_FALLBACK" "$ZONE_RPC_URL" "$maker_account" \
+        "$DARKPOOL" "place(address,uint128,uint128,bool)" "$ALPHAUSD" "$MARKET_ORDER_AMOUNT" "$MARKET_BID_PRICE" true)"
+    maker_bid_tx="$(send_checked "maker bid for market sell" \
+        cast send "$DARKPOOL" "place(address,uint128,uint128,bool)" "$ALPHAUSD" "$MARKET_ORDER_AMOUNT" "$MARKET_BID_PRICE" true \
+        --rpc-url "$ZONE_RPC_URL" --private-key "$maker_key" --gas-limit "$maker_bid_gas")"
+    echo "  maker bid tx: $maker_bid_tx (gas $maker_bid_gas)"
+    print_specific_order_status "maker bid for market sell" "$maker_bid_tx" "$maker_auth" "buy" "$MARKET_ORDER_AMOUNT" "$MARKET_BID_PRICE"
+
+    market_sell_gas="$(buffered_gas_limit "$ORDER_GAS_FALLBACK" "$ZONE_RPC_URL" "$account" \
+        "$DARKPOOL" "marketSell(address,uint128,uint128)" "$ALPHAUSD" "$MARKET_ORDER_AMOUNT" "$MARKET_SELL_MIN_QUOTE_OUT")"
+    market_sell_tx="$(send_checked "market sell" \
+        cast send "$DARKPOOL" "marketSell(address,uint128,uint128)" "$ALPHAUSD" "$MARKET_ORDER_AMOUNT" "$MARKET_SELL_MIN_QUOTE_OUT" \
+        --rpc-url "$ZONE_RPC_URL" --private-key "$private_key" --gas-limit "$market_sell_gas")"
+    zone_path_fees=$((zone_path_fees + $(zone_path_fee_paid "$market_sell_tx" "$account")))
+    echo "  market sell tx: $market_sell_tx (gas $market_sell_gas)"
+    validate_market_fill_status "market sell" "$market_sell_tx" "$maker_account" "$account" "$MARKET_ORDER_AMOUNT" "$MARKET_BID_PRICE"
+    print_order_status "market sell" "$account" "$auth" "$market_sell_tx"
 
     log "Placing darkpool orders"
     local sell_tx buy_tx
     local sell_gas buy_gas
-    local zone_path_fees=0
     sell_gas="$(buffered_gas_limit "$ORDER_GAS_FALLBACK" "$ZONE_RPC_URL" "$account" \
         "$DARKPOOL" "place(address,uint128,uint128,bool)" "$ALPHAUSD" "$ORDER_AMOUNT" "$SELL_PRICE" false)"
     sell_tx="$(send_checked "sell order" \
@@ -876,8 +1053,8 @@ main() {
 
     log "Final public zone status"
     local expected_path_final expected_alpha_final
-    expected_path_final=$((target_path - ORDER_AMOUNT * BUY_PRICE - WITHDRAW_PATHUSD_AMOUNT - zone_path_fees))
-    expected_alpha_final=$((target_alpha - ORDER_AMOUNT - WITHDRAW_ALPHAUSD_AMOUNT))
+    expected_path_final=$((target_path - MARKET_BUY_MAX_QUOTE_IN - ORDER_AMOUNT * BUY_PRICE - WITHDRAW_PATHUSD_AMOUNT - zone_path_fees))
+    expected_alpha_final=$((target_alpha - MARKET_ORDER_AMOUNT - ORDER_AMOUNT - WITHDRAW_ALPHAUSD_AMOUNT))
     assert_public_balance "$PATHUSD" "$account" "$expected_path_final" "pathUSD"
     assert_public_balance "$ALPHAUSD" "$account" "$expected_alpha_final" "alphaUSD"
 
