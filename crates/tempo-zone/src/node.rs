@@ -14,7 +14,7 @@ use crate::{
         spawn_policy_resolution_task, spawn_pool_prefetch_task,
     },
     payload::{ZonePayloadAttributes, ZonePayloadFactory, ZonePayloadTypes},
-    rpc::{TempoZoneRpc, ZoneRpcApi, start_private_rpc},
+    rpc::{TempoZoneRpc, ZoneRpcApi, start_private_rpc, start_public_rpc},
     rpc_connection_config, spawn_zone_sequencer,
 };
 use alloy_primitives::{Address, U256};
@@ -561,8 +561,18 @@ where
         };
         let api: Arc<dyn ZoneRpcApi> =
             Arc::new(TempoZoneRpc::new(eth_handlers, private_rpc_config.clone()).await?);
+        let public_api = Arc::clone(&api);
         let local_addr = start_private_rpc(private_rpc_config, api).await?;
         info!(target: "reth::cli", %local_addr, "Private zone RPC server started");
+
+        // Public read-only RPC (anonymous, allowlisted reads) for wallet-free
+        // surfaces, served on private_rpc_port + 1.
+        let public_addr: std::net::SocketAddr =
+            ([0, 0, 0, 0], config.private_rpc_port.saturating_add(1)).into();
+        match start_public_rpc(public_addr, public_api).await {
+            Ok(addr) => info!(target: "reth::cli", %addr, "Public read-only zone RPC server started"),
+            Err(err) => tracing::warn!(target: "reth::cli", %err, "Public zone RPC server failed to start"),
+        }
 
         Ok(())
     }

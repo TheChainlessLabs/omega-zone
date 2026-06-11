@@ -94,6 +94,118 @@ pub async fn start_private_rpc(
     Ok(local_addr)
 }
 
+/// Read-only zone RPC methods served anonymously by the public RPC server.
+/// These are aggregate / market-data reads whose handlers ignore the caller
+/// (`_auth`), so an anonymous context is safe; every other method is rejected.
+pub const PUBLIC_RPC_METHODS: &[&str] = &[
+    "zone_listBatches",
+    "zone_getBatch",
+    "zone_searchBatch",
+    "zone_getTopOfBook",
+    "zone_getMidpointHistory",
+];
+
+#[derive(Clone)]
+struct PublicRpcState {
+    api: Arc<dyn ZoneRpcApi>,
+}
+
+/// Start the public (anonymous, read-only) zone RPC server.
+///
+/// Unlike [`start_private_rpc`] this performs NO authentication: it serves the
+/// fixed allowlist [`PUBLIC_RPC_METHODS`] with an anonymous [`AuthContext`] and
+/// rejects everything else with method-not-found, so wallet-free surfaces
+/// (the public batches explorer, the trade midpoint poll) can read the zone
+/// without an authorization token.
+pub async fn start_public_rpc(
+    listen_addr: std::net::SocketAddr,
+    api: Arc<dyn ZoneRpcApi>,
+) -> eyre::Result<std::net::SocketAddr> {
+    let state = Arc::new(PublicRpcState { api });
+    let app = Router::new()
+        .route("/", post(handle_public_rpc))
+        .with_state(state);
+    let listener = tokio::net::TcpListener::bind(listen_addr).await?;
+    let local_addr = listener.local_addr()?;
+    info!(target: "zone::rpc", %local_addr, "Starting public (read-only) zone RPC server");
+    tokio::spawn(async move {
+        if let Err(err) = axum::serve(listener, app).await {
+            tracing::error!(target: "zone::rpc", %err, "Public RPC server failed");
+        }
+    });
+    Ok(local_addr)
+}
+
+async fn handle_public_rpc(
+    State(state): State<Arc<PublicRpcState>>,
+    body: Bytes,
+) -> impl IntoResponse {
+    let body_str = match std::str::from_utf8(&body) {
+        Ok(s) => s,
+        Err(_) => return (StatusCode::BAD_REQUEST, "invalid UTF-8").into_response(),
+    };
+    let auth = AuthContext {
+        caller: alloy_primitives::Address::ZERO,
+        expires_at: u64::MAX,
+    };
+    process_public_rpc_text(body_str, &auth, state.api.as_ref())
+        .await
+        .into_response()
+}
+
+/// Like `process_rpc_text`, but rejects any method not in `PUBLIC_RPC_METHODS`.
+async fn process_public_rpc_text(text: &str, auth: &AuthContext, api: &dyn ZoneRpcApi) -> RpcResult {
+    let trimmed = text.trim_start();
+    if trimmed.starts_with('[') {
+        match serde_json::from_str::<Vec<JsonRpcRequest>>(trimmed) {
+            Ok(requests) if requests.is_empty() => RpcResult::Single(JsonRpcResponse::error(
+                serde_json::Value::Null,
+                JsonRpcError::parse_error("empty batch"),
+            )),
+            Ok(requests) if requests.len() > MAX_BATCH_SIZE => RpcResult::Single(
+                JsonRpcResponse::error(
+                    serde_json::Value::Null,
+                    JsonRpcError::invalid_params(format!(
+                        "batch too large ({} > {MAX_BATCH_SIZE})",
+                        requests.len()
+                    )),
+                ),
+            ),
+            Ok(requests) => {
+                let mut responses = Vec::with_capacity(requests.len());
+                for req in &requests {
+                    responses.push(dispatch_public_request(req, auth, api).await);
+                }
+                RpcResult::Batch(responses)
+            }
+            Err(e) => RpcResult::Single(JsonRpcResponse::error(
+                serde_json::Value::Null,
+                JsonRpcError::parse_error(format!("parse error: {e}")),
+            )),
+        }
+    } else {
+        match serde_json::from_str::<JsonRpcRequest>(trimmed) {
+            Ok(request) => RpcResult::Single(dispatch_public_request(&request, auth, api).await),
+            Err(e) => RpcResult::Single(JsonRpcResponse::error(
+                serde_json::Value::Null,
+                JsonRpcError::parse_error(format!("parse error: {e}")),
+            )),
+        }
+    }
+}
+
+async fn dispatch_public_request(
+    req: &JsonRpcRequest,
+    auth: &AuthContext,
+    api: &dyn ZoneRpcApi,
+) -> JsonRpcResponse {
+    if !PUBLIC_RPC_METHODS.contains(&req.method.as_str()) {
+        return JsonRpcResponse::error(req.id.clone(), JsonRpcError::method_not_found());
+    }
+    dispatch_request(req, auth, api).await
+}
+
+
 /// Result of processing a JSON-RPC text payload (single or batch).
 pub(crate) enum RpcResult {
     Single(JsonRpcResponse),
