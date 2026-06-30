@@ -20,10 +20,10 @@ use alloy::{
 };
 use eyre::{Context, Result};
 use tempo_alloy::TempoNetwork;
-use zone::{
-    BatchData, BatchSubmitter, EmptyLegacyProofProvider,
-    abi::{TEMPO_STATE_ADDRESS, TempoState, ZONE_INBOX_ADDRESS, ZoneInbox, ZonePortal},
+use tempo_zone_contracts::{
+    TEMPO_STATE_ADDRESS, TempoState, ZONE_INBOX_ADDRESS, ZoneInbox, ZonePortal,
 };
+use zone_sequencer::{BatchData, BatchSubmitter, EmptyLegacyProofProvider};
 
 #[derive(Debug, clap::Parser)]
 pub(crate) struct SettlementPreflightCmd {

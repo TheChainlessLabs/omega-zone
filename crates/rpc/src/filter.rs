@@ -10,6 +10,8 @@ use alloy_primitives::{Address, B256, b256};
 use alloy_rpc_types_eth::{Filter, FilterSet, Log};
 use tempo_alloy::rpc::TempoTransactionReceipt;
 
+use crate::types::JsonRpcError;
+
 /// `Transfer(address,address,uint256)`
 pub const TRANSFER_TOPIC: B256 =
     b256!("0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef");
@@ -38,6 +40,10 @@ pub const WHITELISTED_TOPICS: [B256; 5] = [
     MINT_TOPIC,
     BURN_TOPIC,
 ];
+
+const TWO_PARTY_TOPICS: [B256; 3] = [TRANSFER_TOPIC, APPROVAL_TOPIC, TRANSFER_WITH_MEMO_TOPIC];
+const CALLER_SCOPED_FILTER_ERROR: &str =
+    "private log filter must include authenticated caller in topic1 or topic2";
 
 /// Returns `true` if `caller` appears in an eligible indexed-topic position
 /// for the log's event type.
@@ -73,9 +79,6 @@ pub fn is_caller_eligible(log: &Log, caller: &Address) -> bool {
 /// A log is included only when **both** of the following hold:
 /// 1. Its topic0 is one of the [`WHITELISTED_TOPICS`].
 /// 2. The `caller` is eligible per [`is_caller_eligible`].
-///
-/// TODO: once the enabled-token registry is plumbed through, also filter
-/// by emitting contract address (only logs from enabled TIP-20 tokens).
 pub fn is_log_visible(log: &Log, caller: &Address) -> bool {
     log.topic0().is_some_and(|t| WHITELISTED_TOPICS.contains(t)) && is_caller_eligible(log, caller)
 }
@@ -96,6 +99,28 @@ pub fn filter_receipt_logs(mut receipt: TempoTransactionReceipt) -> TempoTransac
     receipt
 }
 
+/// Scopes a user-supplied filter to only match enabled zone token addresses.
+pub fn scope_filter_addresses(
+    filter: &mut Filter,
+    zone_tokens: &[Address],
+) -> Result<(), JsonRpcError> {
+    let requested_addresses: Vec<Address> = filter.address.iter().copied().collect();
+
+    if requested_addresses.is_empty() {
+        filter.address = FilterSet::from(zone_tokens.to_vec());
+        return Ok(());
+    }
+
+    if requested_addresses
+        .iter()
+        .all(|address| zone_tokens.contains(address))
+    {
+        Ok(())
+    } else {
+        Err(JsonRpcError::invalid_params("invalid filter address"))
+    }
+}
+
 /// Scopes a user-supplied filter to only match whitelisted TIP-20 event topics.
 ///
 /// Intersects the user's requested topic0 with [`WHITELISTED_TOPICS`].
@@ -104,9 +129,6 @@ pub fn filter_receipt_logs(mut receipt: TempoTransactionReceipt) -> TempoTransac
 ///
 /// The post-filter in [`filter_logs`] remains the actual privacy enforcement;
 /// this pre-filter reduces DB scan volume and timing side-channels.
-///
-/// TODO: once the enabled-token registry is plumbed through, also scope the
-/// filter's `address` field to only match enabled TIP-20 token addresses.
 pub fn scope_filter(filter: &mut Filter) {
     // --- Topic0 scoping ---
     let user_topic0: Vec<B256> = filter.topics[0].iter().copied().collect();
@@ -128,6 +150,37 @@ pub fn scope_filter(filter: &mut Filter) {
     } else {
         filter.topics[0] = FilterSet::from(scoped_topic0);
     }
+}
+
+/// Scopes a user-supplied filter to whitelisted event topics and requires the
+/// authenticated caller to appear in an eligible indexed topic before backend
+/// log retrieval.
+pub fn scope_filter_for_caller(filter: &mut Filter, caller: &Address) -> Result<(), JsonRpcError> {
+    scope_filter(filter);
+    if filter.topics[0].len() == 1 && filter.topics[0].contains(&B256::ZERO) {
+        return Ok(());
+    }
+
+    let caller_word = B256::left_padding_from(caller.as_slice());
+    if filter.topics[1].contains(&caller_word) {
+        filter.topics[1] = FilterSet::from(caller_word);
+        return Ok(());
+    }
+
+    if filter.topics[2].contains(&caller_word) {
+        let topic0 = filter.topics[0]
+            .iter()
+            .copied()
+            .filter(|topic| TWO_PARTY_TOPICS.contains(topic))
+            .collect::<Vec<_>>();
+        if !topic0.is_empty() {
+            filter.topics[0] = FilterSet::from(topic0);
+            filter.topics[2] = FilterSet::from(caller_word);
+            return Ok(());
+        }
+    }
+
+    Err(JsonRpcError::invalid_params(CALLER_SCOPED_FILTER_ERROR))
 }
 
 #[cfg(test)]
@@ -495,5 +548,121 @@ mod tests {
         filter.topics[0] = FilterSet::from(bogus);
         scope_filter(&mut filter);
         assert_eq!(filter.topics[0], FilterSet::from(B256::ZERO));
+    }
+
+    #[test]
+    fn scope_filter_for_caller_rejects_broad_filter() {
+        let caller = address!("0x0000000000000000000000000000000000000001");
+        let mut filter = Filter::default();
+
+        let err = scope_filter_for_caller(&mut filter, &caller).unwrap_err();
+
+        assert_eq!(err.code, JsonRpcError::invalid_params("").code);
+        assert_eq!(err.message, CALLER_SCOPED_FILTER_ERROR);
+    }
+
+    #[test]
+    fn scope_filter_for_caller_scopes_topic1_caller() {
+        let caller = address!("0x0000000000000000000000000000000000000001");
+        let other = address!("0x0000000000000000000000000000000000000002");
+        let caller_topic = caller_word(&caller);
+        let other_topic = caller_word(&other);
+        let mut filter = Filter::default();
+        filter.topics[1] = FilterSet::from(vec![caller_topic, other_topic]);
+        filter.topics[2] = FilterSet::from(other_topic);
+
+        scope_filter_for_caller(&mut filter, &caller).unwrap();
+
+        assert_eq!(filter.topics[0].len(), WHITELISTED_TOPICS.len());
+        assert_eq!(filter.topics[1], FilterSet::from(caller_topic));
+        assert_eq!(filter.topics[2], FilterSet::from(other_topic));
+    }
+
+    #[test]
+    fn scope_filter_for_caller_scopes_topic2_caller_for_two_party_events() {
+        let caller = address!("0x0000000000000000000000000000000000000001");
+        let other = address!("0x0000000000000000000000000000000000000002");
+        let caller_topic = caller_word(&caller);
+        let other_topic = caller_word(&other);
+        let mut filter = Filter::default();
+        filter.topics[0] = FilterSet::from(vec![TRANSFER_TOPIC, MINT_TOPIC]);
+        filter.topics[1] = FilterSet::from(other_topic);
+        filter.topics[2] = FilterSet::from(vec![caller_topic, caller_word(&other)]);
+
+        scope_filter_for_caller(&mut filter, &caller).unwrap();
+
+        assert_eq!(filter.topics[0], FilterSet::from(TRANSFER_TOPIC));
+        assert_eq!(filter.topics[1], FilterSet::from(other_topic));
+        assert_eq!(filter.topics[2], FilterSet::from(caller_topic));
+    }
+
+    #[test]
+    fn scope_filter_for_caller_rejects_wrong_caller() {
+        let caller = address!("0x0000000000000000000000000000000000000001");
+        let a = address!("0x0000000000000000000000000000000000000002");
+        let b = address!("0x0000000000000000000000000000000000000003");
+        let mut filter = Filter::default();
+        filter.topics[0] = FilterSet::from(TRANSFER_TOPIC);
+        filter.topics[1] = FilterSet::from(caller_word(&a));
+        filter.topics[2] = FilterSet::from(caller_word(&b));
+
+        let err = scope_filter_for_caller(&mut filter, &caller).unwrap_err();
+
+        assert_eq!(err.code, JsonRpcError::invalid_params("").code);
+        assert_eq!(err.message, CALLER_SCOPED_FILTER_ERROR);
+    }
+
+    #[test]
+    fn scope_filter_for_caller_rejects_topic2_only_for_one_party_events() {
+        let caller = address!("0x0000000000000000000000000000000000000001");
+        let mut filter = Filter::default();
+        filter.topics[0] = FilterSet::from(MINT_TOPIC);
+        filter.topics[2] = FilterSet::from(caller_word(&caller));
+
+        let err = scope_filter_for_caller(&mut filter, &caller).unwrap_err();
+
+        assert_eq!(err.code, JsonRpcError::invalid_params("").code);
+        assert_eq!(err.message, CALLER_SCOPED_FILTER_ERROR);
+    }
+
+    #[test]
+    fn scope_filter_addresses_scopes_omitted_address() {
+        let token_a = address!("0x00000000000000000000000000000000000000aa");
+        let token_b = address!("0x00000000000000000000000000000000000000bb");
+        let mut filter = Filter::default();
+
+        scope_filter_addresses(&mut filter, &[token_a, token_b]).unwrap();
+
+        assert!(filter.address.contains(&token_a));
+        assert!(filter.address.contains(&token_b));
+        assert_eq!(filter.address.len(), 2);
+    }
+
+    #[test]
+    fn scope_filter_addresses_allows_enabled_token_address() {
+        let token = address!("0x00000000000000000000000000000000000000aa");
+        let mut filter = Filter {
+            address: FilterSet::from(token),
+            ..Default::default()
+        };
+
+        scope_filter_addresses(&mut filter, &[token]).unwrap();
+
+        assert_eq!(filter.address, FilterSet::from(token));
+    }
+
+    #[test]
+    fn scope_filter_addresses_rejects_non_zone_token_address() {
+        let token = address!("0x00000000000000000000000000000000000000aa");
+        let other = address!("0x00000000000000000000000000000000000000cc");
+        let mut filter = Filter {
+            address: FilterSet::from(vec![token, other]),
+            ..Default::default()
+        };
+
+        let err = scope_filter_addresses(&mut filter, &[token]).unwrap_err();
+
+        assert_eq!(err.code, JsonRpcError::invalid_params("").code);
+        assert_eq!(err.message, "invalid filter address");
     }
 }
