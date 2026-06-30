@@ -115,6 +115,8 @@ The Omega alpha path uses this repo as the backend target for a Tempo Zone with:
 
 Relevant docs:
 
+- [docs/ZONE_DARKPOOL_INTERACTION.md](docs/ZONE_DARKPOOL_INTERACTION.md) — practical zone and darkpool command guide
+- [docs/TEMPO_WALLET_INTERACTION.md](docs/TEMPO_WALLET_INTERACTION.md) — direct Tempo Wallet integration guide
 - [docs/ALPHA.md](docs/ALPHA.md) — private-alpha OALPHA / PATH.USD setup
 - [docs/TEE_PROOF.md](docs/TEE_PROOF.md) — proof provider and live-verifier blockers
 - [docs/RUNBOOK_FIRST_BATCH.md](docs/RUNBOOK_FIRST_BATCH.md) — settlement preflight and first-batch runbook

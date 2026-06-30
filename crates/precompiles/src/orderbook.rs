@@ -298,6 +298,23 @@ impl DarkpoolOrderbook {
         self.set_balance(user, token, cur.saturating_sub(amount))
     }
 
+    fn ensure_internal_balance(
+        &mut self,
+        user: Address,
+        token: Address,
+        required: u128,
+    ) -> tempo_precompiles::Result<()> {
+        let available = self.available_balance_of(user, token)?;
+        if available >= required {
+            return Ok(());
+        }
+
+        let missing = required - available;
+        let mut tip20 = TIP20Token::from_address(token)?;
+        tip20.system_transfer_from(user, self.address, U256::from(missing))?;
+        self.increment_balance(user, token, missing)
+    }
+
     // ── pair management ───────────────────────────────────────────────────
 
     fn validate_or_create_pair(&mut self, base: Address) -> tempo_precompiles::Result<B256> {
@@ -387,18 +404,9 @@ impl DarkpoolOrderbook {
                 Some(v) => v,
                 None => revert!(PriceOutOfRange {}),
             };
-            // Pull quote tokens directly from user to ob.
-            let mut tip20_quote = try_storage!(TIP20Token::from_address(quote));
-            try_storage!(tip20_quote.system_transfer_from(
-                sender,
-                self.address,
-                U256::from(escrow),
-            ));
-            try_storage!(self.increment_balance(sender, quote, escrow));
+            try_storage!(self.ensure_internal_balance(sender, quote, escrow));
         } else {
-            // Pull base tokens directly from user to ob.
-            try_storage!(tip20.system_transfer_from(sender, self.address, U256::from(amount),));
-            try_storage!(self.increment_balance(sender, base, amount));
+            try_storage!(self.ensure_internal_balance(sender, base, amount));
         }
 
         let order_id = try_storage!(self.next_order_id_val());
@@ -740,13 +748,7 @@ impl DarkpoolOrderbook {
         let quote = try_storage!(tip20.quote_token());
         let _book_key = try_storage!(self.validate_or_create_pair(base));
 
-        let mut tip20_quote = try_storage!(TIP20Token::from_address(quote));
-        try_storage!(tip20_quote.system_transfer_from(
-            sender,
-            self.address,
-            U256::from(max_quote_in),
-        ));
-        try_storage!(self.increment_balance(sender, quote, max_quote_in));
+        try_storage!(self.ensure_internal_balance(sender, quote, max_quote_in));
 
         let (filled, spent) =
             try_storage!(self.fill_asks_market(sender, base, quote, amount, max_quote_in));
@@ -778,8 +780,7 @@ impl DarkpoolOrderbook {
         let quote = try_storage!(tip20.quote_token());
         let _book_key = try_storage!(self.validate_or_create_pair(base));
 
-        try_storage!(tip20.system_transfer_from(sender, self.address, U256::from(amount),));
-        try_storage!(self.increment_balance(sender, base, amount));
+        try_storage!(self.ensure_internal_balance(sender, base, amount));
 
         let (filled, received) = try_storage!(self.fill_bids_market(sender, base, quote, amount));
 

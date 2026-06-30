@@ -50,6 +50,7 @@ sol! {
         function MIN_ORDER_AMOUNT() external pure returns (uint128);
         function place(address base, uint128 amount, uint128 price, bool isBid)
             external returns (uint128 orderId);
+        function deposit(address token, uint128 amount) external;
         function cancel(uint128 orderId) external;
         function getOrder(uint128 orderId) external view returns (OrderView memory);
         function withdraw(address token, uint128 amount) external;
@@ -144,6 +145,93 @@ async fn test_darkpool_available_on_zone() -> eyre::Result<()> {
     assert!(
         !code.is_empty(),
         "Darkpool account must have marker bytecode so precompile storage writes persist"
+    );
+
+    Ok(())
+}
+
+/// Darkpool-internal available balances should fund new order escrow before the
+/// precompile pulls more from the zone wallet.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_darkpool_place_reuses_internal_available_balance() -> eyre::Result<()> {
+    reth_tracing::init_test_tracing();
+
+    let (zone, mut fixture) = start_local_zone_with_fixture(20).await?;
+    zone.policy_cache()
+        .write()
+        .set_token_policy(ALPHA_USD_ADDRESS, 0, ALLOW_ALL_POLICY_ID);
+
+    let dev_signer = MnemonicBuilder::<English>::default()
+        .phrase(TEST_MNEMONIC)
+        .build()?;
+    let dev_address = dev_signer.address();
+    let provider = ProviderBuilder::new()
+        .wallet(dev_signer)
+        .connect_http(zone.http_url().clone());
+    let darkpool = TestDarkpoolOrderbook::new(DARKPOOL_ADDRESS, &provider);
+
+    let amount: u128 = 1_000_000;
+    let price: u128 = 1;
+    let escrow = amount * price;
+
+    fixture.inject_enabled_tokens(zone.deposit_queue(), vec![alpha_usd_enabled_token()]);
+    fixture.inject_deposits(
+        zone.deposit_queue(),
+        vec![fixture.make_deposit(PATH_USD_ADDRESS, dev_address, dev_address, 10_000_000)],
+    );
+    zone.wait_for_balance(
+        PATH_USD_ADDRESS,
+        dev_address,
+        U256::from(10_000_000u128),
+        DEFAULT_TIMEOUT,
+    )
+    .await?;
+
+    let deposit_pending = darkpool
+        .deposit(PATH_USD_ADDRESS, escrow)
+        .gas_price(TEMPO_T0_BASE_FEE as u128)
+        .gas(500_000)
+        .send()
+        .await?;
+    fixture.inject_empty_block(zone.deposit_queue());
+    let deposit_receipt = deposit_pending.get_receipt().await?;
+    assert!(deposit_receipt.status(), "darkpool deposit should succeed");
+    assert_eq!(
+        darkpool
+            .availableBalanceOf(dev_address, PATH_USD_ADDRESS)
+            .from(dev_address)
+            .call()
+            .await?,
+        escrow,
+        "darkpool deposit should create available internal balance"
+    );
+
+    let bid_pending = darkpool
+        .place(ALPHA_USD_ADDRESS, amount, price, true)
+        .gas_price(TEMPO_T0_BASE_FEE as u128)
+        .gas(4_000_000)
+        .send()
+        .await?;
+    fixture.inject_empty_block(zone.deposit_queue());
+    let bid_receipt = bid_pending.get_receipt().await?;
+    assert!(bid_receipt.status(), "bid should reuse internal escrow");
+    assert_eq!(
+        darkpool
+            .balanceOf(dev_address, PATH_USD_ADDRESS)
+            .from(dev_address)
+            .call()
+            .await?,
+        escrow,
+        "place must not pull and double-credit escrow when internal balance covers it"
+    );
+    assert_eq!(
+        darkpool
+            .availableBalanceOf(dev_address, PATH_USD_ADDRESS)
+            .from(dev_address)
+            .call()
+            .await?,
+        0,
+        "reused internal escrow should be reserved by the resting bid"
     );
 
     Ok(())
