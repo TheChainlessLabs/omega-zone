@@ -395,7 +395,7 @@ impl DarkpoolOrderbook {
             revert!(PriceOutOfRange {});
         }
 
-        let mut tip20 = try_storage!(TIP20Token::from_address(base));
+        let tip20 = try_storage!(TIP20Token::from_address(base));
         let quote = try_storage!(tip20.quote_token());
         let book_key = try_storage!(self.validate_or_create_pair(base));
 
@@ -776,7 +776,7 @@ impl DarkpoolOrderbook {
             revert!(AmountBelowMinimum {});
         }
 
-        let mut tip20 = try_storage!(TIP20Token::from_address(base));
+        let tip20 = try_storage!(TIP20Token::from_address(base));
         let quote = try_storage!(tip20.quote_token());
         let _book_key = try_storage!(self.validate_or_create_pair(base));
 
@@ -980,6 +980,7 @@ impl DarkpoolOrderbook {
         cfg: &revm::context::CfgEnv<TempoHardfork>,
     ) -> alloy_evm::precompiles::DynPrecompile {
         let spec = cfg.spec;
+        let amsterdam_eip8037_enabled = cfg.enable_amsterdam_eip8037;
         let gas_params = cfg.gas_params.clone();
         alloy_evm::precompiles::DynPrecompile::new_stateful(
             PrecompileId::Custom("DarkpoolOrderbook".into()),
@@ -997,6 +998,7 @@ impl DarkpoolOrderbook {
                     input.gas,
                     input.reservoir,
                     spec,
+                    amsterdam_eip8037_enabled,
                     input.is_static,
                     gas_params.clone(),
                 );

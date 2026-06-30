@@ -7,7 +7,7 @@ on:
       - "specs/ref-impls/src/**"
       - "specs/ref-impls/test/**"
       - "specs/ref-impls/foundry.toml"
-      - "crates/tempo-zone/**"
+      - "crates/node/**"
       - ".github/workflows/specs.yml"
   merge_group:
   pull_request:
@@ -16,7 +16,7 @@ on:
       - "specs/ref-impls/src/**"
       - "specs/ref-impls/test/**"
       - "specs/ref-impls/foundry.toml"
-      - "crates/tempo-zone/**"
+      - "crates/node/**"
       - ".github/workflows/specs.yml"
 
 permissions:
@@ -24,20 +24,19 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTC_WRAPPER: "sccache"
 
 jobs:
   build:
     name: Forge Build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           submodules: recursive
           persist-credentials: false
 
       - name: Install Foundry
-        uses: foundry-rs/foundry-toolchain@8789b3e21e6c11b2697f5eb56eddae542f746c10 # v1.7.0
+        uses: foundry-rs/foundry-toolchain@c7450ba673e133f5ee30098b3b54f444d3a2ca2d # v1.8.0
         with:
           version: nightly
 
@@ -52,37 +51,123 @@ jobs:
     name: Forge Fmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           submodules: recursive
           persist-credentials: false
 
       - name: Install Foundry
-        uses: foundry-rs/foundry-toolchain@8789b3e21e6c11b2697f5eb56eddae542f746c10 # v1.7.0
+        uses: foundry-rs/foundry-toolchain@c7450ba673e133f5ee30098b3b54f444d3a2ca2d # v1.8.0
         with:
           version: nightly
 
-      - name: Run Forge fmt check (zone-only)
+      - name: Run Forge fmt check
         working-directory: specs/ref-impls
-        run: forge fmt --check src/zone test/zone
+        run: forge fmt --check src test
 
   test:
-    name: Forge Test
+    name: Forge Test & Coverage
     runs-on: ubuntu-latest
+    env:
+      RUSTC_WRAPPER: "sccache"
+      MIN_LINES: "88"
+      MIN_BRANCHES: "60"
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           submodules: recursive
           persist-credentials: false
 
-      - name: Install Foundry
-        uses: foundry-rs/foundry-toolchain@8789b3e21e6c11b2697f5eb56eddae542f746c10 # v1.7.0
+      - name: Checkout tempo
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          version: nightly
+          repository: tempoxyz/tempo
+          ref: 65185565b01bc9f406a06c522357954d75ce7cb7
+          path: tempo
+          persist-credentials: false
 
-      - name: Run Forge tests (zone-only)
+      - name: Checkout foundry
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: foundry-rs/foundry
+          ref: master
+          path: foundry
+          persist-credentials: false
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - uses: rui314/setup-mold@9c9c13bf4c3f1adef0cc596abc155580bcb04444 # v1
+      - uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: foundry
+
+      - name: Patch foundry to use pinned Tempo crates
+        run: tempo/scripts/foundry-patch.sh "$GITHUB_WORKSPACE/tempo" "$GITHUB_WORKSPACE/foundry"
+
+      - name: Build Tempo-capable forge
+        working-directory: foundry
+        run: cargo build --bin forge --profile release --no-default-features
+
+      - name: Install z3 (symbolic solver)
+        run: sudo apt-get update && sudo apt-get install -y z3
+
+      - name: Run Forge tests (zone specs)
         working-directory: specs/ref-impls
-        run: forge test -vvv --match-path "test/zone/**"
+        run: |
+          "$GITHUB_WORKSPACE/foundry/target/release/forge" test -vvv --match-path "test/**"
+
+      - name: Run symbolic (symex) property tests
+        working-directory: specs/ref-impls
+        run: |
+          "$GITHUB_WORKSPACE/foundry/target/release/forge" test \
+            --symbolic --match-test "check_" \
+            --symbolic-solver z3 --symbolic-timeout 180 -vvv
+
+      - name: Forge coverage (zone specs)
+        working-directory: specs/ref-impls
+        run: |
+          "$GITHUB_WORKSPACE/foundry/target/release/forge" coverage \
+            --ir-minimum --match-path "test/**" --exclude-tests --report summary | tee coverage.txt
+          {
+            echo '### Zone spec coverage'
+            echo '```'
+            cat coverage.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Coverage gate (production src)
+        working-directory: specs/ref-impls
+        run: |
+          python3 - <<'PY'
+          import os, re, sys
+          ln = ld = bn = bd = 0
+          for line in open("coverage.txt"):
+              if "| src/" in line and "| src/interfaces/" not in line:
+                  c = line.split("|")
+                  lm = re.search(r"\((\d+)/(\d+)\)", c[2])
+                  bm = re.search(r"\((\d+)/(\d+)\)", c[4])
+                  if lm:
+                      ln += int(lm.group(1)); ld += int(lm.group(2))
+                  if bm:
+                      bn += int(bm.group(1)); bd += int(bm.group(2))
+          if ld == 0 or bd == 0:
+              sys.exit("Coverage gate failed: no production src coverage rows matched")
+          lines = 100 * ln / ld
+          branches = 100 * bn / bd
+          min_l = float(os.environ["MIN_LINES"])
+          min_b = float(os.environ["MIN_BRANCHES"])
+          print(f"src: lines={lines:.2f}% (min {min_l}), branches={branches:.2f}% (min {min_b})")
+          failed = []
+          if lines < min_l:
+              failed.append(f"lines {lines:.2f}% < {min_l}%")
+          if branches < min_b:
+              failed.append(f"branches {branches:.2f}% < {min_b}%")
+          if failed:
+              sys.exit("Coverage gate failed: " + "; ".join(failed))
+          print("Coverage gate passed.")
+          PY
 
   specs-success:
     name: specs success
@@ -95,6 +180,6 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: Decide whether the needed jobs succeeded or failed
-        uses: re-actors/alls-green@release/v1
+        uses: re-actors/alls-green@05ac9388f0aebcb5727afa17fcccfecd6f8ec5fe # v1.2.2
         with:
           jobs: ${{ toJSON(needs) }}

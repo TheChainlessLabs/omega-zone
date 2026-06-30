@@ -6,11 +6,9 @@ on:
   push:
     branches: [main]
     paths-ignore:
-      - "specs/ref-impls/**"
       - ".github/workflows/specs.yml"
   pull_request:
     paths-ignore:
-      - "specs/ref-impls/**"
       - ".github/workflows/specs.yml"
   merge_group:
 
@@ -31,20 +29,20 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
           submodules: recursive
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # nightly
         with:
           # Pin nightly to avoid breakage from str::as_str() stabilization
           # which breaks shellexpand 3.1.1 method resolution.
           toolchain: nightly-2026-02-21
           components: clippy
       - uses: rui314/setup-mold@9c9c13bf4c3f1adef0cc596abc155580bcb04444 # v1
-      - uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+      - uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
       - name: Install Foundry
-        uses: foundry-rs/foundry-toolchain@8789b3e21e6c11b2697f5eb56eddae542f746c10 # v1.7.0
+        uses: foundry-rs/foundry-toolchain@c7450ba673e133f5ee30098b3b54f444d3a2ca2d # v1.8.0
         with:
           version: nightly
       - name: Build Solidity artifacts
@@ -62,10 +60,10 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # nightly
         with:
           toolchain: nightly-2026-02-21
           components: rustfmt
@@ -77,10 +75,15 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
-      - uses: crate-ci/typos@cf5f1c29a8ac336af8568821ec41919923b05a83 # v1.45.1
+      - uses: crate-ci/typos@37bb98842b0d8c4ffebdb75301a13db0267cef89 # v1.47.2
+
+  deny:
+    permissions:
+      contents: read
+    uses: tempoxyz/ci/.github/workflows/deny.yml@f7b868401133161610784f840fbf8ba5c45fdd4e # main
 
   lint-success:
     name: lint success
@@ -91,6 +94,7 @@ jobs:
       - clippy
       - fmt
       - typos
+      - deny
     timeout-minutes: 30
     steps:
       - name: Decide whether the needed jobs succeeded or failed
