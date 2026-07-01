@@ -292,6 +292,7 @@ zone-up name reset="false" profile="dev" args="":
                       --datadir "$DATADIR" \
                       --log.file.directory "$DATADIR/logs" \
                       --sequencer \
+                      --sequencer-key "$SEQ_KEY" \
                       {{args}}
 
 [group('zone')]

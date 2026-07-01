@@ -614,7 +614,7 @@ Zones inherit the Tempo L1 EVM but replace, disable, or pass through each precom
 | Contract | Address |
 |----------|---------|
 | pathUSD (TIP-20) | `0x20C0000000000000000000000000000000000000` |
-| ZoneFactory (moderato) | `0x3F07435187fB4B4d4A562138A93C0397D0734F2b` |
+| ZoneFactory (moderato) | `0xC73b446C0768bc315Be7741D60B4e494E3ebc0dC` |
 
 The xtasks use this Moderato `ZoneFactory` as their built-in default: `create-zone` and `zone-info` point at it automatically, and `deploy-router` uses `zoneFactory` from `zone.json` before falling back to this address. Pass `--zone-factory` or set `ZONE_FACTORY` to override it.
 
@@ -653,6 +653,42 @@ Current deployment:
 | Transaction | `0x97037ae1ccec2ac6e9425f1499ae0d6c08deebe07054181d2e154987907480fd` |
 | Block | `23667934` |
 | Deployed | `2026-06-24 18:27:45 UTC` |
+
+### Deploying a New ZoneFactory
+
+Deploy a fresh shared factory when the Solidity `ZoneFactory`, `ZonePortal`, `ZoneMessenger`, or verifier ABI changes in a way that existing factory deployments cannot serve.
+
+```bash
+cd specs/ref-impls
+export ETH_RPC_URL=https://rpc.moderato.tempo.xyz
+export PRIVATE_KEY=<deployer_private_key>
+
+forge build
+forge create --broadcast --rpc-url "$ETH_RPC_URL" --private-key "$PRIVATE_KEY" src/zone/ZoneFactory.sol:ZoneFactory
+```
+
+The `--private-key "$PRIVATE_KEY"` form is useful for controlled non-interactive deployments. For manual deployments, prefer replacing it with `--interactive` and paste the key at Foundry's prompt so the key is not written into shell history or process arguments.
+
+After deployment, capture the `Deployed to` address and transaction hash, then verify the contract:
+
+```bash
+export ZONE_FACTORY=0x...
+
+cast code "$ZONE_FACTORY" --rpc-url "$ETH_RPC_URL"
+cast call "$ZONE_FACTORY" "zoneCount()(uint32)" --rpc-url "$ETH_RPC_URL"
+cast call "$ZONE_FACTORY" "verifier()(address)" --rpc-url "$ETH_RPC_URL"
+```
+
+`zoneCount()` should be `0` on a fresh deployment, and `verifier()` should return the verifier deployed by the factory constructor. Update `MODERATO_ZONE_FACTORY` in `xtask/src/zone_utils.rs`, the Key Addresses table above, and any other `rg` hits for the previous address.
+
+Current deployment:
+
+| Field | Value |
+|-------|-------|
+| Address | `0xC73b446C0768bc315Be7741D60B4e494E3ebc0dC` |
+| Transaction | `0xd2864f54ef14553fc083cde8a42b68bd75eaea56a7e5f6928ecf2db0205f9a28` |
+| Block | `19482946` |
+| Deployed | `2026-05-27 06:29:47 UTC` |
 
 ### Zone Node CLI Options
 
