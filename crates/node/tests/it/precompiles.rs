@@ -59,6 +59,10 @@ sol! {
         function bestAsk(address base) external view returns (uint128 price, uint128 quantity);
         function balanceOf(address user, address token) external view returns (uint128);
         function availableBalanceOf(address user, address token) external view returns (uint128);
+        function marketBuy(address base, uint128 amount, uint128 maxQuoteIn)
+            external returns (uint128 quoteSpent);
+        function marketSell(address base, uint128 amount, uint128 minQuoteOut)
+            external returns (uint128 quoteReceived);
 
         event OrderSubmitted(
             uint128 indexed orderId,
@@ -146,6 +150,78 @@ async fn test_darkpool_available_on_zone() -> eyre::Result<()> {
     assert!(
         !code.is_empty(),
         "Darkpool account must have marker bytecode so precompile storage writes persist"
+    );
+
+    Ok(())
+}
+
+/// A limit bid should pull missing quote escrow from the caller's zone wallet
+/// into the darkpool's internal balance.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_darkpool_place_pulls_zone_wallet_balance() -> eyre::Result<()> {
+    reth_tracing::init_test_tracing();
+
+    let (zone, mut fixture) = start_local_zone_with_fixture(20).await?;
+    zone.policy_cache()
+        .write()
+        .set_token_policy(ALPHA_USD_ADDRESS, 0, ALLOW_ALL_POLICY_ID);
+
+    let dev_signer = MnemonicBuilder::<English>::default()
+        .phrase(TEST_MNEMONIC)
+        .build()?;
+    let dev_address = dev_signer.address();
+    let provider = ProviderBuilder::new()
+        .wallet(dev_signer)
+        .connect_http(zone.http_url().clone());
+    let darkpool = TestDarkpoolOrderbook::new(DARKPOOL_ADDRESS, &provider);
+
+    let amount: u128 = 1_000_000;
+    let price: u128 = 1;
+    let initial_balance: u128 = 10_000_000;
+
+    fixture.inject_enabled_tokens(zone.deposit_queue(), vec![alpha_usd_enabled_token()]);
+    fixture.inject_deposits(
+        zone.deposit_queue(),
+        vec![fixture.make_deposit(PATH_USD_ADDRESS, dev_address, dev_address, initial_balance)],
+    );
+    zone.wait_for_balance(
+        PATH_USD_ADDRESS,
+        dev_address,
+        U256::from(initial_balance),
+        DEFAULT_TIMEOUT,
+    )
+    .await?;
+
+    let bid_pending = darkpool
+        .place(ALPHA_USD_ADDRESS, amount, price, true)
+        .gas_price(TEMPO_T0_BASE_FEE as u128)
+        .gas(4_000_000)
+        .send()
+        .await?;
+    fixture.inject_empty_block(zone.deposit_queue());
+    let bid_receipt = bid_pending.get_receipt().await?;
+    assert!(
+        bid_receipt.status(),
+        "bid should pull quote escrow from the zone wallet"
+    );
+
+    assert_eq!(
+        darkpool
+            .balanceOf(dev_address, PATH_USD_ADDRESS)
+            .from(dev_address)
+            .call()
+            .await?,
+        amount * price,
+        "pulled quote should be credited to the caller's internal balance"
+    );
+    assert_eq!(
+        darkpool
+            .availableBalanceOf(dev_address, PATH_USD_ADDRESS)
+            .from(dev_address)
+            .call()
+            .await?,
+        0,
+        "resting bid should reserve the pulled quote escrow"
     );
 
     Ok(())
@@ -529,6 +605,148 @@ async fn test_darkpool_self_crossing_limit_orders_fill() -> eyre::Result<()> {
             .await?,
         amount,
         "base from the filled self-cross should remain available internally"
+    );
+
+    Ok(())
+}
+
+/// Market orders should follow the same self-crossing semantics as limit
+/// orders: an owner may buy from their own ask or sell into their own bid.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_darkpool_self_crossing_market_orders_fill() -> eyre::Result<()> {
+    reth_tracing::init_test_tracing();
+
+    let (zone, mut fixture) = start_local_zone_with_fixture(20).await?;
+    zone.policy_cache()
+        .write()
+        .set_token_policy(ALPHA_USD_ADDRESS, 0, ALLOW_ALL_POLICY_ID);
+
+    let dev_signer = MnemonicBuilder::<English>::default()
+        .phrase(TEST_MNEMONIC)
+        .build()?;
+    let dev_address = dev_signer.address();
+    let provider = ProviderBuilder::new()
+        .wallet(dev_signer)
+        .connect_http(zone.http_url().clone());
+    let darkpool = TestDarkpoolOrderbook::new(DARKPOOL_ADDRESS, &provider);
+
+    let amount: u128 = 1_000_000;
+    let price: u128 = 1;
+    let path_balance: u128 = 10_000_000;
+    let alpha_balance: u128 = 2_000_000;
+
+    fixture.inject_enabled_tokens(zone.deposit_queue(), vec![alpha_usd_enabled_token()]);
+    fixture.inject_deposits(
+        zone.deposit_queue(),
+        vec![
+            fixture.make_deposit(PATH_USD_ADDRESS, dev_address, dev_address, path_balance),
+            fixture.make_deposit(ALPHA_USD_ADDRESS, dev_address, dev_address, alpha_balance),
+        ],
+    );
+    zone.wait_for_balance(
+        PATH_USD_ADDRESS,
+        dev_address,
+        U256::from(path_balance),
+        DEFAULT_TIMEOUT,
+    )
+    .await?;
+    zone.wait_for_balance(
+        ALPHA_USD_ADDRESS,
+        dev_address,
+        U256::from(alpha_balance),
+        DEFAULT_TIMEOUT,
+    )
+    .await?;
+
+    let ask_pending = darkpool
+        .place(ALPHA_USD_ADDRESS, amount, price, false)
+        .gas_price(TEMPO_T0_BASE_FEE as u128)
+        .gas(4_000_000)
+        .send()
+        .await?;
+    fixture.inject_empty_block(zone.deposit_queue());
+    assert!(
+        ask_pending.get_receipt().await?.status(),
+        "self-owned ask should rest"
+    );
+
+    let buy_pending = darkpool
+        .marketBuy(ALPHA_USD_ADDRESS, amount, amount * price)
+        .gas_price(TEMPO_T0_BASE_FEE as u128)
+        .gas(4_000_000)
+        .send()
+        .await?;
+    fixture.inject_empty_block(zone.deposit_queue());
+    let buy_receipt = buy_pending.get_receipt().await?;
+    assert!(
+        buy_receipt.status(),
+        "market buy should fill the caller's own ask"
+    );
+    let buy_fill = buy_receipt
+        .logs()
+        .iter()
+        .find_map(|log| TestDarkpoolOrderbook::OrderFilled::decode_log(&log.inner).ok())
+        .expect("self market buy should emit OrderFilled");
+    assert_eq!(buy_fill.orderId, 1);
+    assert_eq!(buy_fill.maker, dev_address);
+    assert_eq!(buy_fill.taker, dev_address);
+    assert_eq!(buy_fill.amountFilled, amount);
+    assert_eq!(buy_fill.price, price);
+    assert_eq!(darkpool.bestAsk(ALPHA_USD_ADDRESS).call().await?.price, 0);
+
+    let bid_pending = darkpool
+        .place(ALPHA_USD_ADDRESS, amount, price, true)
+        .gas_price(TEMPO_T0_BASE_FEE as u128)
+        .gas(4_000_000)
+        .send()
+        .await?;
+    fixture.inject_empty_block(zone.deposit_queue());
+    assert!(
+        bid_pending.get_receipt().await?.status(),
+        "self-owned bid should rest"
+    );
+
+    let sell_pending = darkpool
+        .marketSell(ALPHA_USD_ADDRESS, amount, amount * price)
+        .gas_price(TEMPO_T0_BASE_FEE as u128)
+        .gas(4_000_000)
+        .send()
+        .await?;
+    fixture.inject_empty_block(zone.deposit_queue());
+    let sell_receipt = sell_pending.get_receipt().await?;
+    assert!(
+        sell_receipt.status(),
+        "market sell should fill the caller's own bid"
+    );
+    let sell_fill = sell_receipt
+        .logs()
+        .iter()
+        .find_map(|log| TestDarkpoolOrderbook::OrderFilled::decode_log(&log.inner).ok())
+        .expect("self market sell should emit OrderFilled");
+    assert_eq!(sell_fill.orderId, 2);
+    assert_eq!(sell_fill.maker, dev_address);
+    assert_eq!(sell_fill.taker, dev_address);
+    assert_eq!(sell_fill.amountFilled, amount);
+    assert_eq!(sell_fill.price, price);
+    assert_eq!(darkpool.bestBid(ALPHA_USD_ADDRESS).call().await?.price, 0);
+
+    assert_eq!(
+        darkpool
+            .availableBalanceOf(dev_address, PATH_USD_ADDRESS)
+            .from(dev_address)
+            .call()
+            .await?,
+        amount,
+        "self market trades should leave quote available internally"
+    );
+    assert_eq!(
+        darkpool
+            .availableBalanceOf(dev_address, ALPHA_USD_ADDRESS)
+            .from(dev_address)
+            .call()
+            .await?,
+        amount,
+        "self market trades should leave base available internally"
     );
 
     Ok(())

@@ -311,7 +311,7 @@ impl DarkpoolOrderbook {
 
         let missing = required - available;
         let mut tip20 = TIP20Token::from_address(token)?;
-        tip20.system_transfer_from(user, self.address, U256::from(missing))?;
+        tip20.system_transfer_from(self.address, user, U256::from(missing))?;
         self.increment_balance(user, token, missing)
     }
 
@@ -356,7 +356,7 @@ impl DarkpoolOrderbook {
 
     pub fn deposit(&mut self, sender: Address, token: Address, amount: u128) -> PrecompileResult {
         let mut tip20 = try_storage!(TIP20Token::from_address(token));
-        try_storage!(tip20.system_transfer_from(sender, self.address, U256::from(amount),));
+        try_storage!(tip20.system_transfer_from(self.address, sender, U256::from(amount),));
         try_storage!(self.increment_balance(sender, token, amount));
         Ok(StorageCtx.success_output(Bytes::new()))
     }
@@ -816,9 +816,6 @@ impl DarkpoolOrderbook {
                 break;
             }
             let ask = self.orders[book.best_ask_id].read()?;
-            if ask.maker == taker {
-                break;
-            }
 
             let fill = remaining.min(ask.quantity);
             let quote_amount = U256::from(fill)
@@ -880,9 +877,6 @@ impl DarkpoolOrderbook {
                 break;
             }
             let bid = self.orders[book.best_bid_id].read()?;
-            if bid.maker == taker {
-                break;
-            }
 
             let fill = remaining.min(bid.quantity);
             let quote_amount = U256::from(fill)

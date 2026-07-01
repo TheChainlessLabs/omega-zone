@@ -123,9 +123,36 @@ send-deposit-encrypted amount="1000000" to="" memo="0x00000000000000000000000000
 zone-info identifier:
     cargo run -p tempo-xtask -- zone-info {{identifier}}
 
+[private]
+_build-zone-contracts:
+    #!/bin/bash
+    set -euo pipefail
+    echo "Building Solidity specs..."
+    if [[ -n "${SOLC:-}" ]]; then
+        (cd specs/ref-impls && forge build --skip test --use "$SOLC")
+    elif ! (cd specs/ref-impls && forge build --skip test); then
+        LOCAL_SOLC=$(command -v solc || true)
+        if [[ -z "$LOCAL_SOLC" ]]; then
+            echo "Error: forge could not build the Solidity specs and no local solc fallback was found." >&2
+            exit 1
+        fi
+        echo "Pinned solc installation failed; retrying with local compiler: $LOCAL_SOLC" >&2
+        (cd specs/ref-impls && forge build --skip test --use "$LOCAL_SOLC")
+    fi
+
+    ARTIFACT="specs/ref-impls/out/ZoneInbox.sol/ZoneInbox.json"
+    ADVANCE_TEMPO_SIGNATURE='advanceTempo(bytes,(uint8,bytes,bool)[],(bytes32,uint8,(bytes32,bytes32))[],(address,string,string,string)[])'
+    EXPECTED_SELECTOR=$(cast sig "$ADVANCE_TEMPO_SIGNATURE" | sed 's/^0x//')
+    ACTUAL_SELECTOR=$(jq -r --arg signature "$ADVANCE_TEMPO_SIGNATURE" '.methodIdentifiers[$signature] // empty' "$ARTIFACT")
+    if [[ "$ACTUAL_SELECTOR" != "$EXPECTED_SELECTOR" ]]; then
+        echo "Error: stale or incompatible ZoneInbox artifact: expected selector $EXPECTED_SELECTOR, got ${ACTUAL_SELECTOR:-missing}." >&2
+        exit 1
+    fi
+    echo "Validated ZoneInbox.advanceTempo selector: 0x$ACTUAL_SELECTOR"
+
 [group('zone')]
 [doc('Creates a new zone on L1 via ZoneFactory and generates genesis + zone.json in generated/<name>/. Optional second positional argument selects the initial TIP-20 enabled on the portal; defaults to pathUSD. Requires L1_RPC_URL, PRIVATE_KEY, and SEQUENCER_KEY env vars. Set ZONE_FACTORY to override the Moderato default.')]
-create-zone name token="":
+create-zone name token="": _build-zone-contracts
     #!/bin/bash
     set -euo pipefail
     PK="${PRIVATE_KEY:?Set PRIVATE_KEY env var}"
@@ -149,8 +176,6 @@ create-zone name token="":
     SEQUENCER_ADDR=$(cast wallet address "$SEQ_KEY")
     OUTPUT="generated/{{name}}"
     mkdir -p "$OUTPUT"
-    echo "Building Solidity specs..."
-    (cd specs/ref-impls && forge build --skip test) || true
     echo "Building xtask..."
     cargo build -p tempo-xtask
     echo "Creating zone '{{name}}' on L1 and generating genesis..."
@@ -178,7 +203,7 @@ create-zone name token="":
 
 [group('zone')]
 [doc('Deploys SwapAndDepositRouter on L1 for an existing zone and saves it to generated/<name>/zone.json. Requires L1_RPC_URL and PRIVATE_KEY env vars.')]
-deploy-router name dex="0xDEc0000000000000000000000000000000000000":
+deploy-router name dex="0xDEc0000000000000000000000000000000000000": _build-zone-contracts
     #!/bin/bash
     set -euo pipefail
     PK="${PRIVATE_KEY:?Set PRIVATE_KEY env var}"
@@ -190,8 +215,6 @@ deploy-router name dex="0xDEc0000000000000000000000000000000000000":
         echo "Error: $ZONE_JSON not found. Run 'just create-zone {{name}}' first." >&2
         exit 1
     fi
-    echo "Building Solidity specs..."
-    (cd specs/ref-impls && forge build --skip test) || true
     cargo run -p tempo-xtask -- deploy-router \
         --zone-dir "$ZONE_DIR" \
         --l1-rpc-url "$HTTP_RPC" \
@@ -254,7 +277,7 @@ zone-up name reset="false" profile="dev" args="":
     elif [[ "{{profile}}" != "dev" ]]; then
         PROFILE_FLAG="--profile {{profile}}"
     fi
-    cargo run $PROFILE_FLAG --bin tempo-zone -- \
+    SEQUENCER_KEY="$SEQ_KEY" cargo run $PROFILE_FLAG --bin tempo-zone -- \
                       node \
                       --chain "$GENESIS_JSON" \
                       --l1.rpc-url "${L1_RPC_URL:?Set L1_RPC_URL env var (wss://...)}" \
@@ -269,7 +292,6 @@ zone-up name reset="false" profile="dev" args="":
                       --datadir "$DATADIR" \
                       --log.file.directory "$DATADIR/logs" \
                       --sequencer \
-                      --sequencer-key "$SEQ_KEY" \
                       {{args}}
 
 [group('zone')]
@@ -729,7 +751,7 @@ check-balance-private name token="0x20C0000000000000000000000000000000000000" rp
 
 [group('zone')]
 [doc('End-to-end: generates a sequencer key, funds it on L1, creates a zone on-chain, generates genesis, and starts the zone node. Optional second positional argument selects the initial TIP-20 enabled on the portal; defaults to pathUSD. Requires L1_RPC_URL. Set ZONE_FACTORY to override the Moderato default.')]
-deploy-zone name token="":
+deploy-zone name token="": _build-zone-contracts
     #!/bin/bash
     set -euo pipefail
     L1_RPC="${L1_RPC_URL:?Set L1_RPC_URL env var (wss://...)}"
@@ -771,13 +793,8 @@ deploy-zone name token="":
     echo "  Funded! Check: https://explore.moderato.tempo.xyz/address/$SEQUENCER_ADDR"
     echo ""
 
-    # Step 3: Build Solidity specs
-    echo "Step 3: Building Solidity specs..."
-    (cd specs/ref-impls && forge build --skip test) || true
-    echo ""
-
-    # Step 4: Create zone on L1 and generate genesis
-    echo "Step 4: Creating zone on L1 via ZoneFactory..."
+    # Step 3: Create zone on L1 and generate genesis
+    echo "Step 3: Creating zone on L1 via ZoneFactory..."
     mkdir -p "$OUTPUT"
     cargo run -p tempo-xtask -- create-zone \
         --output "$OUTPUT" \
@@ -810,8 +827,8 @@ deploy-zone name token="":
     ZONE_ID=$(jq -r '.zoneId' "$OUTPUT/zone.json")
     ANCHOR_BLOCK=$(jq -r '.tempoAnchorBlock' "$OUTPUT/zone.json")
 
-    # Step 5: Register sequencer encryption key on the portal
-    echo "Step 5: Registering sequencer encryption key on ZonePortal..."
+    # Step 4: Register sequencer encryption key on the portal
+    echo "Step 4: Registering sequencer encryption key on ZonePortal..."
     cargo run -p tempo-xtask -- set-encryption-key \
         --l1-rpc-url "$HTTP_RPC" \
         --portal "$PORTAL" \
