@@ -1,6 +1,7 @@
 use alloy_primitives::{Address, B256, hex, keccak256};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::auth::eip712;
 use crate::error::AuthError;
 
 /// Magic prefix: "TempoZoneRPC" left-padded to 32 bytes.
@@ -16,7 +17,7 @@ const TEMPO_ZONE_RPC_MAGIC: [u8; 32] = {
 };
 
 /// Size of the fixed token fields (version + zoneId + chainId + issuedAt + expiresAt).
-const TOKEN_FIELDS_LEN: usize = 1 + 4 + 8 + 8 + 8; // 29 bytes
+pub const TOKEN_FIELDS_LEN: usize = 1 + 4 + 8 + 8 + 8; // 29 bytes
 
 /// HTTP header name for the authorization token.
 pub const X_AUTHORIZATION_TOKEN: &str = "x-authorization-token";
@@ -27,6 +28,10 @@ pub const DEFAULT_MAX_AUTH_TOKEN_VALIDITY_SECS: u64 = 2_592_000;
 /// Protocol default maximum validity window for authorization tokens.
 pub const DEFAULT_MAX_AUTH_TOKEN_VALIDITY: Duration =
     Duration::from_secs(DEFAULT_MAX_AUTH_TOKEN_VALIDITY_SECS);
+
+/// Token format versions.
+const VERSION_RAW: u8 = 0;
+const VERSION_EIP712: u8 = 1;
 
 /// The authenticated caller context extracted from a valid authorization token.
 #[derive(Debug, Clone)]
@@ -41,13 +46,18 @@ pub struct AuthContext {
 
 /// Parsed authorization token fields (before signature verification).
 ///
-/// The token is a hex-encoded blob: `<signature><version:1><zoneId:4><chainId:8><issuedAt:8><expiresAt:8>`.
+/// The token is a hex-encoded blob: `<signature><version:1 byte><zoneId:4><chainId:8><issuedAt:8><expiresAt:8>`.
 /// The last 29 bytes are always the fixed fields; everything before is the variable-length signature.
 ///
-/// See `docs/pages/protocol/privacy/rpc.md` — "Transport" and "Message" sections.
+/// `version == 0` is the original raw-digest scheme:
+/// `digest = keccak256("TempoZoneRPC" || fields)`.
+///
+/// `version == 1` is the EIP-712 scheme:
+/// `digest = keccak256(0x19 0x01 || domainSeparator(chainId) || structHash(zoneId, issuedAt, expiresAt))`
+/// with `domain.name = "TempoZoneRPC"`, `domain.version = "1"`.
 #[derive(Debug, Clone)]
 pub struct AuthorizationToken {
-    /// Spec version (must be 0).
+    /// Spec version (0 = raw digest, 1 = EIP-712).
     pub version: u8,
     /// Zone ID (0 = unscoped, valid for any zone).
     pub zone_id: u32,
@@ -59,7 +69,7 @@ pub struct AuthorizationToken {
     pub expires_at: u64,
     /// The raw signature bytes (everything before the last 29 bytes).
     pub signature: Vec<u8>,
-    /// The signing digest (keccak256 of the packed message).
+    /// The signing digest for the selected token version.
     pub digest: B256,
 }
 
@@ -83,15 +93,20 @@ impl AuthorizationToken {
         let issued_at = u64::from_be_bytes(fields[13..21].try_into().unwrap());
         let expires_at = u64::from_be_bytes(fields[21..29].try_into().unwrap());
 
-        // Build the signing digest
-        let mut msg = Vec::with_capacity(32 + TOKEN_FIELDS_LEN);
-        msg.extend_from_slice(&TEMPO_ZONE_RPC_MAGIC);
-        msg.push(version);
-        msg.extend_from_slice(&zone_id.to_be_bytes());
-        msg.extend_from_slice(&chain_id.to_be_bytes());
-        msg.extend_from_slice(&issued_at.to_be_bytes());
-        msg.extend_from_slice(&expires_at.to_be_bytes());
-        let digest = keccak256(&msg);
+        let digest = match version {
+            VERSION_RAW => {
+                let mut msg = Vec::with_capacity(32 + TOKEN_FIELDS_LEN);
+                msg.extend_from_slice(&TEMPO_ZONE_RPC_MAGIC);
+                msg.push(version);
+                msg.extend_from_slice(&zone_id.to_be_bytes());
+                msg.extend_from_slice(&chain_id.to_be_bytes());
+                msg.extend_from_slice(&issued_at.to_be_bytes());
+                msg.extend_from_slice(&expires_at.to_be_bytes());
+                keccak256(&msg)
+            }
+            VERSION_EIP712 => eip712::digest(zone_id, chain_id, issued_at, expires_at),
+            _ => B256::ZERO,
+        };
 
         Ok(Self {
             version,
@@ -123,7 +138,7 @@ impl AuthorizationToken {
         expected_chain_id: u64,
         max_auth_token_validity: Duration,
     ) -> Result<(), AuthError> {
-        if self.version != 0 {
+        if self.version != VERSION_RAW && self.version != VERSION_EIP712 {
             return Err(AuthError::UnsupportedVersion(self.version));
         }
         if self.zone_id != 0 && self.zone_id != expected_zone_id {
@@ -152,7 +167,7 @@ impl AuthorizationToken {
     }
 }
 
-/// Build the unsigned token fields and their signing digest.
+/// Build the unsigned token fields and their signing digest for `version == 0`.
 ///
 /// Returns `(fields, digest)` where `fields` is the 29-byte suffix
 /// and `digest` is the keccak256 hash to be signed.
@@ -165,7 +180,7 @@ pub fn build_token_fields(
     expires_at: u64,
 ) -> ([u8; TOKEN_FIELDS_LEN], B256) {
     let mut fields = [0u8; TOKEN_FIELDS_LEN];
-    fields[0] = 0; // version
+    fields[0] = VERSION_RAW;
     fields[1..5].copy_from_slice(&zone_id.to_be_bytes());
     fields[5..13].copy_from_slice(&chain_id.to_be_bytes());
     fields[13..21].copy_from_slice(&issued_at.to_be_bytes());
@@ -175,6 +190,28 @@ pub fn build_token_fields(
     msg.extend_from_slice(&TEMPO_ZONE_RPC_MAGIC);
     msg.extend_from_slice(&fields);
     let digest = keccak256(&msg);
+
+    (fields, digest)
+}
+
+/// Build the unsigned token fields and EIP-712 digest for `version == 1`.
+///
+/// Returns `(fields, digest)` where `fields` is the 29-byte suffix
+/// and `digest` is the EIP-712 hash to be signed.
+pub fn build_eip712_token_fields(
+    zone_id: u32,
+    chain_id: u64,
+    issued_at: u64,
+    expires_at: u64,
+) -> ([u8; TOKEN_FIELDS_LEN], B256) {
+    let mut fields = [0u8; TOKEN_FIELDS_LEN];
+    fields[0] = VERSION_EIP712;
+    fields[1..5].copy_from_slice(&zone_id.to_be_bytes());
+    fields[5..13].copy_from_slice(&chain_id.to_be_bytes());
+    fields[13..21].copy_from_slice(&issued_at.to_be_bytes());
+    fields[21..29].copy_from_slice(&expires_at.to_be_bytes());
+
+    let digest = eip712::digest(zone_id, chain_id, issued_at, expires_at);
 
     (fields, digest)
 }

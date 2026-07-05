@@ -9,7 +9,7 @@ use p256::ecdsa::SigningKey as P256SigningKey;
 use rand::thread_rng;
 use tempo_primitives::transaction::tt_signature::TempoSignature;
 use zone_node::rpc::{
-    auth::{AuthorizationToken, build_token_fields},
+    auth::{AuthorizationToken, build_eip712_token_fields, build_token_fields},
     types::{MethodTier, classify_method},
 };
 
@@ -27,6 +27,18 @@ fn build_token_blob(
     let (mut fields, _digest) = build_token_fields(zone_id, chain_id, issued_at, expires_at);
     fields[0] = version;
     let mut blob = vec![0u8; 65]; // fake secp256k1 sig
+    blob.extend_from_slice(&fields);
+    blob
+}
+
+fn build_eip712_token_blob(
+    zone_id: u32,
+    chain_id: u64,
+    issued_at: u64,
+    expires_at: u64,
+) -> Vec<u8> {
+    let (fields, _digest) = build_eip712_token_fields(zone_id, chain_id, issued_at, expires_at);
+    let mut blob = vec![0u8; 65];
     blob.extend_from_slice(&fields);
     blob
 }
@@ -110,7 +122,7 @@ fn validate_accepts_valid_token() {
 #[test]
 fn validate_rejects_wrong_version() {
     let now = now_secs();
-    let token = make_test_token(1, 42, 1337, now, now + 600);
+    let token = make_test_token(2, 42, 1337, now, now + 600);
     assert!(token.validate(42, 1337).is_err());
 }
 
@@ -157,6 +169,81 @@ fn validate_rejects_issued_at_far_future() {
     // issuedAt is 200s in the future (> 60s max skew)
     let token = make_test_token(0, 42, 1337, now + 200, now + 800);
     assert!(token.validate(42, 1337).is_err());
+}
+
+#[tokio::test]
+async fn eip712_token_validates_against_zone_and_chain() {
+    use alloy::signers::{Signer, local::PrivateKeySigner};
+
+    let signer = PrivateKeySigner::random();
+    let now = now_secs();
+    let zone_id = 42u32;
+    let chain_id = 1337u64;
+    let expires_at = now + 600;
+
+    let (fields, digest) = build_eip712_token_fields(zone_id, chain_id, now, expires_at);
+    let sig = signer.sign_hash(&digest).await.unwrap();
+
+    let mut sig_bytes = Vec::with_capacity(65);
+    sig_bytes.extend_from_slice(&sig.r().to_be_bytes::<32>());
+    sig_bytes.extend_from_slice(&sig.s().to_be_bytes::<32>());
+    sig_bytes.push(sig.v() as u8);
+
+    let mut blob = sig_bytes;
+    blob.extend_from_slice(&fields);
+    let token = AuthorizationToken::parse(&blob).unwrap();
+
+    assert_eq!(token.version, 1);
+    assert_eq!(token.zone_id, zone_id);
+    assert_eq!(token.chain_id, chain_id);
+    assert_eq!(token.digest, digest);
+    assert!(token.validate(zone_id, chain_id).is_ok());
+    assert!(token.validate(zone_id, chain_id + 1).is_err());
+    assert!(token.validate(zone_id + 1, chain_id).is_err());
+
+    let parsed_sig = TempoSignature::from_bytes(&token.signature).unwrap();
+    assert_eq!(
+        parsed_sig.recover_signer(&token.digest).unwrap(),
+        signer.address()
+    );
+}
+
+#[test]
+fn eip712_webauthn_token_recovers_signer() {
+    let signing_key = P256SigningKey::random(&mut thread_rng());
+    let now = now_secs();
+    let zone_id = 42u32;
+    let chain_id = 1337u64;
+    let expires_at = now + 600;
+    let (fields, digest) = build_eip712_token_fields(zone_id, chain_id, now, expires_at);
+    let signature =
+        sign_webauthn_signature(&signing_key, digest).expect("webauthn signing should succeed");
+    let expected = signature
+        .recover_signer(&digest)
+        .expect("webauthn recovery should succeed");
+    let blob = build_signed_token_blob(signature, &fields);
+    let token = AuthorizationToken::parse(&blob).unwrap();
+    let parsed = TempoSignature::from_bytes(&token.signature).unwrap();
+
+    assert_eq!(token.version, 1);
+    assert_eq!(token.digest, digest);
+    assert_eq!(parsed.recover_signer(&token.digest).unwrap(), expected);
+}
+
+#[test]
+fn eip712_token_rejects_zone_id_mismatch() {
+    let now = now_secs();
+    let blob = build_eip712_token_blob(42, 1337, now, now + 600);
+    let token = AuthorizationToken::parse(&blob).unwrap();
+    assert!(token.validate(99, 1337).is_err());
+}
+
+#[test]
+fn eip712_token_rejects_expired() {
+    let now = now_secs();
+    let blob = build_eip712_token_blob(1, 1, now - 700, now - 100);
+    let token = AuthorizationToken::parse(&blob).unwrap();
+    assert!(token.validate(1, 1).is_err());
 }
 
 #[tokio::test]

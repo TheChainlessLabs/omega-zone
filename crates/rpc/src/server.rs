@@ -319,12 +319,14 @@ mod tests {
     use super::authenticate_token;
     use crate::{
         PrivateRpcConfig,
-        auth::build_token_fields,
+        auth::{build_eip712_token_fields, build_token_fields},
         error::AuthenticateError,
         handlers::ZoneRpcApi,
         types::{BoxEyreFut, BoxFut, JsonRpcError},
     };
     use alloy_primitives::{Address, Bytes};
+    use alloy_signer::SignerSync;
+    use alloy_signer_local::PrivateKeySigner;
     use axum::http::StatusCode;
     use p256::ecdsa::SigningKey as P256SigningKey;
     use parking_lot::Mutex;
@@ -491,6 +493,32 @@ mod tests {
             AuthenticateError::Invalid(crate::auth::AuthError::WindowTooLarge)
         ));
         assert_eq!(err.status_code(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn eip712_tokens_are_accepted() {
+        let signer = PrivateKeySigner::random();
+        let now = now_secs();
+        let expires_at = now + 600;
+        let (fields, digest) = build_eip712_token_fields(ZONE_ID, CHAIN_ID, now, expires_at);
+        let sig = signer.sign_hash_sync(&digest).unwrap();
+
+        let mut blob = Vec::with_capacity(65 + fields.len());
+        blob.extend_from_slice(&sig.r().to_be_bytes::<32>());
+        blob.extend_from_slice(&sig.s().to_be_bytes::<32>());
+        blob.push(sig.v() as u8);
+        blob.extend_from_slice(&fields);
+        let token = alloy_primitives::hex::encode(blob);
+        let api = TestApi {
+            key_infos: Mutex::new(HashMap::new()),
+        };
+
+        let auth = authenticate_token(&token, &test_config(), &api)
+            .await
+            .expect("eip712 token should authenticate");
+        assert_eq!(auth.caller, signer.address());
+        assert_eq!(auth.expires_at, expires_at);
+        assert!(auth.keychain_key_id.is_none());
     }
 
     #[tokio::test]
