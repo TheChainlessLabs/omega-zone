@@ -77,6 +77,8 @@ use crate::midpoint::{
 
 type RpcBlock = Block<alloy_rpc_types_eth::Transaction<TempoTxEnvelope>, TempoHeaderResponse>;
 const FILTER_OWNER_PRUNE_INTERVAL: Duration = Duration::from_secs(60);
+/// Keep L1 log requests comfortably below public-provider block-range limits.
+const L1_BATCH_LOG_QUERY_MAX_BLOCKS: u64 = 50_000;
 
 /// Canonical alpha-launch market constants.
 ///
@@ -504,15 +506,9 @@ impl<Api: EthApiTypes + 'static> ZoneRpc<Api> {
         &self,
         batch_number: u64,
     ) -> Result<Option<alloy_rpc_types_eth::Log>, JsonRpcError> {
-        if self.config.zone_portal.is_zero() {
-            return Err(JsonRpcError::internal("zone portal not configured"));
-        }
-        let filter = Filter::new()
-            .address(self.config.zone_portal)
-            .event_signature(ZonePortal::BatchSubmitted::SIGNATURE_HASH)
-            .topic1(batch_number_topic(batch_number))
-            .from_block(0);
-        let logs = self.l1_provider.get_logs(&filter).await.map_err(internal)?;
+        let logs = self
+            .fetch_batch_logs_by_topics(&[batch_number_topic(batch_number)])
+            .await?;
         Ok(logs.into_iter().next())
     }
 
@@ -529,12 +525,68 @@ impl<Api: EthApiTypes + 'static> ZoneRpc<Api> {
             return Ok(Vec::new());
         }
         let topics: Vec<B256> = (start..=end).map(batch_number_topic).collect();
-        let filter = Filter::new()
-            .address(self.config.zone_portal)
-            .event_signature(ZonePortal::BatchSubmitted::SIGNATURE_HASH)
-            .topic1(topics)
-            .from_block(0);
-        let mut logs = self.l1_provider.get_logs(&filter).await.map_err(internal)?;
+        self.fetch_batch_logs_by_topics(&topics).await
+    }
+
+    /// Fetch the requested `BatchSubmitted` topics without issuing an unbounded
+    /// `eth_getLogs` request. Public L1 providers cap the block span even when
+    /// indexed topics are supplied, so scan backwards from the current tip in
+    /// bounded windows and stop once every requested batch has been found.
+    async fn fetch_batch_logs_by_topics(
+        &self,
+        topics: &[B256],
+    ) -> Result<Vec<alloy_rpc_types_eth::Log>, JsonRpcError> {
+        if self.config.zone_portal.is_zero() {
+            return Err(JsonRpcError::internal("zone portal not configured"));
+        }
+        if topics.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let portal = ZonePortal::new(self.config.zone_portal, self.l1_provider.clone());
+        let (genesis_block, latest_block) = tokio::try_join!(
+            async {
+                portal
+                    .genesisTempoBlockNumber()
+                    .call()
+                    .await
+                    .map_err(internal)
+            },
+            async { self.l1_provider.get_block_number().await.map_err(internal) },
+        )?;
+        if latest_block < genesis_block {
+            return Ok(Vec::new());
+        }
+
+        let requested = topics.iter().copied().collect::<HashSet<_>>();
+        let mut found = HashSet::with_capacity(requested.len());
+        let mut logs = Vec::with_capacity(requested.len());
+
+        for (from_block, to_block) in reverse_inclusive_block_ranges(
+            genesis_block,
+            latest_block,
+            L1_BATCH_LOG_QUERY_MAX_BLOCKS,
+        ) {
+            let filter = Filter::new()
+                .address(self.config.zone_portal)
+                .event_signature(ZonePortal::BatchSubmitted::SIGNATURE_HASH)
+                .topic1(topics.to_vec())
+                .from_block(from_block)
+                .to_block(to_block);
+            let chunk = self.l1_provider.get_logs(&filter).await.map_err(internal)?;
+            for log in chunk {
+                if let Some(topic) = log.topics().get(1)
+                    && requested.contains(topic)
+                    && found.insert(*topic)
+                {
+                    logs.push(log);
+                }
+            }
+            if found.len() == requested.len() {
+                break;
+            }
+        }
+
         logs.sort_by_key(|log| log_batch_index(log).unwrap_or(0));
         Ok(logs)
     }
@@ -780,12 +832,9 @@ impl<Api: EthApiTypes + 'static> ZoneRpc<Api> {
             return Ok(None);
         }
 
-        let filter = Filter::new()
-            .address(self.config.zone_portal)
-            .from_block(0)
-            .event_signature(ZonePortal::BatchSubmitted::SIGNATURE_HASH)
-            .topic1(B256::from(U256::from(withdrawal_batch_index)));
-        let logs = self.l1_provider.get_logs(&filter).await.map_err(internal)?;
+        let logs = self
+            .fetch_batch_logs_by_topics(&[batch_number_topic(withdrawal_batch_index)])
+            .await?;
 
         for log in logs {
             let event = ZonePortal::BatchSubmitted::decode_log(&log.inner)
@@ -2287,6 +2336,26 @@ fn log_batch_index(log: &alloy_rpc_types_eth::Log) -> Option<u64> {
     Some(u64::from_be_bytes(arr))
 }
 
+/// Split `[first, last]` into non-overlapping inclusive ranges ordered newest
+/// first. Every range contains at most `max_blocks` blocks.
+fn reverse_inclusive_block_ranges(first: u64, last: u64, max_blocks: u64) -> Vec<(u64, u64)> {
+    if last < first || max_blocks == 0 {
+        return Vec::new();
+    }
+
+    let mut ranges = Vec::new();
+    let mut end = last;
+    loop {
+        let start = end.saturating_sub(max_blocks.saturating_sub(1)).max(first);
+        ranges.push((start, end));
+        if start == first {
+            break;
+        }
+        end = start - 1;
+    }
+    ranges
+}
+
 /// Pure mapping: `BatchSubmitted` event + decoded `submitBatch` calldata +
 /// timing data + precomputed darkpool aggregates → aggregate-only
 /// [`BatchSummary`].
@@ -3032,6 +3101,24 @@ mod tests {
             verifierConfig: Default::default(),
             proof: Default::default(),
         }
+    }
+
+    #[test]
+    fn batch_log_ranges_are_bounded_newest_first_without_gaps() {
+        assert_eq!(
+            reverse_inclusive_block_ranges(100, 349, 100),
+            vec![(250, 349), (150, 249), (100, 149)]
+        );
+    }
+
+    #[test]
+    fn batch_log_ranges_handle_short_empty_and_invalid_spans() {
+        assert_eq!(
+            reverse_inclusive_block_ranges(24798757, 24799061, 50_000),
+            vec![(24798757, 24799061)]
+        );
+        assert!(reverse_inclusive_block_ranges(2, 1, 50_000).is_empty());
+        assert!(reverse_inclusive_block_ranges(1, 2, 0).is_empty());
     }
 
     #[test]
