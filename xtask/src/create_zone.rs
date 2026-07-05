@@ -152,7 +152,16 @@ impl CreateZone {
             "Creating zone on L1 via ZoneFactory at {}...",
             self.zone_factory
         );
-        let receipt = factory.createZone(params).send_sync().await?;
+        let receipt = factory
+            .createZone(params)
+            .send_sync()
+            .await
+            .wrap_err_with(|| {
+                format!(
+                    "failed to create zone through ZoneFactory {} (it must support the admin-aware createZone ABI)",
+                    self.zone_factory
+                )
+            })?;
         println!("Transaction confirmed in block {:?}", receipt.block_number);
         println!("Status: {}", receipt.status());
         println!("Gas used: {:?}", receipt.gas_used);
