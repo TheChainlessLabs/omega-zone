@@ -380,6 +380,15 @@ pub trait BatchProofProvider: Send + Sync + std::fmt::Debug {
     /// Short tag used in logs and diagnostics.
     fn name(&self) -> &'static str;
 
+    /// Whether ancestry mode may skip local header-chain validation.
+    ///
+    /// This is unsafe for real proof providers. It exists only for the legacy
+    /// empty-proof mode used with permissive development verifiers, where the
+    /// collected headers are not included in either verifier payload.
+    fn allows_unverified_ancestry(&self) -> bool {
+        false
+    }
+
     /// Produce the verifier config and proof bytes for a single batch.
     fn build_proof<'a>(&'a self, inputs: &'a BatchPublicInputs) -> ProofFuture<'a>;
 }
@@ -414,6 +423,10 @@ pub struct EmptyLegacyProofProvider;
 impl BatchProofProvider for EmptyLegacyProofProvider {
     fn name(&self) -> &'static str {
         "empty-legacy"
+    }
+
+    fn allows_unverified_ancestry(&self) -> bool {
+        true
     }
 
     fn build_proof<'a>(&'a self, inputs: &'a BatchPublicInputs) -> ProofFuture<'a> {
@@ -1119,6 +1132,7 @@ mod tests {
     #[tokio::test]
     async fn fail_fast_provider_errors_with_no_backend_configured() {
         let provider = FailFastProofProvider;
+        assert!(!provider.allows_unverified_ancestry());
         let err = provider
             .build_proof(&sample_inputs())
             .await
@@ -1134,6 +1148,7 @@ mod tests {
     #[tokio::test]
     async fn empty_legacy_provider_returns_empty_payload() {
         let provider = EmptyLegacyProofProvider;
+        assert!(provider.allows_unverified_ancestry());
         let payload = provider.build_proof(&sample_inputs()).await.unwrap();
         assert_eq!(payload, TeeProofPayload::empty_legacy());
     }

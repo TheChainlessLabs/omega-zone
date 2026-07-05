@@ -572,9 +572,18 @@ impl BatchSubmitter {
         }
 
         let anchor_block = current_l1_block.saturating_sub(self.anchor_config.safety_margin());
-        let ancestry_headers = self
-            .fetch_ancestry_headers(tempo_block_number, anchor_block)
-            .await?;
+        let ancestry_headers = if self.proof_provider.allows_unverified_ancestry() {
+            warn!(
+                proof_provider = self.proof_provider.name(),
+                tempo_block_number,
+                anchor_block,
+                "Skipping local ancestry-header validation for permissive proof provider"
+            );
+            Vec::new()
+        } else {
+            self.fetch_ancestry_headers(tempo_block_number, anchor_block)
+                .await?
+        };
 
         warn!(
             tempo_block_number,
