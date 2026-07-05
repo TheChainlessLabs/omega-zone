@@ -91,7 +91,7 @@ pub(crate) struct CreateZone {
     rpc_url: String,
 
     /// Private key (hex) for signing the createZone transaction on L1.
-    #[arg(long)]
+    #[arg(long, env = "PRIVATE_KEY", hide_env_values = true)]
     private_key: String,
 
     /// Base fee per gas for the zone L2.

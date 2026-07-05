@@ -139,7 +139,7 @@ pub struct ZoneArgs {
     pub block_interval_ms: u64,
 
     /// Sequencer private key (hex, with or without 0x prefix).
-    #[arg(long = "sequencer-key", env = "SEQUENCER_KEY")]
+    #[arg(long = "sequencer-key", env = "SEQUENCER_KEY", hide_env_values = true)]
     pub sequencer_key: String,
 
     /// How often (in seconds) the zone monitor polls for new L2 blocks.

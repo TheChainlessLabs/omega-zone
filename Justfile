@@ -180,12 +180,11 @@ create-zone name token="": _build-zone-contracts
     cargo build -p tempo-xtask
     echo "Creating zone '{{name}}' on L1 and generating genesis..."
     echo "Initial portal token: $ZONE_TOKEN_L1"
-    cargo run -p tempo-xtask -- create-zone \
+    PRIVATE_KEY="$PK" cargo run -p tempo-xtask -- create-zone \
         --output "$OUTPUT" \
         --l1-rpc-url "$HTTP_RPC" \
         --initial-token "$ZONE_TOKEN_L1" \
-        --sequencer "$SEQUENCER_ADDR" \
-        --private-key "$PK"
+        --sequencer "$SEQUENCER_ADDR"
     GENESIS_JSON="$OUTPUT/genesis.json"
     TMP_GENESIS="$(mktemp)"
     jq '.config += {
@@ -244,7 +243,7 @@ demo-swap-and-deposit name amount="100000000" tick="0" rpc=zone_rpc:
         --tick "{{tick}}"
 
 [group('zone')]
-[doc('Starts a Tempo Zone L2 node, subscribing to L1 deposits. Pass the zone name used in create-zone. Use profile=release for production.')]
+[doc('Starts a Tempo Zone L2 node with persistent state under generated/<name>/data. Set ZONE_DATADIR to override. Use profile=release for production.')]
 zone-up name reset="false" profile="dev" args="":
     #!/bin/bash
     set -euo pipefail
@@ -267,7 +266,7 @@ zone-up name reset="false" profile="dev" args="":
         echo "Error: SEQUENCER_KEY env var not set and not found in $ZONE_JSON" >&2
         exit 1
     fi
-    DATADIR="/tmp/tempo-zone-{{name}}"
+    DATADIR="${ZONE_DATADIR:-$ZONE_DIR/data}"
     if [[ "{{reset}}" = "true" ]]; then
         rm -rf "$DATADIR" || true
     fi
@@ -292,7 +291,6 @@ zone-up name reset="false" profile="dev" args="":
                       --datadir "$DATADIR" \
                       --log.file.directory "$DATADIR/logs" \
                       --sequencer \
-                      --sequencer-key "$SEQ_KEY" \
                       {{args}}
 
 [group('zone')]
@@ -797,12 +795,11 @@ deploy-zone name token="": _build-zone-contracts
     # Step 3: Create zone on L1 and generate genesis
     echo "Step 3: Creating zone on L1 via ZoneFactory..."
     mkdir -p "$OUTPUT"
-    cargo run -p tempo-xtask -- create-zone \
+    PRIVATE_KEY="$SEQUENCER_KEY" cargo run -p tempo-xtask -- create-zone \
         --output "$OUTPUT" \
         --l1-rpc-url "$HTTP_RPC" \
         --initial-token "$ZONE_TOKEN_L1" \
-        --sequencer "$SEQUENCER_ADDR" \
-        --private-key "$SEQUENCER_KEY"
+        --sequencer "$SEQUENCER_ADDR"
     GENESIS_JSON="$OUTPUT/genesis.json"
     TMP_GENESIS="$(mktemp)"
     jq '.config += {
@@ -830,10 +827,9 @@ deploy-zone name token="": _build-zone-contracts
 
     # Step 4: Register sequencer encryption key on the portal
     echo "Step 4: Registering sequencer encryption key on ZonePortal..."
-    cargo run -p tempo-xtask -- set-encryption-key \
+    PRIVATE_KEY="$SEQUENCER_KEY" cargo run -p tempo-xtask -- set-encryption-key \
         --l1-rpc-url "$HTTP_RPC" \
-        --portal "$PORTAL" \
-        --private-key "$SEQUENCER_KEY"
+        --portal "$PORTAL"
     echo ""
 
     # Step 6: Display summary
@@ -861,9 +857,9 @@ deploy-zone name token="": _build-zone-contracts
     echo "Step 7: Building and starting zone node (release)..."
     echo ""
     cargo build --bin tempo-zone --release
-    DATADIR="/tmp/tempo-zone-{{name}}"
+    DATADIR="${ZONE_DATADIR:-$OUTPUT/data}"
     rm -rf "$DATADIR" || true
-    exec cargo run --release --bin tempo-zone -- \
+    SEQUENCER_KEY="$SEQUENCER_KEY" exec cargo run --release --bin tempo-zone -- \
                       node \
                       --chain "$OUTPUT/genesis.json" \
                       --l1.rpc-url "$L1_RPC" \
@@ -877,8 +873,7 @@ deploy-zone name token="": _build-zone-contracts
                       --http.api all \
                       --datadir "$DATADIR" \
                       --log.file.directory "$DATADIR/logs" \
-                      --sequencer \
-                      --sequencer-key "$SEQUENCER_KEY"
+                      --sequencer
 
 [group('zone')]
 [doc('Spam deposit transactions to measure portal throughput. Requires L1_RPC_URL, L1_PORTAL_ADDRESS, and PRIVATE_KEY env vars. Example: just spam-deposits 10 10 200000 1 (10 txs, 10 per block, 200000 amount, encrypted)')]
