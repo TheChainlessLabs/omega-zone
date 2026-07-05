@@ -17,7 +17,7 @@ use alloy::{
 };
 use alloy_provider::ProviderBuilder;
 use alloy_signer_local::{MnemonicBuilder, coins_bip39::English};
-use alloy_sol_types::SolCall;
+use alloy_sol_types::{SolCall, sol};
 use futures::{SinkExt, StreamExt};
 use p256::ecdsa::SigningKey as P256SigningKey;
 use rand::thread_rng;
@@ -35,6 +35,15 @@ use tokio_tungstenite::{
     connect_async,
     tungstenite::{Message, client::IntoClientRequest},
 };
+use zone_l1::EnabledToken;
+use zone_precompiles::DARKPOOL_ADDRESS;
+
+sol! {
+    #[sol(rpc)]
+    contract DarkpoolRegistry {
+        function createPair(address base) external returns (bytes32);
+    }
+}
 
 fn corrupt_token_hex(token: &str) -> String {
     let mut bytes = hex::decode(token).expect("token hex should decode");
@@ -137,6 +146,90 @@ async fn ws_collect_messages_until_quiet(
             Ok(Some(Err(err))) => return Err(err.into()),
         }
     }
+}
+
+/// Market RPCs discover pairs from the darkpool registry instead of an
+/// RPC-local address allowlist.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_market_rpcs_follow_darkpool_pair_registry() -> eyre::Result<()> {
+    reth_tracing::init_test_tracing();
+
+    let mut ctx = start_zone_with_private_rpc().await?;
+    let base = address!("0x20C0000000000000000000000000000000000001");
+    let quote = PATH_USD_ADDRESS;
+    let signer = MnemonicBuilder::<English>::default()
+        .phrase(TEST_MNEMONIC)
+        .build()?;
+    let signer_address = signer.address();
+    ctx.fixture.inject_enabled_tokens(
+        ctx.zone.deposit_queue(),
+        vec![EnabledToken {
+            token: base,
+            name: "Alpha USD".to_string(),
+            symbol: "ALPHAUSD".to_string(),
+            currency: "USD".to_string(),
+        }],
+    );
+    ctx.inject_deposit(quote, signer_address, signer_address, 1_000_000)
+        .await?;
+    let provider = ProviderBuilder::new()
+        .wallet(signer)
+        .connect_http(ctx.zone.http_url().clone());
+    let darkpool = DarkpoolRegistry::new(DARKPOOL_ADDRESS, &provider);
+    let pending = darkpool
+        .createPair(base)
+        .gas_price(TEMPO_T0_BASE_FEE as u128)
+        .gas(1_000_000)
+        .send()
+        .await?;
+    ctx.fixture.inject_empty_block(ctx.zone.deposit_queue());
+    assert!(
+        pending.get_receipt().await?.status(),
+        "pair creation should succeed"
+    );
+
+    let config = ctx
+        .call_as_sequencer("zone_getMarketConfig", json!([]))
+        .await?;
+    let markets = config["result"]["markets"]
+        .as_array()
+        .expect("market config should return an array");
+    assert_eq!(markets.len(), 1);
+    assert_eq!(markets[0]["base"]["address"], format!("{base:#x}"));
+    assert_eq!(markets[0]["quote"]["address"], format!("{quote:#x}"));
+
+    for method in [
+        "zone_getTopOfBook",
+        "zone_getMidpointHistory",
+        "zone_getReferencePrice",
+    ] {
+        let mut params = vec![json!({ "base": base, "quote": quote })];
+        if method == "zone_getMidpointHistory" {
+            params.extend([json!("1m"), json!(50)]);
+        }
+        let response = ctx.call_as_sequencer(method, json!(params)).await?;
+        assert!(
+            response.get("error").is_none(),
+            "registered market should be accepted by {method}: {response}",
+        );
+        assert_eq!(response["result"]["base"], format!("{base:#x}"));
+        assert_eq!(response["result"]["quote"], format!("{quote:#x}"));
+    }
+
+    let missing = ctx
+        .call_as_sequencer(
+            "zone_getTopOfBook",
+            json!([{ "base": Address::repeat_byte(0x42), "quote": quote }]),
+        )
+        .await?;
+    assert_eq!(missing["error"]["code"], -32602);
+    assert!(
+        missing["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("does not exist in the darkpool"))
+    );
+
+    Ok(())
 }
 
 /// Auth enforcement: missing header → 401, garbage token → 401/403, wrong chain ID → 403.

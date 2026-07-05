@@ -67,6 +67,7 @@ alloy-sol-types.workspace = true
 clap = { workspace = true, optional = true }
 const-hex = { workspace = true, optional = true }
 k256.workspace = true
+parking_lot.workspace = true
 url = { version = "2", features = ["serde"] }
 eyre.workspace = true
 futures.workspace = true

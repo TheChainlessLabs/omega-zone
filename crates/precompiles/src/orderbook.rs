@@ -12,9 +12,8 @@
 //!   without repeated TIP-20 transfers. Withdrawals push tokens back to the
 //!   user's TIP-20 wallet.
 //!
-//! `bestBid` / `bestAsk` are exposed as temporary aggregate alpha-readiness
-//! helpers. Strict darkpool/privacy claims should not rely on public
-//! top-of-book visibility.
+//! `bestBid` / `bestAsk` expose aggregate market readiness. Strict
+//! darkpool/privacy claims should not rely on public top-of-book visibility.
 //!
 //! Matching happens eagerly on placement: a new bid matches against the best
 //! ask first (and vice versa), with price improvement refunded to the taker
@@ -109,6 +108,9 @@ alloy_sol_types::sol! {
     function availableBalanceOf(address user, address token) external view returns (uint128);
     function pairKey(address base, address quote) external pure returns (bytes32);
     function createPair(address base) external returns (bytes32);
+    function pairCount() external view returns (uint256);
+    function pairAt(uint256 index) external view returns (address base, address quote);
+    function pairExists(address base, address quote) external view returns (bool);
     function bestBid(address base) external view returns (uint128 price, uint128 quantity);
     function bestAsk(address base) external view returns (uint128 price, uint128 quantity);
     function MIN_ORDER_AMOUNT() external pure returns (uint128);
@@ -350,6 +352,34 @@ impl DarkpoolOrderbook {
         }));
         try_storage!(self.book_keys.push(book_key));
         Ok(StorageCtx.success_output(book_key.abi_encode().into()))
+    }
+
+    pub fn pair_count(&self) -> PrecompileResult {
+        let len = try_storage!(self.book_keys.len());
+        Ok(StorageCtx.success_output(U256::from(len).abi_encode().into()))
+    }
+
+    pub fn pair_at(&self, index: U256) -> PrecompileResult {
+        let Ok(index) = usize::try_from(index) else {
+            return Ok(StorageCtx.revert_output(Bytes::new()));
+        };
+        let len = try_storage!(self.book_keys.len());
+        if index >= len {
+            return Ok(StorageCtx.revert_output(Bytes::new()));
+        }
+        let book_key = try_storage!(self.book_keys[index].read());
+        let book = try_storage!(self.books[book_key].read());
+        Ok(StorageCtx.success_output((book.base, book.quote).abi_encode().into()))
+    }
+
+    pub fn pair_exists(&self, base: Address, quote: Address) -> PrecompileResult {
+        let book_key = compute_book_key(base, quote);
+        let book = try_storage!(self.books[book_key].read());
+        Ok(StorageCtx.success_output(
+            (book.base == base && book.quote == quote)
+                .abi_encode()
+                .into(),
+        ))
     }
 
     // ── deposit / withdraw ────────────────────────────────────────────────
@@ -1081,6 +1111,19 @@ impl TempoPrecompile for DarkpoolOrderbook {
                     return Ok(StorageCtx.revert_output(Bytes::new()));
                 };
                 self.create_pair(call.base)
+            }
+            s if s == pairCountCall::SELECTOR => self.pair_count(),
+            s if s == pairAtCall::SELECTOR => {
+                let Ok(call) = pairAtCall::abi_decode(calldata) else {
+                    return Ok(StorageCtx.revert_output(Bytes::new()));
+                };
+                self.pair_at(call.index)
+            }
+            s if s == pairExistsCall::SELECTOR => {
+                let Ok(call) = pairExistsCall::abi_decode(calldata) else {
+                    return Ok(StorageCtx.revert_output(Bytes::new()));
+                };
+                self.pair_exists(call.base, call.quote)
             }
             s if s == bestBidCall::SELECTOR => {
                 let Ok(call) = bestBidCall::abi_decode(calldata) else {

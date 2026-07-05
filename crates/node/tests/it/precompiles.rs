@@ -55,6 +55,9 @@ sol! {
         function cancel(uint128 orderId) external;
         function getOrder(uint128 orderId) external view returns (OrderView memory);
         function withdraw(address token, uint128 amount) external;
+        function pairCount() external view returns (uint256);
+        function pairAt(uint256 index) external view returns (address base, address quote);
+        function pairExists(address base, address quote) external view returns (bool);
         function bestBid(address base) external view returns (uint128 price, uint128 quantity);
         function bestAsk(address base) external view returns (uint128 price, uint128 quantity);
         function balanceOf(address user, address token) external view returns (uint128);
@@ -175,6 +178,14 @@ async fn test_darkpool_place_pulls_zone_wallet_balance() -> eyre::Result<()> {
         .connect_http(zone.http_url().clone());
     let darkpool = TestDarkpoolOrderbook::new(DARKPOOL_ADDRESS, &provider);
 
+    assert_eq!(darkpool.pairCount().call().await?, U256::ZERO);
+    assert!(
+        !darkpool
+            .pairExists(ALPHA_USD_ADDRESS, PATH_USD_ADDRESS)
+            .call()
+            .await?
+    );
+
     let amount: u128 = 1_000_000;
     let price: u128 = 1;
     let initial_balance: u128 = 10_000_000;
@@ -203,6 +214,23 @@ async fn test_darkpool_place_pulls_zone_wallet_balance() -> eyre::Result<()> {
     assert!(
         bid_receipt.status(),
         "bid should pull quote escrow from the zone wallet"
+    );
+
+    assert_eq!(darkpool.pairCount().call().await?, U256::from(1));
+    let pair = darkpool.pairAt(U256::ZERO).call().await?;
+    assert_eq!(pair.base, ALPHA_USD_ADDRESS);
+    assert_eq!(pair.quote, PATH_USD_ADDRESS);
+    assert!(
+        darkpool
+            .pairExists(ALPHA_USD_ADDRESS, PATH_USD_ADDRESS)
+            .call()
+            .await?
+    );
+    assert!(
+        !darkpool
+            .pairExists(PATH_USD_ADDRESS, ALPHA_USD_ADDRESS)
+            .call()
+            .await?
     );
 
     assert_eq!(

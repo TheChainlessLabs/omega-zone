@@ -210,7 +210,7 @@ pub trait ZoneRpcApi: Send + Sync + 'static {
         Box::pin(async { Err(JsonRpcError::method_disabled()) })
     }
 
-    /// `zone_getMarketConfig()` — returns canonical market metadata.
+    /// `zone_getMarketConfig()` — returns markets registered in the darkpool.
     fn zone_get_market_config(&self, auth: AuthContext) -> BoxFut<'_>;
 
     /// `zone_getReferencePrice(pair)` — returns the public reference-price

@@ -267,7 +267,7 @@ pub struct ZoneArgs {
     pub proof_tee_format: TeeAttestationFormat,
 
     /// Static reference price (raw integer, same units as the orderbook
-    /// precompile) for the alpha OALPHA/PATH.USD pair. When unset, the
+    /// precompile) for the configured darkpool market. When unset, the
     /// reference-price provider stays disabled and `zone_getReferencePrice`
     /// returns `enabled: false`. Setting this opts into the static provider.
     #[arg(long = "ref-price.static-price", env = "REF_PRICE_STATIC_PRICE")]

@@ -150,6 +150,9 @@ Darkpool read methods:
 | `availableBalanceOf(address user, address token)` | Owner-scoped internal balance excluding resting-order escrow. |
 | `pairKey(address base, address quote)` | Pure pair-key helper. |
 | `createPair(address base)` | Explicit pair creation; `place` also lazily creates pairs. |
+| `pairCount()` | Number of markets currently registered by `createPair` or `place`. |
+| `pairAt(uint256 index)` | Base and quote addresses for a registered market. |
+| `pairExists(address base, address quote)` | Whether the exact market is registered. |
 | `bestBid(address base)` | Aggregate best bid for readiness/debugging. |
 | `bestAsk(address base)` | Aggregate best ask for readiness/debugging. |
 | `MIN_ORDER_AMOUNT()` | Current dust floor. |
@@ -294,8 +297,10 @@ cast rpc zone_getTopOfBook \
   --rpc-headers "X-Authorization-Token: $TOKEN"
 ```
 
-Some builds expose only the canonical alpha pair in private market RPCs. If a
-pair is unsupported, the private RPC returns an explicit unsupported-pair error.
+Market RPCs accept any exact `(base, quote)` pair registered in the darkpool.
+They reject pairs that `pairExists(base, quote)` reports as absent. Market
+labels and token decimals come from each TIP-20 contract rather than RPC-local
+constants.
 
 ## Private Order Status
 

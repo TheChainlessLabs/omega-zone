@@ -1,4 +1,4 @@
-//! In-memory aggregate midpoint history for the alpha market.
+//! In-memory aggregate midpoint history for one darkpool market.
 //!
 //! The history stores only wall-clock timestamps and aggregate midpoint
 //! prices. It never sees account, order, maker, taker, or fill-level data —

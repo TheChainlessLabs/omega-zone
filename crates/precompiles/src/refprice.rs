@@ -1,6 +1,6 @@
 //! Reference-price guardrail helper for the darkpool orderbook.
 //!
-//! This is **alpha infrastructure** for the canonical OALPHA/PATH.USD pair.
+//! This is **alpha infrastructure** for configured darkpool markets.
 //! It is not a production oracle: the reference price is whatever the
 //! sequencer-side configuration provides (typically a static value), and the
 //! guard only enforces a configurable max-deviation and staleness bound.
@@ -14,7 +14,7 @@
 
 use alloc::string::String;
 
-/// A single snapshot of the public reference price for the alpha pair.
+/// A single snapshot of a public market reference price.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReferencePrice {
     /// Raw integer price; same units as the orderbook precompile.

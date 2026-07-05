@@ -259,13 +259,13 @@ pub enum DepositState {
     Failed,
 }
 
-/// Canonical market token metadata returned by `zone_getMarketConfig`.
+/// On-chain market token metadata returned by `zone_getMarketConfig`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MarketToken {
     /// The token contract address.
     pub address: Address,
-    /// Canonical display symbol.
+    /// Display symbol read from the TIP-20 contract.
     pub symbol: String,
     /// TIP-20 decimals.
     pub decimals: u8,
@@ -309,7 +309,7 @@ pub struct MarketEntry {
 pub struct MarketConfigResponse {
     /// The darkpool orderbook contract address.
     pub darkpool: Address,
-    /// Markets currently exposed to the frontend.
+    /// Markets currently registered in the darkpool.
     pub markets: Vec<MarketEntry>,
 }
 

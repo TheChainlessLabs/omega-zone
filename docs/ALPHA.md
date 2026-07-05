@@ -198,8 +198,9 @@ up the maker.
 
 ## Midpoint chart history (`zone_getMidpointHistory`)
 
-The private RPC backs the alpha frontend chart with an in-memory aggregate
-midpoint sampler. It reads the darkpool's aggregate top-of-book
+The private RPC backs frontend charts with per-market in-memory aggregate
+midpoint samplers. It discovers registered markets from the darkpool and reads
+each market's aggregate top-of-book
 (`bestBid` / `bestAsk`) on a fixed cadence and stores `(timestamp, midpoint)`
 samples — no account, order id, maker, taker, or fill-level data.
 
@@ -209,7 +210,7 @@ Response contract:
   private RPC has booted). The frontend can render the chart.
 - `samples` is empty when the book has never had two-sided liquidity since
   process start — the sampler skips writes when either side is missing.
-- `pair`, `base`, and `quote` echo the canonical alpha market.
+- `pair`, `base`, and `quote` identify the requested darkpool market.
 
 Supported `interval` labels (bucket size in parentheses):
 
@@ -232,8 +233,8 @@ current page when older buckets exist. Re-issue the call with that value as
 `cursor` to walk further back. Limits cap at `5000` samples per page; the
 default is `500`.
 
-Unsupported pairs (anything other than `OALPHA/PATH.USD`) still return the
-existing unsupported-pair `invalid_params` error.
+Pairs not registered in the darkpool return a market-not-found
+`invalid_params` error. The RPC does not maintain a separate pair allowlist.
 
 ## Public reference price (alpha guardrail, not an oracle)
 

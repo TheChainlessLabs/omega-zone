@@ -19,6 +19,9 @@ pub mod abi {
     alloy_sol_types::sol! {
         #[sol(rpc)]
         contract DarkpoolReader {
+            function pairCount() external view returns (uint256);
+            function pairAt(uint256 index) external view returns (address base, address quote);
+            function pairExists(address base, address quote) external view returns (bool);
             function bestBid(address base) external view returns (uint128 price, uint128 quantity);
             function bestAsk(address base) external view returns (uint128 price, uint128 quantity);
             #[allow(non_snake_case)]

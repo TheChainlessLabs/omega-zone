@@ -24,6 +24,7 @@ use alloy_rpc_types_eth::{
 use alloy_sol_types::{SolCall, SolEvent, SolEventInterface};
 use eyre::WrapErr;
 use futures::StreamExt;
+use parking_lot::RwLock;
 use reth_provider::CanonStateSubscriptions;
 use reth_rpc::{EthFilter, eth::filter::EthFilterError};
 use reth_rpc_builder::EthHandlers;
@@ -37,7 +38,7 @@ use tempo_alloy::{
     rpc::{TempoHeaderResponse, TempoTransactionRequest},
 };
 use tempo_contracts::precompiles::{
-    ACCOUNT_KEYCHAIN_ADDRESS,
+    ACCOUNT_KEYCHAIN_ADDRESS, ITIP20,
     account_keychain::IAccountKeychain::{self, KeyInfo, getKeyCall},
 };
 use tempo_primitives::{TempoHeader, TempoTxEnvelope};
@@ -80,21 +81,18 @@ const FILTER_OWNER_PRUNE_INTERVAL: Duration = Duration::from_secs(60);
 /// Keep L1 log requests comfortably below public-provider block-range limits.
 const L1_BATCH_LOG_QUERY_MAX_BLOCKS: u64 = 50_000;
 
-/// Canonical alpha-launch market constants.
-///
-/// The darkpool's `bestBid(base)` / `bestAsk(base)` reads take only a base
-/// address and implicitly resolve the quote via the base token's
-/// `quoteToken()`. To keep response labels and on-chain reads in sync, the
-/// alpha private RPC exposes exactly one pair: OALPHA/PATH.USD.
-mod alpha {
+type MarketKey = (Address, Address);
+type MidpointHistories = RwLock<HashMap<MarketKey, Arc<MidpointHistory>>>;
+
+#[cfg(test)]
+mod test_market {
     use alloy_primitives::{Address, address};
 
-    pub(super) const BASE: Address = address!("0x20C000000000000000000000518dDADD37eD1d28");
+    pub(super) const BASE: Address = address!("0x20C0000000000000000000000000000000000001");
     pub(super) const QUOTE: Address = address!("0x20C0000000000000000000000000000000000000");
-    pub(super) const BASE_SYMBOL: &str = "OALPHA";
-    pub(super) const QUOTE_SYMBOL: &str = "PATH.USD";
-    pub(super) const DECIMALS: u8 = 6;
-    pub(super) const PAIR_LABEL: &str = "OALPHA/PATH.USD";
+    pub(super) const PAIR_LABEL: &str =
+        "0x20c0000000000000000000000000000000000001/0x20c0000000000000000000000000000000000000";
+    pub(super) const DISPLAY_LABEL: &str = "ALPHAUSD/PATHUSD";
 }
 
 fn filter_not_found_error() -> JsonRpcError {
@@ -186,7 +184,7 @@ pub struct ZoneRpc<Api: EthApiTypes> {
     /// In-memory aggregate midpoint history backing
     /// [`zone_get_midpoint_history`](Self::zone_get_midpoint_history).
     /// Written by a background sampler; never sees owner data.
-    midpoint_history: Arc<MidpointHistory>,
+    midpoint_histories: Arc<MidpointHistories>,
     /// Unix timestamp at which the (static) reference-price snapshot was
     /// loaded. Used to compute snapshot age for `zone_getReferencePrice`.
     ref_price_loaded_at: u64,
@@ -228,7 +226,7 @@ impl<Api: EthApiTypes + 'static> ZoneRpc<Api> {
             zone_provider,
             tempo_state,
             filter_owners: Arc::new(Mutex::new(HashMap::new())),
-            midpoint_history: Arc::new(MidpointHistory::new(MIDPOINT_RETENTION)),
+            midpoint_histories: Arc::new(RwLock::new(HashMap::new())),
             ref_price_loaded_at,
         };
         rpc.spawn_filter_owner_pruner();
@@ -239,6 +237,87 @@ impl<Api: EthApiTypes + 'static> ZoneRpc<Api> {
     /// Returns a reference to the inner [`EthFilter`] handler.
     pub fn filter(&self) -> &EthFilter<Api> {
         &self.eth.filter
+    }
+
+    async fn ensure_darkpool_market(
+        &self,
+        base: Address,
+        quote: Address,
+    ) -> Result<(), JsonRpcError> {
+        let darkpool = DarkpoolReader::new(DARKPOOL_ADDRESS, &self.zone_provider);
+        let exists = darkpool
+            .pairExists(base, quote)
+            .call()
+            .await
+            .map_err(internal)?;
+        if exists {
+            Ok(())
+        } else {
+            Err(JsonRpcError::invalid_params(format!(
+                "market {base:#x}/{quote:#x} does not exist in the darkpool",
+            )))
+        }
+    }
+
+    async fn market_token(&self, address: Address) -> Result<MarketToken, JsonRpcError> {
+        let token = ITIP20::new(address, &self.zone_provider);
+        let symbol = token.symbol().call().await.map_err(internal)?;
+        let decimals = token.decimals().call().await.map_err(internal)?;
+        Ok(MarketToken {
+            address,
+            symbol,
+            decimals,
+        })
+    }
+
+    async fn market_label(&self, base: Address, quote: Address) -> Result<String, JsonRpcError> {
+        let base = self.market_token(base).await?;
+        let quote = self.market_token(quote).await?;
+        Ok(format!("{}/{}", base.symbol, quote.symbol))
+    }
+
+    async fn darkpool_pairs(&self) -> Result<Vec<MarketKey>, JsonRpcError> {
+        let darkpool = DarkpoolReader::new(DARKPOOL_ADDRESS, &self.zone_provider);
+        let pair_count = darkpool.pairCount().call().await.map_err(internal)?;
+        let pair_count = usize::try_from(pair_count)
+            .map_err(|_| JsonRpcError::internal("darkpool pair count exceeds platform limits"))?;
+        let mut pairs = Vec::with_capacity(pair_count);
+        for index in 0..pair_count {
+            let pair = darkpool
+                .pairAt(U256::from(index))
+                .call()
+                .await
+                .map_err(internal)?;
+            pairs.push((pair.base, pair.quote));
+        }
+        Ok(pairs)
+    }
+
+    async fn darkpool_market_config(&self) -> Result<MarketConfigResponse, JsonRpcError> {
+        let darkpool = DarkpoolReader::new(DARKPOOL_ADDRESS, &self.zone_provider);
+        let min_order_amount = darkpool.MIN_ORDER_AMOUNT().call().await.map_err(internal)?;
+        let mut markets = Vec::new();
+        for (base, quote) in self.darkpool_pairs().await? {
+            let base = self.market_token(base).await?;
+            let quote = self.market_token(quote).await?;
+            markets.push(MarketEntry {
+                pair: format!("{}/{}", base.symbol, quote.symbol),
+                base,
+                quote,
+                min_order_amount: U128::from(min_order_amount),
+                price_unit: "raw integer; quote = baseAmount * price".to_string(),
+                allowed_actions: vec![
+                    MarketAction::MarketBuy,
+                    MarketAction::MarketSell,
+                    MarketAction::LimitBid,
+                    MarketAction::LimitAsk,
+                ],
+            });
+        }
+        Ok(MarketConfigResponse {
+            darkpool: DARKPOOL_ADDRESS,
+            markets,
+        })
     }
 
     async fn filter_is_active(&self, id: &FilterId) -> bool {
@@ -277,7 +356,7 @@ impl<Api: EthApiTypes + 'static> ZoneRpc<Api> {
         Api: Send + Sync + 'static,
     {
         let provider = self.zone_provider.clone();
-        let history: Weak<MidpointHistory> = Arc::downgrade(&self.midpoint_history);
+        let histories: Weak<MidpointHistories> = Arc::downgrade(&self.midpoint_histories);
         tokio::spawn(async move {
             let mut tick = interval(MIDPOINT_SAMPLE_INTERVAL);
             tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -285,31 +364,46 @@ impl<Api: EthApiTypes + 'static> ZoneRpc<Api> {
             loop {
                 tick.tick().await;
 
-                let Some(history) = history.upgrade() else {
+                let Some(histories) = histories.upgrade() else {
                     break;
                 };
 
                 let darkpool = DarkpoolReader::new(DARKPOOL_ADDRESS, &provider);
-                let Ok(best_bid) = darkpool.bestBid(alpha::BASE).call().await else {
+                let Ok(pair_count) = darkpool.pairCount().call().await else {
                     continue;
                 };
-                let Ok(best_ask) = darkpool.bestAsk(alpha::BASE).call().await else {
+                let Ok(pair_count) = usize::try_from(pair_count) else {
                     continue;
                 };
+                for index in 0..pair_count {
+                    let Ok(pair) = darkpool.pairAt(U256::from(index)).call().await else {
+                        continue;
+                    };
+                    let Ok(best_bid) = darkpool.bestBid(pair.base).call().await else {
+                        continue;
+                    };
+                    let Ok(best_ask) = darkpool.bestAsk(pair.base).call().await else {
+                        continue;
+                    };
 
-                if best_bid.price == 0
-                    || best_bid.quantity == 0
-                    || best_ask.price == 0
-                    || best_ask.quantity == 0
-                {
-                    continue;
+                    if best_bid.price == 0
+                        || best_bid.quantity == 0
+                        || best_ask.price == 0
+                        || best_ask.quantity == 0
+                    {
+                        continue;
+                    }
+
+                    let history = histories
+                        .write()
+                        .entry((pair.base, pair.quote))
+                        .or_insert_with(|| Arc::new(MidpointHistory::new(MIDPOINT_RETENTION)))
+                        .clone();
+                    history.record(RawSample {
+                        timestamp: unix_now_secs(),
+                        midpoint: best_bid.price.saturating_add(best_ask.price) / 2,
+                    });
                 }
-
-                let midpoint = best_bid.price.saturating_add(best_ask.price) / 2;
-                history.record(RawSample {
-                    timestamp: unix_now_secs(),
-                    midpoint,
-                });
             }
         });
     }
@@ -1695,7 +1789,7 @@ where
     }
 
     fn zone_get_market_config(&self, _auth: AuthContext) -> BoxFut<'_> {
-        Box::pin(async move { to_raw(&canonical_alpha_market_config()) })
+        Box::pin(async move { to_raw(&self.darkpool_market_config().await?) })
     }
 
     fn zone_get_reference_price(
@@ -1705,7 +1799,8 @@ where
         _auth: AuthContext,
     ) -> BoxFut<'_> {
         Box::pin(async move {
-            ensure_canonical_pair(base, quote)?;
+            self.ensure_darkpool_market(base, quote).await?;
+            let pair = self.market_label(base, quote).await?;
 
             let now_secs = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1721,6 +1816,9 @@ where
                 self.ref_price_loaded_at,
                 now_secs,
                 as_of_block,
+                pair,
+                base,
+                quote,
             );
             to_raw(&response)
         })
@@ -1733,7 +1831,8 @@ where
         _auth: AuthContext,
     ) -> BoxFut<'_> {
         Box::pin(async move {
-            ensure_canonical_pair(base, quote)?;
+            self.ensure_darkpool_market(base, quote).await?;
+            let pair = self.market_label(base, quote).await?;
 
             let darkpool = DarkpoolReader::new(DARKPOOL_ADDRESS, &self.zone_provider);
             let best_bid = darkpool.bestBid(base).call().await.map_err(internal)?;
@@ -1757,7 +1856,7 @@ where
             };
 
             to_raw(&TopOfBookResponse {
-                pair: alpha::PAIR_LABEL.to_string(),
+                pair,
                 base,
                 quote,
                 bid,
@@ -1779,7 +1878,8 @@ where
         _auth: AuthContext,
     ) -> BoxFut<'_> {
         Box::pin(async move {
-            ensure_canonical_pair(base, quote)?;
+            self.ensure_darkpool_market(base, quote).await?;
+            let pair = self.market_label(base, quote).await?;
 
             let interval_secs = interval_seconds(&interval).ok_or_else(|| {
                 JsonRpcError::invalid_params(format!(
@@ -1790,7 +1890,11 @@ where
 
             let cursor_ts = parse_midpoint_cursor(cursor.as_deref())?;
 
-            let (page, next_cursor) = self.midpoint_history.query(interval_secs, limit, cursor_ts);
+            let history = self.midpoint_histories.read().get(&(base, quote)).cloned();
+            let (page, next_cursor) = history
+                .as_deref()
+                .map(|history| history.query(interval_secs, limit, cursor_ts))
+                .unwrap_or_default();
 
             let samples = page
                 .into_iter()
@@ -1801,6 +1905,7 @@ where
                 .collect();
 
             to_raw(&build_midpoint_history_response(
+                pair,
                 base,
                 quote,
                 interval,
@@ -2433,15 +2538,11 @@ struct BatchAggregates {
     volume_by_token: Vec<BatchAggregateVolume>,
 }
 
-/// Human-readable label for `(base, quote)`. The canonical alpha-launch pair
-/// gets its `OALPHA/PATH.USD` label; any other pair falls back to its
-/// `0xBASE/0xQUOTE` hex form so downstream callers can still group volume.
+/// Stable address-based label for `(base, quote)` used by the synchronous
+/// batch-event reducer. Market RPCs resolve human-readable token symbols from
+/// on-chain TIP-20 metadata instead.
 fn pair_label(base: Address, quote: Address) -> String {
-    if base == alpha::BASE && quote == alpha::QUOTE {
-        alpha::PAIR_LABEL.to_string()
-    } else {
-        format!("{base:#x}/{quote:#x}")
-    }
+    format!("{base:#x}/{quote:#x}")
 }
 
 /// Pure reduction: a slice of darkpool logs spanning `[0, block_range.1]` →
@@ -2511,7 +2612,7 @@ fn aggregate_batch_events(
             {
                 pair_set.insert((base, quote));
                 let base_amount = U256::from(decoded.amountFilled);
-                // `quote = baseAmount * price` per the alpha market config.
+                // `quote = baseAmount * price` per the darkpool price model.
                 let quote_amount = base_amount.saturating_mul(U256::from(decoded.price));
                 volume_by_token
                     .entry(base)
@@ -2704,16 +2805,6 @@ fn level_from_response(price: u128, quantity: u128) -> Option<OrderLevel> {
     })
 }
 
-fn ensure_canonical_pair(base: Address, quote: Address) -> Result<(), JsonRpcError> {
-    if base == alpha::BASE && quote == alpha::QUOTE {
-        Ok(())
-    } else {
-        Err(JsonRpcError::invalid_params(
-            "unsupported pair; this build only exposes OALPHA/PATH.USD",
-        ))
-    }
-}
-
 fn unix_now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2731,6 +2822,7 @@ fn parse_midpoint_cursor(cursor: Option<&str>) -> Result<Option<u64>, JsonRpcErr
 }
 
 fn build_midpoint_history_response(
+    pair: String,
     base: Address,
     quote: Address,
     interval: String,
@@ -2738,7 +2830,7 @@ fn build_midpoint_history_response(
     next_cursor: Option<u64>,
 ) -> MidpointHistoryResponse {
     MidpointHistoryResponse {
-        pair: alpha::PAIR_LABEL.to_string(),
+        pair,
         base,
         quote,
         interval,
@@ -2756,33 +2848,6 @@ fn build_midpoint_history_response(
     }
 }
 
-fn canonical_alpha_market_config() -> MarketConfigResponse {
-    MarketConfigResponse {
-        darkpool: DARKPOOL_ADDRESS,
-        markets: vec![MarketEntry {
-            pair: alpha::PAIR_LABEL.to_string(),
-            base: MarketToken {
-                address: alpha::BASE,
-                symbol: alpha::BASE_SYMBOL.to_string(),
-                decimals: alpha::DECIMALS,
-            },
-            quote: MarketToken {
-                address: alpha::QUOTE,
-                symbol: alpha::QUOTE_SYMBOL.to_string(),
-                decimals: alpha::DECIMALS,
-            },
-            min_order_amount: U128::from(zone_precompiles::orderbook::MIN_ORDER_AMOUNT),
-            price_unit: "raw integer; quote = baseAmount * price".to_string(),
-            allowed_actions: vec![
-                MarketAction::MarketBuy,
-                MarketAction::MarketSell,
-                MarketAction::LimitBid,
-                MarketAction::LimitAsk,
-            ],
-        }],
-    }
-}
-
 /// Build the `zone_getReferencePrice` response payload from the configured
 /// provider (if any) and the current zone clock.
 ///
@@ -2796,13 +2861,16 @@ fn build_reference_price_response(
     loaded_at_secs: u64,
     now_secs: u64,
     _as_of_block: u64,
+    pair: String,
+    base: Address,
+    quote: Address,
 ) -> ReferencePriceResponse {
     let Some(provider) = provider else {
         return ReferencePriceResponse {
             enabled: false,
-            pair: alpha::PAIR_LABEL.to_string(),
-            base: alpha::BASE,
-            quote: alpha::QUOTE,
+            pair,
+            base,
+            quote,
             price: None,
             source: None,
             as_of_block: None,
@@ -2838,9 +2906,9 @@ fn build_reference_price_response(
 
     ReferencePriceResponse {
         enabled: true,
-        pair: alpha::PAIR_LABEL.to_string(),
-        base: alpha::BASE,
-        quote: alpha::QUOTE,
+        pair,
+        base,
+        quote,
         price: Some(U128::from(price)),
         source: Some(source),
         as_of_block: Some(U64::from(0u64)),
@@ -3203,14 +3271,14 @@ mod tests {
         let aggregates = BatchAggregates {
             order_count: 3,
             fill_count: 2,
-            pair_labels: vec![alpha::PAIR_LABEL.to_string()],
+            pair_labels: vec![test_market::PAIR_LABEL.to_string()],
             volume_by_token: vec![
                 BatchAggregateVolume {
-                    token: alpha::BASE,
+                    token: test_market::BASE,
                     amount: U256::from(500u64),
                 },
                 BatchAggregateVolume {
-                    token: alpha::QUOTE,
+                    token: test_market::QUOTE,
                     amount: U256::from(2_500u64),
                 },
             ],
@@ -3228,7 +3296,10 @@ mod tests {
 
         assert_eq!(summary.order_count, U64::from(3));
         assert_eq!(summary.fill_count, U64::from(2));
-        assert_eq!(summary.aggregate_pairs, vec![alpha::PAIR_LABEL.to_string()]);
+        assert_eq!(
+            summary.aggregate_pairs,
+            vec![test_market::PAIR_LABEL.to_string()]
+        );
         assert_eq!(summary.aggregate_volume.len(), 2);
 
         let json = serde_json::to_value(&summary).expect("summary should serialize");
@@ -3258,9 +3329,9 @@ mod tests {
         let aggregates = BatchAggregates {
             order_count: 2,
             fill_count: 1,
-            pair_labels: vec![alpha::PAIR_LABEL.to_string()],
+            pair_labels: vec![test_market::PAIR_LABEL.to_string()],
             volume_by_token: vec![BatchAggregateVolume {
-                token: alpha::BASE,
+                token: test_market::BASE,
                 amount: U256::from(500u64),
             }],
         };
@@ -3287,7 +3358,10 @@ mod tests {
         assert_eq!(summary.settled_at, None);
         assert_eq!(summary.order_count, U64::from(2));
         assert_eq!(summary.fill_count, U64::from(1));
-        assert_eq!(summary.aggregate_pairs, vec![alpha::PAIR_LABEL.to_string()]);
+        assert_eq!(
+            summary.aggregate_pairs,
+            vec![test_market::PAIR_LABEL.to_string()]
+        );
         assert_eq!(summary.aggregate_volume.len(), 1);
         assert_eq!(summary.settlement_tx_hash, None);
         assert_eq!(summary.proof_ref, None);
@@ -3299,7 +3373,7 @@ mod tests {
     }
 
     /// Build a darkpool [`alloy_rpc_types_eth::Log`] for an `OrderSubmitted`
-    /// event at `block` with the alpha pair, used to seed the pair index in
+    /// event at `block` with the test pair, used to seed the pair index in
     /// aggregation tests.
     fn alpha_submitted_log(
         block: u64,
@@ -3310,8 +3384,8 @@ mod tests {
         let event = zone_darkpool::OrderSubmitted {
             orderId: order_id,
             maker: Address::repeat_byte(0xaa),
-            base: alpha::BASE,
-            quote: alpha::QUOTE,
+            base: test_market::BASE,
+            quote: test_market::QUOTE,
             amount,
             price,
             isBid: true,
@@ -3364,22 +3438,22 @@ mod tests {
 
         assert_eq!(agg.order_count, 2, "two OrderSubmitted events in range");
         assert_eq!(agg.fill_count, 2, "two OrderFilled events in range");
-        assert_eq!(agg.pair_labels, vec![alpha::PAIR_LABEL.to_string()]);
+        assert_eq!(agg.pair_labels, vec![test_market::PAIR_LABEL.to_string()]);
     }
 
     #[test]
-    fn aggregate_batch_events_includes_alpha_pair_when_traded() {
+    fn aggregate_batch_events_includes_address_pair_when_traded() {
         let logs = vec![
             alpha_submitted_log(5, 1, 1_000, 7),
             alpha_filled_log(5, 1, 1_000, 7),
         ];
         let agg = aggregate_batch_events(&logs, (5, 5));
-        assert_eq!(agg.pair_labels, vec!["OALPHA/PATH.USD".to_string()]);
+        assert_eq!(agg.pair_labels, vec![test_market::PAIR_LABEL.to_string()]);
     }
 
     #[test]
     fn aggregate_batch_events_aggregates_volume_per_token() {
-        // Two fills on the alpha pair: 400 base @ price 5 → +2_000 quote;
+        // Two fills on the test pair: 400 base @ price 5 → +2_000 quote;
         // 800 base @ price 6 → +4_800 quote. Totals: base 1_200, quote 6_800.
         let logs = vec![
             alpha_submitted_log(10, 1, 1_000, 5),
@@ -3392,12 +3466,12 @@ mod tests {
         let base_volume = agg
             .volume_by_token
             .iter()
-            .find(|v| v.token == alpha::BASE)
+            .find(|v| v.token == test_market::BASE)
             .expect("base volume present");
         let quote_volume = agg
             .volume_by_token
             .iter()
-            .find(|v| v.token == alpha::QUOTE)
+            .find(|v| v.token == test_market::QUOTE)
             .expect("quote volume present");
         assert_eq!(base_volume.amount, U256::from(1_200u64));
         assert_eq!(quote_volume.amount, U256::from(6_800u64));
@@ -3406,7 +3480,7 @@ mod tests {
     #[test]
     fn aggregate_batch_events_uses_earlier_order_submitted_for_pair_lookup() {
         // OrderSubmitted lives in block 5; OrderFilled hits in block 12 — the
-        // pair index must still resolve the fill to the alpha pair even
+        // pair index must still resolve the fill to the test pair even
         // though the submission is outside the [from, to] range.
         let logs = vec![
             alpha_submitted_log(5, 42, 1_000, 4),
@@ -3416,11 +3490,11 @@ mod tests {
 
         assert_eq!(agg.order_count, 0, "submission is outside [from, to]");
         assert_eq!(agg.fill_count, 1, "fill is inside [from, to]");
-        assert_eq!(agg.pair_labels, vec![alpha::PAIR_LABEL.to_string()]);
+        assert_eq!(agg.pair_labels, vec![test_market::PAIR_LABEL.to_string()]);
         let base_volume = agg
             .volume_by_token
             .iter()
-            .find(|v| v.token == alpha::BASE)
+            .find(|v| v.token == test_market::BASE)
             .expect("base volume present");
         assert_eq!(base_volume.amount, U256::from(1_000u64));
     }
@@ -3449,8 +3523,11 @@ mod tests {
     }
 
     #[test]
-    fn pair_label_uses_canonical_label_for_alpha_pair() {
-        assert_eq!(pair_label(alpha::BASE, alpha::QUOTE), "OALPHA/PATH.USD");
+    fn pair_label_uses_address_form_for_every_pair() {
+        assert_eq!(
+            pair_label(test_market::BASE, test_market::QUOTE),
+            test_market::PAIR_LABEL
+        );
     }
 
     #[test]
@@ -3556,78 +3633,6 @@ mod tests {
     }
 
     #[test]
-    fn ensure_canonical_pair_accepts_alpha_pair() {
-        assert!(ensure_canonical_pair(alpha::BASE, alpha::QUOTE).is_ok());
-    }
-
-    #[test]
-    fn ensure_canonical_pair_rejects_swapped_pair() {
-        let err = ensure_canonical_pair(alpha::QUOTE, alpha::BASE)
-            .expect_err("swapped pair must be rejected");
-        assert_eq!(err.code, -32602);
-        assert_eq!(
-            err.message,
-            "unsupported pair; this build only exposes OALPHA/PATH.USD"
-        );
-    }
-
-    #[test]
-    fn ensure_canonical_pair_rejects_wrong_base() {
-        let err = ensure_canonical_pair(Address::repeat_byte(0x42), alpha::QUOTE)
-            .expect_err("wrong base must be rejected");
-        assert_eq!(err.code, -32602);
-    }
-
-    #[test]
-    fn ensure_canonical_pair_rejects_wrong_quote() {
-        let err = ensure_canonical_pair(alpha::BASE, Address::repeat_byte(0x42))
-            .expect_err("wrong quote must be rejected");
-        assert_eq!(err.code, -32602);
-    }
-
-    #[test]
-    fn canonical_alpha_market_config_returns_only_the_alpha_pair() {
-        let config = canonical_alpha_market_config();
-        assert_eq!(config.darkpool, DARKPOOL_ADDRESS);
-        assert_eq!(config.markets.len(), 1);
-
-        let market = &config.markets[0];
-        assert_eq!(market.pair, "OALPHA/PATH.USD");
-        assert_eq!(market.base.address, alpha::BASE);
-        assert_eq!(market.base.symbol, "OALPHA");
-        assert_eq!(market.base.decimals, 6);
-        assert_eq!(market.quote.address, alpha::QUOTE);
-        assert_eq!(market.quote.symbol, "PATH.USD");
-        assert_eq!(market.quote.decimals, 6);
-        assert_eq!(
-            market.min_order_amount,
-            U128::from(zone_precompiles::orderbook::MIN_ORDER_AMOUNT)
-        );
-        assert_eq!(market.price_unit, "raw integer; quote = baseAmount * price");
-        assert_eq!(
-            market.allowed_actions,
-            vec![
-                MarketAction::MarketBuy,
-                MarketAction::MarketSell,
-                MarketAction::LimitBid,
-                MarketAction::LimitAsk,
-            ]
-        );
-    }
-
-    #[test]
-    fn canonical_alpha_addresses_match_task_constants() {
-        assert_eq!(
-            format!("{:#x}", alpha::BASE),
-            "0x20c000000000000000000000518ddadd37ed1d28"
-        );
-        assert_eq!(
-            format!("{:#x}", alpha::QUOTE),
-            "0x20c0000000000000000000000000000000000000"
-        );
-    }
-
-    #[test]
     fn rpc_midpoint_cursor_accepts_hex_and_decimal() {
         assert_eq!(parse_midpoint_cursor(None).unwrap(), None);
         assert_eq!(parse_midpoint_cursor(Some("0x180")).unwrap(), Some(384));
@@ -3645,16 +3650,17 @@ mod tests {
     #[test]
     fn rpc_midpoint_history_response_advertises_enabled_sampler() {
         let response = build_midpoint_history_response(
-            alpha::BASE,
-            alpha::QUOTE,
+            test_market::DISPLAY_LABEL.to_string(),
+            test_market::BASE,
+            test_market::QUOTE,
             "1m".to_string(),
             Vec::new(),
             None,
         );
 
-        assert_eq!(response.pair, alpha::PAIR_LABEL);
-        assert_eq!(response.base, alpha::BASE);
-        assert_eq!(response.quote, alpha::QUOTE);
+        assert_eq!(response.pair, test_market::DISPLAY_LABEL);
+        assert_eq!(response.base, test_market::BASE);
+        assert_eq!(response.quote, test_market::QUOTE);
         assert_eq!(response.interval, "1m");
         assert!(response.samples.is_empty());
         assert!(response.next_cursor.is_none());
@@ -3672,8 +3678,9 @@ mod tests {
     #[test]
     fn rpc_midpoint_history_response_encodes_next_cursor_as_hex() {
         let response = build_midpoint_history_response(
-            alpha::BASE,
-            alpha::QUOTE,
+            test_market::DISPLAY_LABEL.to_string(),
+            test_market::BASE,
+            test_market::QUOTE,
             "5m".to_string(),
             vec![MidpointSample {
                 timestamp: U64::from(1_700u64),
@@ -3688,8 +3695,9 @@ mod tests {
     #[test]
     fn rpc_midpoint_history_response_emits_aggregate_only_fields() {
         let response = build_midpoint_history_response(
-            alpha::BASE,
-            alpha::QUOTE,
+            test_market::DISPLAY_LABEL.to_string(),
+            test_market::BASE,
+            test_market::QUOTE,
             "1m".to_string(),
             vec![
                 MidpointSample {
@@ -3751,14 +3759,31 @@ mod tests {
         }
     }
 
+    fn build_test_reference_price_response(
+        provider: Option<&zone_refprice::ReferencePriceProviderConfig>,
+        loaded_at_secs: u64,
+        now_secs: u64,
+        as_of_block: u64,
+    ) -> ReferencePriceResponse {
+        build_reference_price_response(
+            provider,
+            loaded_at_secs,
+            now_secs,
+            as_of_block,
+            test_market::DISPLAY_LABEL.to_string(),
+            test_market::BASE,
+            test_market::QUOTE,
+        )
+    }
+
     #[test]
     fn market_reference_price_disabled_returns_explicit_disabled_response() {
-        let response = build_reference_price_response(None, 1_700_000_000, 1_700_000_100, 42);
+        let response = build_test_reference_price_response(None, 1_700_000_000, 1_700_000_100, 42);
 
         assert!(!response.enabled);
-        assert_eq!(response.pair, "OALPHA/PATH.USD");
-        assert_eq!(response.base, alpha::BASE);
-        assert_eq!(response.quote, alpha::QUOTE);
+        assert_eq!(response.pair, test_market::DISPLAY_LABEL);
+        assert_eq!(response.base, test_market::BASE);
+        assert_eq!(response.quote, test_market::QUOTE);
         assert!(response.price.is_none());
         assert!(response.source.is_none());
         assert!(response.as_of_block.is_none());
@@ -3785,10 +3810,10 @@ mod tests {
     fn market_reference_price_static_provider_returns_price_source_and_freshness() {
         let provider = static_alpha_provider(1_000_000);
         let response =
-            build_reference_price_response(Some(&provider), 1_700_000_000, 1_700_000_010, 99);
+            build_test_reference_price_response(Some(&provider), 1_700_000_000, 1_700_000_010, 99);
 
         assert!(response.enabled);
-        assert_eq!(response.pair, "OALPHA/PATH.USD");
+        assert_eq!(response.pair, test_market::DISPLAY_LABEL);
         assert_eq!(response.price, Some(U128::from(1_000_000u128)));
         assert_eq!(response.source.as_deref(), Some("static:alpha"));
         // Static providers do not anchor to a block; expose the sentinel.
@@ -3806,7 +3831,7 @@ mod tests {
         let mut provider = static_alpha_provider(1_000_000);
         provider.max_staleness_secs = 60;
         let response =
-            build_reference_price_response(Some(&provider), 1_700_000_000, 1_700_000_120, 1);
+            build_test_reference_price_response(Some(&provider), 1_700_000_000, 1_700_000_120, 1);
 
         assert!(response.enabled);
         assert_eq!(response.fresh, Some(false));
@@ -3818,7 +3843,7 @@ mod tests {
     fn market_reference_price_response_serializes_with_camel_case_keys() {
         let provider = static_alpha_provider(2_500_000);
         let response =
-            build_reference_price_response(Some(&provider), 1_700_000_000, 1_700_000_005, 7);
+            build_test_reference_price_response(Some(&provider), 1_700_000_000, 1_700_000_005, 7);
 
         let json = serde_json::to_value(&response).expect("response must serialize");
         let obj = json.as_object().expect("response must be a JSON object");
@@ -3849,7 +3874,7 @@ mod tests {
 
     #[test]
     fn market_reference_price_disabled_response_omits_snapshot_fields_in_json() {
-        let response = build_reference_price_response(None, 1_700_000_000, 1_700_000_100, 5);
+        let response = build_test_reference_price_response(None, 1_700_000_000, 1_700_000_100, 5);
         let json = serde_json::to_value(&response).expect("response must serialize");
         let obj = json.as_object().expect("response must be a JSON object");
         for omitted in [
