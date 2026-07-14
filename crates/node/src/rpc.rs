@@ -6,7 +6,7 @@
 pub use zone_rpc::*;
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     str::FromStr,
     sync::{Arc, Weak},
     time::Duration,
@@ -80,9 +80,12 @@ type RpcBlock = Block<alloy_rpc_types_eth::Transaction<TempoTxEnvelope>, TempoHe
 const FILTER_OWNER_PRUNE_INTERVAL: Duration = Duration::from_secs(60);
 /// Keep L1 log requests comfortably below public-provider block-range limits.
 const L1_BATCH_LOG_QUERY_MAX_BLOCKS: u64 = 50_000;
+/// Keep recent immutable submitted summaries in memory for explorer reuse.
+const BATCH_SUMMARY_CACHE_CAPACITY: usize = 2_048;
 
 type MarketKey = (Address, Address);
 type MidpointHistories = RwLock<HashMap<MarketKey, Arc<MidpointHistory>>>;
+type BatchSummaryCache = RwLock<BTreeMap<u64, BatchSummary>>;
 
 #[cfg(test)]
 mod test_market {
@@ -185,6 +188,10 @@ pub struct ZoneRpc<Api: EthApiTypes> {
     /// [`zone_get_midpoint_history`](Self::zone_get_midpoint_history).
     /// Written by a background sampler; never sees owner data.
     midpoint_histories: Arc<MidpointHistories>,
+    /// Recent submitted batches. Once emitted on L1 these summaries are immutable.
+    batch_summaries: Arc<BatchSummaryCache>,
+    /// Serializes batch-explorer L1 reads across concurrent private-RPC requests.
+    batch_query_lock: Arc<Mutex<()>>,
     /// Unix timestamp at which the (static) reference-price snapshot was
     /// loaded. Used to compute snapshot age for `zone_getReferencePrice`.
     ref_price_loaded_at: u64,
@@ -196,11 +203,11 @@ impl<Api: EthApiTypes + 'static> ZoneRpc<Api> {
         eth: EthHandlers<Api>,
         config: zone_rpc::PrivateRpcConfig,
     ) -> eyre::Result<Self> {
-        let l1_rpc_url = config.l1_rpc_url.clone();
+        let l1_rpc_url = l1_read_rpc_url(&config.l1_rpc_url)?;
         let zone_rpc_url = config.zone_rpc_url.clone();
         let l1_provider = ProviderBuilder::new_with_network::<TempoNetwork>()
             .connect_with_config(
-                &l1_rpc_url,
+                l1_rpc_url.as_str(),
                 rpc_connection_config(config.retry_connection_interval),
             )
             .await
@@ -227,6 +234,8 @@ impl<Api: EthApiTypes + 'static> ZoneRpc<Api> {
             tempo_state,
             filter_owners: Arc::new(Mutex::new(HashMap::new())),
             midpoint_histories: Arc::new(RwLock::new(HashMap::new())),
+            batch_summaries: Arc::new(RwLock::new(BTreeMap::new())),
+            batch_query_lock: Arc::new(Mutex::new(())),
             ref_price_loaded_at,
         };
         rpc.spawn_filter_owner_pruner();
@@ -622,6 +631,14 @@ impl<Api: EthApiTypes + 'static> ZoneRpc<Api> {
         self.fetch_batch_logs_by_topics(&topics).await
     }
 
+    fn cached_batch_summary(&self, batch_number: u64) -> Option<BatchSummary> {
+        self.batch_summaries.read().get(&batch_number).cloned()
+    }
+
+    fn cache_batch_summary(&self, batch_number: u64, summary: BatchSummary) {
+        insert_batch_summary(&mut self.batch_summaries.write(), batch_number, summary);
+    }
+
     /// Fetch the requested `BatchSubmitted` topics without issuing an unbounded
     /// `eth_getLogs` request. Public L1 providers cap the block span even when
     /// indexed topics are supplied, so scan backwards from the current tip in
@@ -638,16 +655,16 @@ impl<Api: EthApiTypes + 'static> ZoneRpc<Api> {
         }
 
         let portal = ZonePortal::new(self.config.zone_portal, self.l1_provider.clone());
-        let (genesis_block, latest_block) = tokio::try_join!(
-            async {
-                portal
-                    .genesisTempoBlockNumber()
-                    .call()
-                    .await
-                    .map_err(internal)
-            },
-            async { self.l1_provider.get_block_number().await.map_err(internal) },
-        )?;
+        let genesis_block = portal
+            .genesisTempoBlockNumber()
+            .call()
+            .await
+            .map_err(internal)?;
+        let latest_block = self
+            .l1_provider
+            .get_block_number()
+            .await
+            .map_err(internal)?;
         if latest_block < genesis_block {
             return Ok(Vec::new());
         }
@@ -694,6 +711,9 @@ impl<Api: EthApiTypes + 'static> ZoneRpc<Api> {
         let event = ZonePortal::BatchSubmitted::decode_log(&log.inner)
             .map_err(internal)?
             .data;
+        if let Some(summary) = self.cached_batch_summary(event.withdrawalBatchIndex) {
+            return Ok(summary);
+        }
         let settlement_tx_hash = log
             .transaction_hash
             .ok_or_else(|| JsonRpcError::internal("BatchSubmitted log missing transaction hash"))?;
@@ -701,30 +721,28 @@ impl<Api: EthApiTypes + 'static> ZoneRpc<Api> {
             .block_number
             .ok_or_else(|| JsonRpcError::internal("BatchSubmitted log missing block number"))?;
 
-        let (settled_at, tx, zone_block_to) = tokio::try_join!(
-            async {
-                self.l1_provider
-                    .get_block_by_number(l1_block_number.into())
-                    .await
-                    .map(|opt| opt.as_ref().map(|b| b.header.timestamp()))
-                    .map_err(internal)
-            },
-            async {
-                self.l1_provider
-                    .get_transaction_by_hash(settlement_tx_hash)
-                    .await
-                    .map_err(internal)?
-                    .ok_or_else(|| {
-                        JsonRpcError::internal("BatchSubmitted settlement tx not found on L1")
-                    })
-            },
-            async {
-                self.zone_provider
-                    .get_block_by_hash(event.nextBlockHash)
-                    .await
-                    .map_err(internal)
-            },
-        )?;
+        // Tempo's public endpoint enforces a low per-IP connection limit. Keep
+        // explorer hydration strictly serial so one page cannot open a burst of
+        // block/transaction connections alongside the sequencer's own L1 work.
+        let zone_block_to = self
+            .zone_provider
+            .get_block_by_hash(event.nextBlockHash)
+            .await
+            .map_err(internal)?;
+        let settled_at = self
+            .l1_provider
+            .get_block_by_number(l1_block_number.into())
+            .await
+            .map(|opt| opt.as_ref().map(|b| b.header.timestamp()))
+            .map_err(internal)?;
+        let tx = self
+            .l1_provider
+            .get_transaction_by_hash(settlement_tx_hash)
+            .await
+            .map_err(internal)?
+            .ok_or_else(|| {
+                JsonRpcError::internal("BatchSubmitted settlement tx not found on L1")
+            })?;
 
         let call = ZonePortal::submitBatchCall::abi_decode(tx.input().as_ref()).map_err(|err| {
             JsonRpcError::internal(format!("failed to decode submitBatch calldata: {err}"))
@@ -760,7 +778,7 @@ impl<Api: EthApiTypes + 'static> ZoneRpc<Api> {
             _ => BatchAggregates::default(),
         };
 
-        Ok(map_batch_summary(
+        let summary = map_batch_summary(
             &event,
             &call,
             settlement_tx_hash,
@@ -769,7 +787,9 @@ impl<Api: EthApiTypes + 'static> ZoneRpc<Api> {
             zone_block_to_number,
             sealed_at,
             aggregates,
-        ))
+        );
+        self.cache_batch_summary(event.withdrawalBatchIndex, summary.clone());
+        Ok(summary)
     }
 
     /// Fetch darkpool `OrderSubmitted` / `OrderFilled` logs covering the
@@ -1657,6 +1677,10 @@ where
 
     fn zone_list_batches(&self, params: ListBatchesParams, _auth: AuthContext) -> BoxFut<'_> {
         Box::pin(async move {
+            // The public L1 endpoint rejects connection bursts by source IP.
+            // Queue explorer pages so concurrent callers cannot multiply the
+            // serial hydration work performed below.
+            let _query_guard = self.batch_query_lock.lock().await;
             let limit = params
                 .limit
                 .unwrap_or(LIST_BATCHES_DEFAULT_LIMIT)
@@ -1700,13 +1724,16 @@ where
             let start = end
                 .saturating_sub((remaining_limit as u64).saturating_sub(1))
                 .max(1);
-            let logs = self.fetch_batch_logs_in_range(start, end).await?;
-
-            let futures = logs
-                .into_iter()
-                .map(|log| self.build_batch_summary(log))
+            let expected_count = end.saturating_sub(start).saturating_add(1) as usize;
+            let mut submitted_batches = (start..=end)
+                .filter_map(|batch_number| self.cached_batch_summary(batch_number))
                 .collect::<Vec<_>>();
-            let mut submitted_batches = futures::future::try_join_all(futures).await?;
+            if submitted_batches.len() != expected_count {
+                submitted_batches.clear();
+                for log in self.fetch_batch_logs_in_range(start, end).await? {
+                    submitted_batches.push(self.build_batch_summary(log).await?);
+                }
+            }
             submitted_batches.sort_by(|a, b| b.batch_number.cmp(&a.batch_number));
             batches.extend(submitted_batches);
 
@@ -1728,6 +1755,13 @@ where
             if batch_number == 0 {
                 return Ok(raw_null());
             }
+            if let Some(summary) = self.cached_batch_summary(batch_number) {
+                return to_raw(&summary);
+            }
+            let _query_guard = self.batch_query_lock.lock().await;
+            if let Some(summary) = self.cached_batch_summary(batch_number) {
+                return to_raw(&summary);
+            }
             let log = match self.fetch_batch_log(batch_number).await? {
                 Some(log) => log,
                 None => return Ok(raw_null()),
@@ -1747,6 +1781,13 @@ where
             match classify_batch_query(trimmed) {
                 BatchQuery::BatchNumber(0) => Ok(raw_null()),
                 BatchQuery::BatchNumber(batch_number) => {
+                    if let Some(summary) = self.cached_batch_summary(batch_number) {
+                        return to_raw(&summary);
+                    }
+                    let _query_guard = self.batch_query_lock.lock().await;
+                    if let Some(summary) = self.cached_batch_summary(batch_number) {
+                        return to_raw(&summary);
+                    }
                     let log = match self.fetch_batch_log(batch_number).await? {
                         Some(log) => log,
                         None => return Ok(raw_null()),
@@ -1755,6 +1796,7 @@ where
                     to_raw(&summary)
                 }
                 BatchQuery::SettlementTxHash(tx_hash) => {
+                    let _query_guard = self.batch_query_lock.lock().await;
                     let receipt = match self
                         .l1_provider
                         .get_transaction_receipt(tx_hash)
@@ -2404,6 +2446,17 @@ enum BatchQuery {
     Invalid,
 }
 
+fn insert_batch_summary(
+    cache: &mut BTreeMap<u64, BatchSummary>,
+    batch_number: u64,
+    summary: BatchSummary,
+) {
+    cache.insert(batch_number, summary);
+    while cache.len() > BATCH_SUMMARY_CACHE_CAPACITY {
+        cache.pop_first();
+    }
+}
+
 fn classify_batch_query(query: &str) -> BatchQuery {
     let hex_body = query
         .strip_prefix("0x")
@@ -2929,9 +2982,62 @@ pub(crate) fn rpc_connection_config(retry_connection_interval: Duration) -> Conn
         .with_retry_interval(retry_connection_interval)
 }
 
+/// Return the HTTP(S) endpoint used by private-RPC L1 reads.
+///
+/// The zone's main L1 subscriber still uses the configured WS(S) endpoint for
+/// new-head subscriptions. Explorer and status methods only perform request /
+/// response reads, so keeping them off the pubsub transport prevents a broken
+/// websocket reconnect loop from stalling authenticated RPC requests.
+fn l1_read_rpc_url(l1_rpc_url: &str) -> eyre::Result<url::Url> {
+    let mut url: url::Url = l1_rpc_url.parse().wrap_err("invalid private RPC L1 URL")?;
+    let http_scheme = match url.scheme() {
+        "http" | "https" => return Ok(url),
+        "ws" => "http",
+        "wss" => "https",
+        scheme => eyre::bail!("unsupported private RPC L1 URL scheme `{scheme}`"),
+    };
+    url.set_scheme(http_scheme)
+        .map_err(|_| eyre::eyre!("failed to set private RPC L1 URL scheme"))?;
+    Ok(url)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn l1_read_rpc_url_uses_http_for_request_response_reads() {
+        assert_eq!(
+            l1_read_rpc_url("wss://rpc.example.test/rpc?key=value")
+                .unwrap()
+                .as_str(),
+            "https://rpc.example.test/rpc?key=value",
+        );
+        assert_eq!(
+            l1_read_rpc_url("ws://127.0.0.1:8545").unwrap().as_str(),
+            "http://127.0.0.1:8545/",
+        );
+    }
+
+    #[test]
+    fn l1_read_rpc_url_preserves_existing_http_endpoints() {
+        assert_eq!(
+            l1_read_rpc_url("https://rpc.example.test")
+                .unwrap()
+                .as_str(),
+            "https://rpc.example.test/",
+        );
+        assert_eq!(
+            l1_read_rpc_url("http://127.0.0.1:8545").unwrap().as_str(),
+            "http://127.0.0.1:8545/",
+        );
+    }
+
+    #[test]
+    fn l1_read_rpc_url_rejects_unsupported_or_invalid_urls() {
+        assert!(l1_read_rpc_url("ftp://rpc.example.test").is_err());
+        assert!(l1_read_rpc_url("not a URL").is_err());
+    }
 
     #[test]
     fn regular_deposit_status_maps_terminal_events() {
@@ -3370,6 +3476,28 @@ mod tests {
         let obj = json.as_object().expect("summary must be a JSON object");
         assert!(!obj.contains_key("settlementTxHash"));
         assert!(!obj.contains_key("proofRef"));
+    }
+
+    #[test]
+    fn batch_summary_cache_keeps_only_the_newest_submitted_batches() {
+        let mut cache = BTreeMap::new();
+        for batch_number in 1..=(BATCH_SUMMARY_CACHE_CAPACITY as u64 + 1) {
+            let summary = map_pending_batch_summary(
+                batch_number,
+                None,
+                batch_number,
+                batch_number,
+                B256::ZERO,
+                B256::repeat_byte(0x11),
+                BatchAggregates::default(),
+            );
+            insert_batch_summary(&mut cache, batch_number, summary);
+        }
+
+        assert_eq!(cache.len(), BATCH_SUMMARY_CACHE_CAPACITY);
+        assert!(!cache.contains_key(&1));
+        assert!(cache.contains_key(&2));
+        assert!(cache.contains_key(&(BATCH_SUMMARY_CACHE_CAPACITY as u64 + 1)));
     }
 
     /// Build a darkpool [`alloy_rpc_types_eth::Log`] for an `OrderSubmitted`
