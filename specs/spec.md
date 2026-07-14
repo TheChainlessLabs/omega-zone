@@ -19,6 +19,7 @@
     - [Gas Rate Configuration](#gas-rate-configuration)
     - [Encryption Key Management](#encryption-key-management)
     - [Sequencer Transfer](#sequencer-transfer)
+    - [Admin Transfer](#admin-transfer)
   - [Deposits](#deposits)
     - [Regular Deposits](#regular-deposits)
     - [Deposit Fees](#deposit-fees)
@@ -43,6 +44,7 @@
     - [Privacy Modifications](#privacy-modifications)
   - [Tempo State Reads](#tempo-state-reads)
     - [TempoState Predeploy](#tempostate-predeploy)
+    - [Tempo Follower Mode](#tempo-follower-mode)
     - [Header Finalization](#header-finalization)
     - [Storage Reads](#storage-reads)
     - [Staleness and Finality](#staleness-and-finality)
@@ -55,7 +57,6 @@
     - [Method Access Control](#method-access-control)
     - [Block Responses](#block-responses)
     - [Event Filtering](#event-filtering)
-    - [Timing Side Channels](#timing-side-channels)
     - [WebSocket Subscriptions](#websocket-subscriptions)
     - [Zone-Specific Methods](#zone-specific-methods)
     - [Error Codes](#error-codes)
@@ -177,12 +178,15 @@ Each zone has two privileged roles registered on the [`ZonePortal`](#izoneportal
 - Holds governance powers over the zone (token enablement, deposit pause/resume).
 - Expected to be a cold key, multisig, or governance contract.
 - Set at zone creation via [`IZoneFactory.createZone`](#izonefactory).
-- Cannot be renounced. The zero address is never a valid admin.
+- Rotatable via a two-step transfer (see [Admin Transfer](#admin-transfer)), so a lost or compromised admin key can be moved to a new cold key or multisig.
+- Cannot be renounced.
 
 **Sequencer.**
 
 - Operates the zone: collects transactions, produces blocks, advances Tempo, processes deposits and withdrawals, and submits batches with proofs.
 - Expected to be an online operational key.
+- Rotatable via a two-step transfer. (see [Sequencer Transfer](#sequencer-transfer))
+- Cannot be renounced.
 - Set at zone creation via [`IZoneFactory.createZone`](#izonefactory).
 - Holds the encryption private key used to decrypt [encrypted deposits](#encrypted-deposits).
 
@@ -197,6 +201,10 @@ The following table lists every privileged action and the role authorized to inv
 | `enableToken(token)` | [`ZonePortal`](#izoneportal) | **admin** |
 | `pauseDeposits(token)` | [`ZonePortal`](#izoneportal) | **admin** |
 | `resumeDeposits(token)` | [`ZonePortal`](#izoneportal) | **admin** |
+| `transferAdmin(newAdmin)` | [`ZonePortal`](#izoneportal) | **admin** |
+| `acceptAdmin()` | [`ZonePortal`](#izoneportal) | **pending admin** |
+| `transferSequencer(newSequencer)` | [`ZonePortal`](#izoneportal) | **sequencer** |
+| `acceptSequencer()` | [`ZonePortal`](#izoneportal) | **pending sequencer** |
 | `setZoneGasRate(rate)` | [`ZonePortal`](#izoneportal) | **sequencer** |
 | `setSequencerEncryptionKey(...)` | [`ZonePortal`](#izoneportal) | **sequencer** |
 | `setRpcUrl(url)` | [`ZonePortal`](#izoneportal) | **sequencer** |
@@ -254,15 +262,14 @@ The portal gives the messenger max approval for each enabled token so that withd
 
 ### Zone Predeploys
 
-Each zone has six system contracts deployed at genesis at fixed addresses:
+Each zone has five system contracts deployed at genesis at fixed addresses:
 
 | Predeploy | Address | Purpose |
 |-----------|---------|---------|
-| [`TempoState`](#itempostate) | `0x1c00...0000` | Stores finalized Tempo block headers and provides storage read access to Tempo contracts. |
+| [`TempoState`](#itempostate) | `0x1c00...0000` | Stores the finalized Tempo checkpoint and provides storage read access to Tempo contracts. |
 | [`ZoneInbox`](#izoneinbox) | `0x1c00...0001` | Advances the zone's view of Tempo and processes incoming deposits. Sole mint authority. |
 | [`ZoneOutbox`](#izoneoutbox) | `0x1c00...0002` | Handles withdrawal requests and batch finalization. Sole burn authority. |
 | [`ZoneConfig`](#izoneconfig) | `0x1c00...0003` | Central configuration. Reads the sequencer address and token registry from Tempo via `TempoState`. |
-| `TempoStateReader` | `0x1c00...0004` | Precompile stub for reading Tempo L1 storage. Actual reads are performed by the zone node and validated against the `tempoStateRoot`. |
 | `ZoneTxContext` | `0x1c00...0005` | Provides the current transaction hash to system contracts (used by `ZoneOutbox` for `senderTag` computation). |
 
 `ZoneConfig` reads the sequencer address and token registry from the portal on Tempo via `TempoState` storage reads, making Tempo the single source of truth for zone configuration. See [Tempo State Reads](#tempo-state-reads) for details.
@@ -309,7 +316,7 @@ The sequencer can also configure `maxWithdrawalsPerBlock` via `ZoneOutbox.setMax
 
 ### Encryption Key Management
 
-The sequencer publishes a secp256k1 encryption public key used for [encrypted deposits](#encrypted-deposits). The key is set via `setSequencerEncryptionKey(x, yParity, popV, popR, popS)` on the portal, which requires a proof of possession (an ECDSA signature proving control of the corresponding private key).
+The sequencer publishes a secp256k1 encryption public key used for [encrypted deposits](#encrypted-deposits) and for deterministic authenticated-withdrawal sender reveals. The key is set via `setSequencerEncryptionKey(x, yParity, popV, popR, popS)` on the portal, which requires a proof of possession (an ECDSA signature proving control of the corresponding private key).
 
 The portal stores all historical encryption keys in an append-only list. Users specify a `keyIndex` when making encrypted deposits, referencing which key they encrypted to. This avoids a race condition where a key rotates between transaction signing and block inclusion.
 
@@ -319,10 +326,19 @@ When a new key is set, the previous key remains valid for `ENCRYPTION_KEY_GRACE_
 
 The sequencer can transfer control to a new address via a two-step process on Tempo:
 
-1. Current sequencer calls `ZonePortal.transferSequencer(newSequencer)` to nominate a new sequencer.
+1. Current sequencer calls `ZonePortal.transferSequencer(newSequencer)` to nominate a new sequencer. Calling it with `address(0)` cancels a pending transfer.
 2. New sequencer calls `ZonePortal.acceptSequencer()` to accept the transfer.
 
 Sequencer management happens exclusively on Tempo. Zone-side contracts read the sequencer address from the portal via `ZoneConfig`, so the transfer takes effect on the zone once `advanceTempo` imports the Tempo block containing the accepted transfer. The two-step pattern prevents accidental transfers to incorrect addresses.
+
+### Admin Transfer
+
+The admin can transfer the governance role to a new address via the same two-step process, allowing an operator to rotate to a new cold key or multisig after a planned governance change or a suspected key compromise:
+
+1. Current admin calls `ZonePortal.transferAdmin(newAdmin)` to nominate a new admin. Calling it with `address(0)` cancels a pending transfer.
+2. New admin calls `ZonePortal.acceptAdmin()` to accept the transfer.
+
+Until `acceptAdmin()` is called the current admin retains all governance powers, so a nomination to a wrong or unreachable address cannot strand the role. Because only a non-zero pending admin can accept, the transfer can never set the admin to `address(0)` — the admin still cannot be renounced.
 
 <br>
 
@@ -613,15 +629,15 @@ for i from (count - 1) down to 0:
 
 The function writes `withdrawalQueueHash` and `withdrawalBatchIndex` to `lastBatch` storage, where the proof reads them. The call is required at each batch boundary even if there are zero withdrawals (use `count = 0`) so the batch index advances. The `withdrawalBatchIndex` ensures batches are submitted in order, preventing the sequencer from omitting batches that contain withdrawals.
 
-Batch cadence is sequencer-chosen. It closes a batch when there are pending withdrawals or otherwise closes an empty batch when the configured `withdrawalBatchInterval` elapses; the default interval is 60 seconds. Intermediate zone blocks in the same batch do not call `finalizeWithdrawalBatch`.
+Batch cadence is deterministic. It closes a batch when there are pending withdrawals or otherwise closes an empty batch at a block-number boundary. The default cadence is every 120th zone block (~1 minute at Tempo's expected 500 ms block interval), configurable as a block count. Intermediate zone blocks in the same batch do not call `finalizeWithdrawalBatch`.
 
 ### Withdrawal Queue
 
-The portal stores withdrawals in a fixed-size ring buffer with `WITHDRAWAL_QUEUE_CAPACITY = 100`. Each batch with a non-zero `withdrawalQueueHash` gets its own slot. Empty batches advance `withdrawalBatchIndex` but do not consume a ring-buffer slot.
+The portal stores withdrawals in a fixed-size ring buffer with `WITHDRAWAL_QUEUE_CAPACITY = 100`. Each batch with a non-zero `withdrawalQueueHash` gets its own logical queue index. Empty batches advance `withdrawalBatchIndex` but do not consume a queue index.
 
-The portal tracks `head` (oldest unprocessed batch) and `tail` (where the next batch writes). Both are raw counters that never wrap. Modular arithmetic (`index % 100`) is used for slot indexing. Empty slots contain `EMPTY_SENTINEL` (`0xff...ff`) instead of `0x00` to avoid storage clearing and gas refund incentive issues.
+The portal tracks `head` (oldest unprocessed batch) and `tail` (the logical index assigned to the next non-empty batch). Both are monotonically increasing counters that never wrap. The physical ring-buffer slot for a logical queue index is `index % 100`. `withdrawalQueueSlot(physicalSlot)` reads a physical slot, so clients resolving a pending logical index from an event must call `withdrawalQueueSlot(withdrawalQueueIndex % 100)`. Empty physical slots contain `EMPTY_SENTINEL` (`0xff...ff`) instead of `0x00` to avoid storage clearing and gas refund incentive issues.
 
-When `submitBatch` includes a non-zero `withdrawalQueueHash`, it is written to `slots[tail % 100]` and `tail` advances. The queue reverts with `WithdrawalQueueFull` if `tail - head >= 100`.
+When `submitBatch` includes a non-zero `withdrawalQueueHash`, the current `tail` is assigned as its logical `withdrawalQueueIndex`, the hash is written to `slots[withdrawalQueueIndex % 100]`, and `tail` advances. `BatchSubmitted.withdrawalQueueIndex` emits that assigned logical index. For an empty batch, the event emits `NO_QUEUE_INDEX = type(uint256).max` and `tail` does not advance. The queue reverts with `WithdrawalQueueFull` if `tail - head >= 100`.
 
 ### Withdrawal Processing
 
@@ -691,6 +707,14 @@ The `txHash` is the hash of the `requestWithdrawal` transaction on the zone. Sin
 
 The sender can optionally specify a `revealTo` public key (compressed secp256k1, 33 bytes) when requesting the withdrawal. If provided, the sequencer encrypts `(sender, txHash)` to that key using ECDH and populates `encryptedSender` in the withdrawal struct. The wire format is `ephemeralPubKey (33 bytes) || nonce (12 bytes) || ciphertext (52 bytes) || tag (16 bytes)` totaling 113 bytes.
 
+Unlike user-created encrypted deposits, authenticated-withdrawal sender reveals are sequencer-created data that is hashed into the withdrawal queue. To keep zone blocks deterministic, the sequencer must not use fresh randomness when producing `encryptedSender`. It first derives a purpose-specific authenticated-withdrawal HMAC key from the registered sequencer encryption private key:
+
+```
+withdrawalHmacKey = HMAC-SHA256(uint256_be(sequencerEncryptionPrivKey), "tempo-zone-authenticated-withdrawal-derivation-key-v1")
+```
+
+Here, `uint256_be` is the 32-byte big-endian encoding of the private scalar. Using `withdrawalHmacKey`, the sequencer derives the ECIES ephemeral scalar deterministically from the zone id, `revealTo`, `sender`, and `txHash`, retrying with a counter if the derived value is not a valid secp256k1 scalar. It derives the AES-GCM nonce from the same context plus the resulting ephemeral public key. For the same registered encryption key, zone id, reveal key, sender, and withdrawal transaction hash, `encryptedSender` is therefore byte-for-byte reproducible.
+
 Two disclosure modes are available:
 
 - **Manual reveal**: The sender shares `txHash` with a verifier off-chain. The verifier checks `keccak256(abi.encodePacked(sender, txHash)) == senderTag`.
@@ -729,7 +753,7 @@ Each zone block contains system transactions and user transactions in a fixed or
 2. User transactions, executed in order.
 3. `ZoneOutbox.finalizeWithdrawalBatch(count, blockNumber, encryptedSenders)` (required in the final block of a batch, absent in intermediate blocks). Constructs the withdrawal hash chain from pending withdrawals, populates `encryptedSender` for authenticated withdrawals, and writes the `withdrawalQueueHash` and `withdrawalBatchIndex` to state. Must be called at each batch boundary even if there are zero withdrawals so the batch index advances. The builder may execute it as a zone system transaction with `msg.sender == address(0)`.
 
-A batch covers one or more zone blocks and ends with exactly one `finalizeWithdrawalBatch` call. The sequencer controls batch frequency, and finalizes when withdrawals are present or uses the configured `withdrawalBatchInterval` as the maximum time between empty batch boundaries (60 seconds by default). Intermediate blocks within a batch contain only `advanceTempo` (optional) and user transactions.
+A batch covers one or more zone blocks and ends with exactly one `finalizeWithdrawalBatch` call. The sequencer finalizes when withdrawals are present or when the current zone block number is a configured batch-cadence multiple (every 120 blocks by default). Intermediate blocks within a batch contain only `advanceTempo` (optional) and user transactions.
 
 ### Block Header Format
 
@@ -764,15 +788,21 @@ The zone reads all of its configuration from Tempo: the sequencer address, the t
 
 ### TempoState Predeploy
 
-`TempoState` is deployed at `0x1c00000000000000000000000000000000000000`. It stores finalized Tempo block header fields and provides storage read access to Tempo contracts.
+`TempoState` is deployed at `0x1c00000000000000000000000000000000000000`. It stores the finalized Tempo checkpoint and provides storage read access to Tempo contracts.
 
-The predeploy exposes Tempo wrapper fields (`generalGasLimit`, `sharedGasLimit`) and selected inner Ethereum header fields (`parentHash`, `beneficiary`, `stateRoot`, `blockNumber`, `timestamp`, etc.). The `tempoBlockHash` is always `keccak256(RLP(TempoHeader))`, committing to the complete header contents even though only a subset of fields are stored.
+The durable onchain checkpoint is `tempoBlockHash` and `tempoBlockNumber`. The `tempoBlockHash` is always `keccak256(RLP(TempoHeader))`, committing to the complete header contents without persisting every decoded header field.
 
 Tempo headers are RLP-encoded as `rlp([general_gas_limit, shared_gas_limit, timestamp_millis_part, inner])`, where `inner` is a standard Ethereum header.
 
+### Tempo Follower Mode
+
+Zone sequencers MUST run their Tempo L1 provider in Tempo follower mode with consensus certification enabled. The follower stack syncs finalized Tempo consensus state from an upstream node and drives the execution layer from those finalized certificates.
+
+Sequencers MUST NOT use uncertified follow mode (`--follow.nocertify`) or a generic execution-only RPC as the source for `advanceTempo` headers or Tempo state reads. Certified follower mode is required so the zone only imports Tempo headers that have reached deterministic finality; this prevents zone proofs from anchoring deposits, token configuration, sequencer rotation, or TIP-403 policy reads to state that could be reorged.
+
 ### Header Finalization
 
-`ZoneInbox.advanceTempo()` calls `TempoState.finalizeTempo(header)` to advance the zone's view of Tempo. This function decodes the RLP header, validates chain continuity (parent hash must match the previous finalized header, block number must increment by one), and stores the header fields.
+`ZoneInbox.advanceTempo()` calls `TempoState.finalizeTempo(header)` to advance the zone's view of Tempo. This function decodes the RLP header, validates chain continuity (parent hash must match the previous finalized header, block number must increment by one), stores the new checkpoint, and emits the decoded state root in `TempoBlockFinalized`.
 
 If a block omits `advanceTempo`, the Tempo binding carries forward from the previous block. Multiple blocks can share the same Tempo binding.
 
@@ -780,7 +810,7 @@ If a block omits `advanceTempo`, the Tempo binding carries forward from the prev
 
 `TempoState` provides `readTempoStorageSlot(account, slot)` for reading storage from any Tempo contract. This function is restricted to zone system contracts (`ZoneInbox`, `ZoneOutbox`, `ZoneConfig`). User transactions cannot call it.
 
-The function is a precompile stub. The actual storage reads are performed by the zone node and validated against the `tempoStateRoot` from the finalized header. The prover includes Merkle proofs for each unique account and storage slot accessed by system contracts during the batch.
+The native precompile resolves the read through the zone node's Tempo L1 provider at the currently finalized `tempoBlockNumber`. The prover validates these reads against the Tempo state root from the corresponding finalized header witness. The prover includes Merkle proofs for each unique account and storage slot accessed by system contracts during the batch.
 
 Current callers:
 
@@ -872,15 +902,25 @@ The RPC uses a default-deny model. Any method not explicitly listed returns `-32
 
 **Disabled.** Methods not available on zones. `eth_getProof` leaks trie structure. `eth_newPendingTransactionFilter` and `eth_subscribe("newPendingTransactions")` enable mempool observation. Uncle query methods (`eth_getUncleByBlockNumberAndIndex`, `eth_getUncleByBlockHashAndIndex`) and mining methods (`eth_mining`, `eth_hashrate`, `eth_getWork`, `eth_submitWork`, `eth_submitHashrate`) do not apply to zones.
 
+**Note on timing side channel attacks:** Scoped methods returning empty values could technically be timed to estimate if the values exist. However, (1) Benchmarked timing differences are very small and (2) The values like `transactionHash` etc... can't be correlated to actual user data, so any leaked signal is not material.
+
 ### Block Responses
 
 For non-sequencer callers, block responses are modified:
 
 - The `transactions` field is always an empty array, regardless of the `include_transactions` parameter.
-- The `logsBloom` field is zeroed. The Bloom filter summarizes all log topics and emitting addresses in the block, so returning the real value would allow probing whether a specific address had activity in that block.
-- All other header fields (`number`, `hash`, `parentHash`, `timestamp`, `stateRoot`, `gasUsed`, etc.) are returned normally. Aggregate activity metrics are intentionally public.
+- Header fields that reveal aggregate execution activity are zeroed or emptied: `gasUsed`, `transactionsRoot`, `receiptsRoot`, `stateRoot`, `extraData`, `logsBloom`, `size`, optional blob gas fields (`blobGasUsed`, `excessBlobGas`), and optional withdrawal fields (`withdrawals`, `withdrawalsRoot`). The Bloom filter summarizes all log topics and emitting addresses in the block, and the other redacted fields reveal transaction count, payload size, state changes, receipt/log activity, blob usage, or withdrawal activity.
+- Public block identity and timing fields such as `number`, `hash`, `parentHash`, `timestamp`, and fee metadata remain visible.
 
 The sequencer receives full block data.
+
+### Fee History
+
+`eth_feeHistory` uses the underlying node implementation for block range resolution, history limits, and reward percentile validation, then redacts activity-derived fields before returning the response to non-sequencer callers:
+
+- `baseFeePerGas` is set to the public zone T0 base fee for every returned entry.
+- `gasUsedRatio`, `baseFeePerBlobGas` and `blobGasUsedRatio` are set to `0`.
+- `reward`, when requested, is returned with the same shape but every value set to `0`.
 
 ### Event Filtering
 
@@ -896,17 +936,17 @@ All log queries are restricted to TIP-20 events where the authenticated account 
 
 All other events (system events, configuration events) are filtered out. The `address` filter parameter must be a zone token address or omitted. The RPC server injects topic filters to restrict indexed address parameters to the caller, then post-filters results as a final pass.
 
-### Timing Side Channels
+To avoid leaking how much activity occurred in a block, some fields of returned logs are redacted:
 
-Scoped methods that fetch data before checking authorization leak existence via timing differences. The RPC server enforces a minimum response time of 100ms on `eth_getTransactionByHash`, `eth_getTransactionReceipt`, `eth_getLogs`, `eth_getFilterLogs`, and `eth_getFilterChanges`.
+- `transactionIndex` is set to `0` on every log, so the caller cannot infer its transaction's position among, or the number of, other transactions in the block.
+- `logIndex` is renumbered per transaction rather than exposing the log's global position in the block. `(transactionHash, logIndex)` is stable and consistent for a given log across `eth_getLogs`, `eth_getFilterLogs`, `eth_getFilterChanges`, `eth_getTransactionReceipt`, and `eth_subscribe("logs")`.
 
-Methods where authorization is checked before any data fetch (`eth_getBalance`, `eth_call`, `eth_sendRawTransaction`) do not need the speed bump.
 
 ### WebSocket Subscriptions
 
 WebSocket connections follow the same authorization model. The authorization token is provided during the handshake and scopes all subscriptions for that connection.
 
-- `eth_subscribe("newHeads")`: allowed, pushes block headers with `logsBloom` zeroed for non-sequencer callers.
+- `eth_subscribe("newHeads")`: allowed, pushes block headers with the same header redaction as HTTP block responses for non-sequencer callers.
 - `eth_subscribe("logs")`: scoped to the authenticated account using the same event filtering rules.
 - `eth_subscribe("newPendingTransactions")`: disabled.
 
@@ -962,7 +1002,7 @@ It takes a complete witness of zone blocks and their dependencies, executes EVM 
 
 The witness contains everything needed to re-execute the batch:
 
-- **PublicInputs**: `prev_block_hash`, `tempo_block_number`, `anchor_block_number`, `anchor_block_hash`, `expected_withdrawal_batch_index`, `sequencer`. These are the values the portal passes to the verifier and the proof must be consistent with.
+- **PublicInputs**: `zone_id`, `prev_block_hash`, `tempo_block_number`, `anchor_block_number`, `anchor_block_hash`, `expected_withdrawal_batch_index`, `sequencer`. These are the values the portal passes to the verifier and the proof must be consistent with.
 - **BatchWitness**: the public inputs, the previous batch's block header, the zone blocks to execute, the initial zone state, Tempo state proofs, and Tempo ancestry headers (for ancestry validation).
 - **ZoneBlock**: `number`, `parent_hash`, `timestamp`, `beneficiary`, `protocol_version`, `tempo_header_rlp` (optional), `deposits`, `decryptions`, `enabled_tokens`, `finalize_withdrawal_batch_count` (optional), `finalize_withdrawal_batch_encrypted_senders`, and user `transactions`.
 - **ZoneStateWitness**: the initial zone state root, a deduplicated pool of zone-state trie nodes, and decoded account / storage reads needed to bootstrap execution. Only accounts and storage slots accessed during execution are included. Missing witness data must produce an error, not default to zero, to prevent the prover from omitting non-zero state.
@@ -976,7 +1016,7 @@ flowchart TB
     subgraph BW["BatchWitness"]
         direction TB
 
-        PI["PublicInputs<br/>prev_block_hash<br/>tempo_block_number<br/>anchor_block_number<br/>anchor_block_hash<br/>expected_withdrawal_batch_index<br/>sequencer"]
+        PI["PublicInputs<br/>zone_id<br/>prev_block_hash<br/>tempo_block_number<br/>anchor_block_number<br/>anchor_block_hash<br/>expected_withdrawal_batch_index<br/>sequencer"]
 
         PH["ZoneHeader<br/>parent_hash<br/>beneficiary<br/>state_root<br/>transactions_root<br/>receipts_root<br/>number<br/>timestamp<br/>protocol_version"]
 
@@ -1046,6 +1086,10 @@ The prover-side inputs are defined concretely below. Types that mirror the oncha
 
 ```rust
 pub struct PublicInputs {
+    /// Zone ID. The verifier must bind this public input to the zone portal;
+    /// the program derives the EVM chain ID from it.
+    pub zone_id: u32,
+
     /// Previous batch's block hash (must equal portal.blockHash)
     pub prev_block_hash: B256,
 
@@ -1139,7 +1183,7 @@ pub struct ZoneBlock {
     /// `ZoneOutbox.finalizeWithdrawalBatch(count, blockNumber, encryptedSenders)`.
     /// Required iff finalize_withdrawal_batch_count is present; otherwise empty.
     /// Length must equal count. Entries are empty bytes for withdrawals without
-    /// `revealTo`, or the sequencer-supplied encrypted sender payload.
+    /// `revealTo`, or the deterministic encrypted sender payload.
     pub finalize_withdrawal_batch_encrypted_senders: Vec<Vec<u8>>,
 
     /// Transactions to execute
@@ -1184,7 +1228,7 @@ pub struct ZoneStateWitness {
     pub state_root: B256,
 
     /// Deduplicated pool of all zone-state MPT nodes
-    pub node_pool: HashMap<B256, Vec<u8>>,
+    pub node_pool: Vec<Vec<u8>>,
 
     /// Decoded account leaves needed to bootstrap execution
     pub account_reads: Vec<ZoneAccountRead>,
@@ -1209,7 +1253,7 @@ pub struct ZoneStorageRead {
 
 pub struct BatchStateProof {
     /// Deduplicated pool of all MPT nodes
-    pub node_pool: HashMap<B256, Vec<u8>>,
+    pub node_pool: Vec<Vec<u8>>,
 
     /// Tempo state reads verified against the shared node pool
     pub reads: Vec<L1StateRead>,
@@ -1235,14 +1279,14 @@ pub struct L1StateRead {
 
 `ZoneStateWitness` and `BatchStateProof` both use the same trie-proof encoding:
 
-- `node_pool` is a deduplicated map from `keccak256(rlp(node))` to the node's raw RLP bytes. The prover validates each node once by recomputing the hash.
+- `node_pool` is a deduplicated list of raw RLP-encoded nodes. The prover computes `keccak256(rlp(node))` for each entry and builds its own hash-to-node index for proof traversal.
 - Each read descriptor (`ZoneAccountRead`, `ZoneStorageRead`, or `L1StateRead`) states which decoded account or storage value must be proven against a bound trie root.
-- Verification walks the account trie using `keccak256(account)` and, when needed, the storage trie using `keccak256(slot)`, fetching branch, extension, and leaf nodes from `node_pool`.
+- Verification walks the account trie using `keccak256(account)` and, when needed, the storage trie using `keccak256(slot)`, fetching branch, extension, and leaf nodes from the prover's hash-to-node index constructed from `node_pool`.
 - For `ZoneAccountRead`, the account leaf proves the committed `code_hash`, but not the bytecode preimage itself. If the witness supplies `code`, the prover must additionally require `keccak256(code) == code_hash` before materializing that account into the execution state.
 - Missing leaves are represented by valid non-membership proofs. An absent account is interpreted as the canonical empty account: `nonce = 0`, `balance = 0`, `code = None`, `code_hash = KECCAK_EMPTY`, and an empty storage trie. An absent storage leaf is interpreted as zero.
 - Client databases may still retain historical trie nodes that are no longer reachable from the current root, but those stale nodes are irrelevant to proof verification because only nodes reachable from the bound root contribute to the proof.
 
-`ZoneStateWitness` applies this shared trie proof format to the initial zone-state root at batch start. `account_reads` and `storage_reads` describe the decoded account and storage values needed to bootstrap execution. To initialize execution, the prover checks that `ZoneStateWitness.state_root` is consistent with `prev_block_header.state_root`, validates `node_pool`, proves each `ZoneAccountRead` and `ZoneStorageRead` against that initial root, checks `keccak256(code) == code_hash` for every supplied account-code preimage, materializes the resulting account and storage values into the execution state, and only then starts replaying blocks. Missing account or storage reads are errors; they must not silently default to zero.
+`ZoneStateWitness` applies this shared trie proof format to the initial zone-state root at batch start. `account_reads` and `storage_reads` describe the decoded account and storage values needed to bootstrap execution. To initialize execution, the prover indexes `node_pool`, proves each `ZoneAccountRead` and `ZoneStorageRead` against that initial root, checks `keccak256(code) == code_hash` for every supplied account-code preimage, materializes the resulting account and storage values into the execution state, and only then starts replaying blocks. Missing account or storage reads are errors; they must not silently default to zero.
 
 ### Batch Output
 
@@ -1263,16 +1307,16 @@ The stateless execution function must reject the witness on any failed check, mi
    Require `keccak256(rlp(prev_block_header)) == public_inputs.prev_block_hash`. Require `prev_block_header.state_root == initial_zone_state.state_root`. These checks ensure that the witness starts from the exact predecessor block already committed on Tempo.
 
 2. **Verify and materialize the initial zone state.**
-   Apply the [shared trie proof format](#shared-trie-proof-format) to `initial_zone_state`: validate every node in `initial_zone_state.node_pool`, prove each `ZoneAccountRead` and `ZoneStorageRead` against `initial_zone_state.state_root`, require `keccak256(code) == code_hash` for every supplied account-code preimage, interpret non-membership as the canonical empty account or zero storage, and load the decoded results into the prover's in-memory execution state. After this step, ordinary zone-state reads during execution come from the materialized state, not from repeated Merkle-proof checks.
+   Apply the [shared trie proof format](#shared-trie-proof-format) to `initial_zone_state`: index each node in `initial_zone_state.node_pool` by `keccak256(rlp(node))`, prove each `ZoneAccountRead` and `ZoneStorageRead` against `initial_zone_state.state_root`, require `keccak256(code) == code_hash` for every supplied account-code preimage, interpret non-membership as the canonical empty account or zero storage, and load the decoded results into the prover's in-memory execution state. After this step, ordinary zone-state reads during execution come from the materialized state, not from repeated Merkle-proof checks.
 
-3. **Verify and index the Tempo proof pool.**
-   Validate every node in `tempo_state_proofs.node_pool` once by recomputing `keccak256(rlp(node))` for each node.
+3. **Index the Tempo proof pool.**
+   Compute `keccak256(rlp(node))` for each node in `tempo_state_proofs.node_pool` and build a hash-to-node index for proof traversal.
 
 4. **For each `zone_blocks[i]`, verify the block witness before executing it.**
    Require `block.parent_hash == prev_block_hash`. Require `block.number == prev_header.number + 1`. Require `block.timestamp >= prev_header.timestamp`. Require `block.beneficiary == public_inputs.sequencer`. Require `finalize_withdrawal_batch_count` to be absent in intermediate blocks and present in the final block of the batch. If `tempo_header_rlp` is absent, require `deposits`, `decryptions`, and `enabled_tokens` to be empty. If `finalize_withdrawal_batch_count` is absent, require `finalize_withdrawal_batch_encrypted_senders` to be empty. If it is present, require the encrypted-sender array length to equal `count`.
 
 5. **Execute `advanceTempo` if the block imports a Tempo header.**
-   If `tempo_header_rlp` is present, call `TempoState.finalizeTempo(header)` in the modeled execution environment. This validates header continuity, updates the bound `tempoBlockNumber`, `tempoBlockHash`, and `tempoStateRoot`, and make the new Tempo root available for subsequent `TempoState.readTempoStorageSlot` calls in this block. Require the finalized `tempoBlockHash` to equal `keccak256(tempo_header_rlp)`.
+   If `tempo_header_rlp` is present, call `TempoState.finalizeTempo(header)` in the modeled execution environment. This validates header continuity, updates the bound `tempoBlockNumber` and `tempoBlockHash`, and makes the imported header's state root available for subsequent `TempoState.readTempoStorageSlot` calls in this block. Require the finalized `tempoBlockHash` to equal `keccak256(tempo_header_rlp)`.
 
 6. **Process deposits and encrypted deposit decryptions inside `advanceTempo`.**
    Using the now-bound Tempo root for this block, verify the Tempo-side reads needed by `ZoneInbox` such as the portal's current deposit queue hash. Execute `ZoneInbox.advanceTempo(header, deposits, decryptions, enabledTokens)` using `enabled_tokens` in the exact witness order; this order is part of the system transaction calldata and therefore affects the transaction root, receipts/logs root, and resulting state transition. Process the `deposits` in witness order, enforcing the queue semantics specified in [Deposit Queue](#deposit-queue). For encrypted deposits, verify the supplied `DecryptionData` and Chaum-Pedersen proof, decode the recipient and memo when AES-GCM decryption succeeds, and enqueue a bounce-back when proof verification, AES-GCM authentication, plaintext length validation, or the decrypted-recipient mint fails as specified in [Onchain Decryption Verification](#onchain-decryption-verification).
@@ -1281,7 +1325,7 @@ The stateless execution function must reject the witness on any failed check, mi
    Run each user transaction against the materialized zone state using the current block environment. Whenever execution calls `TempoState.readTempoStorageSlot`, satisfy that call by locating the corresponding `L1StateRead`, proving it against the Tempo root currently bound for this block, and requiring the decoded value to match the witness entry. Any zone-state or Tempo-state access not covered by the witness is an error. `ZoneOutbox.requestWithdrawal` execution must include the `maxWithdrawalsPerBlock` state machine exactly, including the `block.number`-based counter reset, because rejected withdrawal requests must not enter the pending queue or contribute to `withdrawal_queue_hash`.
 
 8. **Execute `finalizeWithdrawalBatch` at the end of the final block.**
-   If `finalize_withdrawal_batch_count` is present, execute `ZoneOutbox.finalizeWithdrawalBatch(count, block.number, finalize_withdrawal_batch_encrypted_senders)` as the final zone system transaction after all user transactions in that block. This call uses the zone system caller (`msg.sender == address(0)`) and must update the outbox's last-batch state and compute the `withdrawal_queue_hash` committed by the batch. The encrypted-sender array is not derivable from `(sender, txHash, revealTo)` because the ciphertext is randomized, and it is part of each public `Withdrawal` encoded into the withdrawal hash chain. Intermediate blocks must not execute this call.
+   If `finalize_withdrawal_batch_count` is present, execute `ZoneOutbox.finalizeWithdrawalBatch(count, block.number, finalize_withdrawal_batch_encrypted_senders)` as the final zone system transaction after all user transactions in that block. This call uses the zone system caller (`msg.sender == address(0)`) and must update the outbox's last-batch state and compute the `withdrawal_queue_hash` committed by the batch. The encrypted-sender array is derived deterministically as specified in [Authenticated Withdrawals](#authenticated-withdrawals), and it is part of each public `Withdrawal` encoded into the withdrawal hash chain. Intermediate blocks must not execute this call.
 
 9. **Compute the resulting block header and carry it forward.**
     After block execution, compute the `transactionsRoot` and `receiptsRoot` over the full ordered list of transactions and receipts for that block. Construct the simplified `ZoneHeader` from `parent_hash`, `beneficiary`, `state_root`, `transactions_root`, `receipts_root`, `number`, `timestamp`, and `protocol_version`, then compute `next_block_hash = keccak256(rlp(header))`. Set `prev_block_hash = next_block_hash` and `prev_header = header` before moving to the next block.
@@ -1297,12 +1341,12 @@ The stateless execution function must reject the witness on any failed check, mi
 
 ### Tempo State Proofs
 
-System contracts read Tempo state during execution (deposit queue hash, sequencer address, token registry, TIP-403 policies). `BatchStateProof` applies the [shared trie proof format](#shared-trie-proof-format) to the Tempo root currently bound in `TempoState` at the moment of each read. If `advanceTempo()` runs during the batch, later reads are therefore verified against the newer Tempo root, not the root from the start of the batch. The witness includes a `BatchStateProof` containing:
+System contracts read Tempo state during execution (deposit queue hash, sequencer address, token registry, TIP-403 policies). `BatchStateProof` applies the [shared trie proof format](#shared-trie-proof-format) to the Tempo root from the header currently bound by `TempoState` at the moment of each read. If `advanceTempo()` runs during the batch, later reads are therefore verified against the newer Tempo root, not the root from the start of the batch. The witness includes a `BatchStateProof` containing:
 
-- A deduplicated `node_pool` of MPT nodes, keyed by `keccak256(rlp(node))`. Each node is verified exactly once.
+- A deduplicated `node_pool` of raw RLP-encoded MPT nodes. The prover computes `keccak256(rlp(node))` for each entry and builds a hash-to-node index.
 - A list of `L1StateRead` entries, each specifying the zone block index, Tempo block number, account, storage slot, and expected value.
 
-Reads are indexed and verified on demand during execution. Each `L1StateRead` is additionally tagged with `zone_block_index` and `tempo_block_number` so the prover can bind that read to the correct in-batch `TempoState`. The proof shape is the same as `ZoneStateWitness`; the difference is timing. `ZoneStateWitness` is verified once against the initial zone-state root at batch start, while `BatchStateProof` reads are verified against the Tempo root currently bound in `TempoState` at the moment of each read.
+Reads are indexed and verified on demand during execution. Each `L1StateRead` is additionally tagged with `zone_block_index` and `tempo_block_number` so the prover can bind that read to the correct in-batch Tempo checkpoint. The proof shape is the same as `ZoneStateWitness`; the difference is timing. `ZoneStateWitness` is verified once against the initial zone-state root at batch start, while `BatchStateProof` reads are verified against the Tempo root bound by the active Tempo checkpoint at the moment of each read.
 
 Anchor validation ensures the zone's view of Tempo is correct. If `anchor_block_number` equals `tempo_block_number`, the zone's `tempoBlockHash` must match `anchor_block_hash` directly. If `anchor_block_number` is greater (for zones that have been offline longer than the EIP-2935 window), the proof verifies the parent-hash chain from `tempo_block_number` to `anchor_block_number` using the ancestry headers in the witness.
 
@@ -1335,8 +1379,8 @@ On success, the portal:
 1. Updates `blockHash` to `nextBlockHash`.
 2. Updates `lastSyncedTempoBlockNumber` to `tempoBlockNumber` and `lastProcessedDepositNumber` to `depositQueueTransition.nextDepositNumber`.
 3. Advances `withdrawalBatchIndex`.
-4. Adds the withdrawal hash chain to the next slot in the withdrawal queue ring buffer (if `withdrawalQueueHash` is non-zero).
-5. Emits `BatchSubmitted`.
+4. If `withdrawalQueueHash` is non-zero, assigns the current logical withdrawal queue `tail`, writes the hash chain to physical slot `tail % WITHDRAWAL_QUEUE_CAPACITY`, and advances `tail`.
+5. Emits `BatchSubmitted` with the assigned logical `withdrawalQueueIndex`, or `NO_QUEUE_INDEX` for an empty batch.
 
 ### Verifier Interface
 
@@ -1345,6 +1389,7 @@ The portal calls the verifier to validate each batch:
 ```solidity
 interface IVerifier {
     function verify(
+        uint32 zoneId,
         uint64 tempoBlockNumber,
         uint64 anchorBlockNumber,
         bytes32 anchorBlockHash,
@@ -1359,7 +1404,7 @@ interface IVerifier {
 }
 ```
 
-The portal computes `anchorBlockNumber` and `anchorBlockHash` from the submission parameters (see [Anchor Block Validation](#anchor-block-validation)) and passes them alongside the portal's current `withdrawalBatchIndex + 1` as `expectedWithdrawalBatchIndex` and the registered `sequencer` address. The `verifierConfig` and `proof` are opaque to the portal.
+The portal passes its `zoneId`, computes `anchorBlockNumber` and `anchorBlockHash` from the submission parameters (see [Anchor Block Validation](#anchor-block-validation)), and passes them alongside the portal's current `withdrawalBatchIndex + 1` as `expectedWithdrawalBatchIndex` and the registered `sequencer` address. The `verifierConfig` and `proof` are opaque to the portal.
 
 ### Anchor Block Validation
 
@@ -1418,7 +1463,14 @@ interface IChaumPedersenVerify {
 
 Verifies that an ECDH shared secret was correctly derived from the sequencer's private key and an ephemeral public key, without exposing the private key. Used during [onchain decryption verification](#onchain-decryption-verification) of encrypted deposits.
 
-The verifier reconstructs commitments `R1 = s*G - c*pubSeq` and `R2 = s*ephemeralPub - c*sharedSecretPoint`, recomputes the Fiat-Shamir challenge `c' = hash(G, ephemeralPub, pubSeq, sharedSecretPoint, R1, R2)`, and checks `c == c'`.
+Proof generation uses a deterministic, domain-separated nonce so that independently built versions of the same zone block contain identical `advanceTempo` calldata. For a counter starting at zero, the prover computes:
+
+```
+candidate = HMAC-SHA256(uint256_be(privSeq), "tempo-zone-chaum-pedersen-nonce-v1" || sec1_compressed(ephemeralPub) || sec1_compressed(pubSeq) || sec1_compressed(sharedSecretPoint) || uint32_be(counter))
+k = OS2IP(candidate)
+```
+
+Here, `uint256_be` and `uint32_be` are fixed-width big-endian encodings, `sec1_compressed` and `sec1_uncompressed` are the 33-byte and 65-byte SEC1 point encodings respectively, and `OS2IP` interprets a byte string as a big-endian nonnegative integer. If `k` is not a valid nonzero secp256k1 scalar, the prover increments the counter and retries. The prover then computes `R1 = k*G`, `R2 = k*ephemeralPub`, `c = OS2IP(keccak256(sec1_uncompressed(G) || sec1_uncompressed(ephemeralPub) || sec1_uncompressed(pubSeq) || sec1_uncompressed(sharedSecretPoint) || sec1_uncompressed(R1) || sec1_uncompressed(R2))) mod n`, where `n` is the secp256k1 group order, and `s = k + c*privSeq`. The verifier reconstructs `R1 = s*G - c*pubSeq` and `R2 = s*ephemeralPub - c*sharedSecretPoint`, recomputes `c'`, and checks `c == c'`.
 
 ### AES-GCM Decrypt
 
@@ -1611,6 +1663,7 @@ interface IZonePortal {
     );
     event BatchSubmitted(
         uint64 indexed withdrawalBatchIndex,
+        uint256 indexed withdrawalQueueIndex,
         bytes32 nextProcessedDepositQueueHash,
         bytes32 nextBlockHash,
         bytes32 withdrawalQueueHash,
@@ -1641,6 +1694,8 @@ interface IZonePortal {
     event RefundClaimed(address indexed recipient, address indexed token, uint128 amount);
     event SequencerTransferStarted(address indexed currentSequencer, address indexed pendingSequencer);
     event SequencerTransferred(address indexed previousSequencer, address indexed newSequencer);
+    event AdminTransferStarted(address indexed currentAdmin, address indexed pendingAdmin);
+    event AdminTransferred(address indexed previousAdmin, address indexed newAdmin);
     event SequencerEncryptionKeyUpdated(bytes32 x, uint8 yParity, uint256 keyIndex, uint64 activationBlock);
     event ZoneGasRateUpdated(uint128 zoneGasRate);
     event TokenEnabled(address indexed token, string name, string symbol, string currency);
@@ -1650,6 +1705,7 @@ interface IZonePortal {
     error NotSequencer();
     error NotAdmin();
     error NotPendingSequencer();
+    error NotPendingAdmin();
     error InvalidProof();
     error InvalidTempoBlockNumber();
     error CallbackRejected();
@@ -1732,6 +1788,11 @@ interface IZonePortal {
     // Sequencer management
     function transferSequencer(address newSequencer) external;
     function acceptSequencer() external;
+
+    // Admin management
+    function transferAdmin(address newAdmin) external;
+    function acceptAdmin() external;
+
     function setZoneGasRate(uint128 _zoneGasRate) external;
     function zoneGasRate() external view returns (uint128);
 
@@ -1751,6 +1812,7 @@ interface IZonePortal {
     function sequencer() external view returns (address);
     function admin() external view returns (address);
     function pendingSequencer() external view returns (address);
+    function pendingAdmin() external view returns (address);
 
     function verifier() external view returns (address);
     function blockHash() external view returns (bytes32);
@@ -1759,7 +1821,7 @@ interface IZonePortal {
     function lastSyncedTempoBlockNumber() external view returns (uint64);
     function withdrawalQueueHead() external view returns (uint256);
     function withdrawalQueueTail() external view returns (uint256);
-    function withdrawalQueueSlot(uint256 slot) external view returns (bytes32);
+    function withdrawalQueueSlot(uint256 physicalSlot) external view returns (bytes32);
     function genesisTempoBlockNumber() external view returns (uint64);
 
 }
@@ -1799,8 +1861,6 @@ interface ITempoState {
 
     function tempoBlockHash() external view returns (bytes32);
     function tempoBlockNumber() external view returns (uint64);
-    function tempoStateRoot() external view returns (bytes32);
-    function tempoTimestamp() external view returns (uint64);
 
     function finalizeTempo(bytes calldata header) external;
     function readTempoStorageSlot(address account, bytes32 slot) external view returns (bytes32);

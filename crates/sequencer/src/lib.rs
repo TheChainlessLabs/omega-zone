@@ -17,6 +17,7 @@ pub mod abi {
     pub use tempo_zone_contracts::*;
 }
 
+mod encryption_key;
 mod metrics;
 pub mod midpoint;
 pub mod monitor;
@@ -26,6 +27,7 @@ mod rpc;
 pub mod settlement;
 pub mod withdrawals;
 
+pub use encryption_key::register_encryption_key;
 pub use monitor::{ZoneMonitorConfig, spawn_zone_monitor};
 pub use proof::{
     BatchProofProvider, BatchPublicInputs, DEFAULT_TEE_ATTESTATION_TIMEOUT,
@@ -62,8 +64,8 @@ pub struct ZoneSequencerConfig {
     pub zone_rpc_url: String,
     /// How often the zone monitor polls for new L2 blocks.
     pub zone_poll_interval: Duration,
-    /// Maximum time to accumulate zone blocks before submitting a batch to L1.
-    pub batch_interval: Duration,
+    /// Number of zone blocks between empty withdrawal batch boundaries / L1 submissions.
+    pub batch_interval_blocks: u64,
     /// EIP-2935 history and safety-margin limits used by the batch submitter.
     pub batch_anchor_config: BatchAnchorConfig,
     /// Builds `(verifierConfig, proof)` for each batch.
@@ -82,7 +84,7 @@ impl std::fmt::Debug for ZoneSequencerConfig {
             .field("tempo_state_address", &self.tempo_state_address)
             .field("zone_rpc_url", &self.zone_rpc_url)
             .field("zone_poll_interval", &self.zone_poll_interval)
-            .field("batch_interval", &self.batch_interval)
+            .field("batch_interval_blocks", &self.batch_interval_blocks)
             .field("batch_anchor_config", &self.batch_anchor_config)
             .field("proof_provider", &self.proof_provider.name())
             .finish()
@@ -147,7 +149,7 @@ pub async fn spawn_zone_sequencer(
         zone_rpc_url: config.zone_rpc_url,
         retry_connection_interval: config.retry_connection_interval,
         poll_interval: config.zone_poll_interval,
-        batch_interval: config.batch_interval,
+        batch_interval_blocks: config.batch_interval_blocks,
         portal_address: config.portal_address,
         batch_anchor_config: config.batch_anchor_config,
     };

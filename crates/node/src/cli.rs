@@ -4,21 +4,21 @@ use std::{sync::Arc, time::Duration};
 
 use alloy_primitives::{Address, Bytes};
 use alloy_signer_local::PrivateKeySigner;
-use clap::{Args, Parser};
+use clap::{Args, CommandFactory, FromArgMatches};
 use reth_consensus::noop::NoopConsensus;
 use reth_ethereum::cli::Cli;
 use reth_tracing::tracing::info;
 use tempo_chainspec::spec::{TempoChainSpec, TempoChainSpecParser};
 use url::Url;
 use zone_evm::ZoneEvmConfig;
-use zone_payload::DEFAULT_WITHDRAWAL_BATCH_INTERVAL;
+use zone_payload::DEFAULT_WITHDRAWAL_BATCH_INTERVAL_BLOCKS;
 use zone_sequencer::{
     BatchAnchorConfig,
     proof::{ProofBackend, TeeAttestationFormat, TeeProviderOptions},
 };
 
 use crate::{
-    ZoneNode, ZonePrivateRpcConfig, ZoneSequencerAddOnsConfig,
+    ZoneNode, ZonePrivateRpcConfig, ZoneSequencerAddOnsConfig, dev::DevCommand,
     rpc::auth::DEFAULT_MAX_AUTH_TOKEN_VALIDITY_SECS,
 };
 use zone_rpc::refprice::{ReferencePriceProviderConfig, ReferencePriceProviderKind};
@@ -34,12 +34,45 @@ const ZONE_LOG_FILTER_DIRECTIVES: &str = concat!(
 );
 
 /// Tempo Zone CLI entry point.
-pub struct ZoneCli(Cli<TempoChainSpecParser, ZoneArgs>);
+pub enum ZoneCli {
+    Node(Box<Cli<TempoChainSpecParser, ZoneArgs>>),
+    Dev(DevCommand),
+}
 
 impl ZoneCli {
+    fn command() -> clap::Command {
+        Cli::<TempoChainSpecParser, ZoneArgs>::command()
+            .about("Tempo Zone")
+            .subcommand(DevCommand::command())
+    }
+
     /// Parse CLI arguments from the environment.
     pub fn parse() -> Self {
-        Self(Cli::parse())
+        Self::parse_from(std::env::args_os())
+    }
+
+    /// Parse CLI arguments from an iterator. The first item is the binary name.
+    pub fn parse_from<I, T>(args: I) -> Self
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<std::ffi::OsString> + Clone,
+    {
+        Self::try_parse_from(args).unwrap_or_else(|err| err.exit())
+    }
+
+    /// Try to parse CLI arguments from an iterator.
+    pub fn try_parse_from<I, T>(args: I) -> Result<Self, clap::Error>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<std::ffi::OsString> + Clone,
+    {
+        let matches = Self::command().try_get_matches_from(args)?;
+        if let Some(("dev", dev_matches)) = matches.subcommand() {
+            return DevCommand::from_arg_matches(dev_matches).map(Self::Dev);
+        }
+        Cli::from_arg_matches(&matches)
+            .map(Box::new)
+            .map(Self::Node)
     }
 
     /// Run the Tempo Zone node.
@@ -47,82 +80,88 @@ impl ZoneCli {
     /// Configures the node builder, launches the zone node with all sequencer
     /// background tasks, and blocks until exit.
     pub fn run(self) -> eyre::Result<()> {
-        let mut cli = self.0;
-
-        prepend_log_filter(&mut cli.logs.log_stdout_filter, ZONE_LOG_FILTER_DIRECTIVES);
-        prepend_log_filter(&mut cli.logs.log_file_filter, ZONE_LOG_FILTER_DIRECTIVES);
-
-        let components = |spec: Arc<TempoChainSpec>| {
-            (
-                ZoneEvmConfig::new_without_l1(spec),
-                NoopConsensus::default(),
-            )
-        };
-
-        cli.run_with_components::<ZoneNode>(components, async move |mut builder, args| {
-            info!(target: "reth::cli", "Launching Tempo Zone node");
-
-            builder.config_mut().network.discovery.disable_discovery = true;
-            builder.config_mut().rpc.disable_auth_server = true;
-            builder.config_mut().rpc.rpc_max_logs_per_response = MAX_LOGS_PER_RESPONSE.into();
-            builder.config_mut().rpc.rpc_max_blocks_per_filter = MAX_BLOCKS_PER_FILTER.into();
-
-            let tee_options = args.tee_provider_options()?;
-
-            let mut node = ZoneNode::new(
-                args.l1_rpc_url,
-                args.portal_address,
-                args.l1_genesis_block_number,
-                args.l1_fetch_concurrency,
-                Duration::from_millis(args.l1_retry_connection_interval_ms),
-            )
-            .with_withdrawal_batch_interval(Duration::from_secs(args.zone_batch_interval_secs))
-            .with_private_rpc(ZonePrivateRpcConfig {
-                private_rpc_port: args.private_rpc_port,
-                zone_id: args.zone_id,
-                max_auth_token_validity: Duration::from_secs(
-                    args.private_rpc_max_auth_token_validity_secs,
-                ),
-                ref_price_provider: build_ref_price_provider(
-                    args.ref_price_static_price,
-                    &args.ref_price_source,
-                    args.ref_price_max_deviation_bps,
-                    args.ref_price_max_staleness_secs,
-                ),
-            });
-
-            if args.enable_sequencer {
-                let sequencer_signer: PrivateKeySigner = args
-                    .sequencer_key
-                    .parse()
-                    .expect("invalid sequencer private key");
-                let proof_provider = args
-                    .proof_backend
-                    .into_provider(tee_options)
-                    .map_err(|err| eyre::eyre!("failed to construct proof provider: {err}"))?;
-                node = node.with_sequencer(ZoneSequencerAddOnsConfig {
-                    sequencer_signer,
-                    zone_id: args.zone_id,
-                    zone_poll_interval: Duration::from_secs(args.zone_poll_interval_secs),
-                    batch_interval: Duration::from_secs(args.zone_batch_interval_secs),
-                    batch_anchor_config: BatchAnchorConfig::default(),
-                    withdrawal_poll_interval: Duration::from_secs(
-                        args.withdrawal_poll_interval_secs,
-                    ),
-                    proof_provider,
-                });
-            }
-
-            let handle = builder.node(node).launch_with_debug_capabilities().await?;
-            handle.wait_for_node_exit().await
-        })
+        match self {
+            Self::Node(cli) => run_node(*cli),
+            Self::Dev(command) => command.run(),
+        }
     }
+}
+
+/// Main entry point for the `node` command.
+fn run_node(mut cli: Cli<TempoChainSpecParser, ZoneArgs>) -> eyre::Result<()> {
+    prepend_log_filter(&mut cli.logs.log_stdout_filter, ZONE_LOG_FILTER_DIRECTIVES);
+    prepend_log_filter(&mut cli.logs.log_file_filter, ZONE_LOG_FILTER_DIRECTIVES);
+
+    let components = |spec: Arc<TempoChainSpec>| {
+        (
+            ZoneEvmConfig::new_without_l1(spec),
+            NoopConsensus::default(),
+        )
+    };
+
+    cli.run_with_components::<ZoneNode>(components, async move |mut builder, args| {
+        info!(target: "reth::cli", "Launching Tempo Zone node");
+
+        validate_l1_rpc_url(&args.l1_rpc_url)?;
+
+        builder.config_mut().network.discovery.disable_discovery = true;
+        builder.config_mut().rpc.disable_auth_server = true;
+        builder.config_mut().rpc.rpc_max_logs_per_response = MAX_LOGS_PER_RESPONSE.into();
+        builder.config_mut().rpc.rpc_max_blocks_per_filter = MAX_BLOCKS_PER_FILTER.into();
+
+        let tee_options = args.tee_provider_options()?;
+
+        let mut node = ZoneNode::new(
+            args.l1_rpc_url,
+            args.portal_address,
+            args.l1_genesis_block_number,
+            args.l1_fetch_concurrency,
+            Duration::from_millis(args.l1_retry_connection_interval_ms),
+        )
+        .with_withdrawal_batch_interval_blocks(args.zone_batch_interval_blocks)
+        .with_private_rpc(ZonePrivateRpcConfig {
+            private_rpc_port: args.private_rpc_port,
+            zone_id: args.zone_id,
+            max_auth_token_validity: Duration::from_secs(
+                args.private_rpc_max_auth_token_validity_secs,
+            ),
+            ref_price_provider: build_ref_price_provider(
+                args.ref_price_static_price,
+                &args.ref_price_source,
+                args.ref_price_max_deviation_bps,
+                args.ref_price_max_staleness_secs,
+            ),
+        });
+
+        if args.enable_sequencer {
+            let sequencer_signer: PrivateKeySigner = args
+                .sequencer_key
+                .parse()
+                .expect("invalid sequencer private key");
+            let proof_provider = args
+                .proof_backend
+                .into_provider(tee_options)
+                .map_err(|err| eyre::eyre!("failed to construct proof provider: {err}"))?;
+            node = node.with_sequencer(ZoneSequencerAddOnsConfig {
+                sequencer_signer,
+                zone_id: args.zone_id,
+                zone_poll_interval: Duration::from_secs(args.zone_poll_interval_secs),
+                batch_interval_blocks: args.zone_batch_interval_blocks,
+                batch_anchor_config: BatchAnchorConfig::default(),
+                withdrawal_poll_interval: Duration::from_secs(args.withdrawal_poll_interval_secs),
+                proof_provider,
+            });
+        }
+
+        let handle = builder.node(node).launch_with_debug_capabilities().await?;
+        handle.wait_for_node_exit().await
+    })
 }
 
 /// Tempo Zone CLI arguments.
 #[derive(Debug, Clone, Args)]
 pub struct ZoneArgs {
-    /// L1 WebSocket RPC URL for subscribing to deposit events and chain notifications.
+    /// Certified Tempo follower WebSocket RPC URL for finalized L1 state, deposit events, and chain notifications.
     #[arg(long = "l1.rpc-url", env = "L1_RPC_URL")]
     pub l1_rpc_url: String,
 
@@ -150,13 +189,17 @@ pub struct ZoneArgs {
     )]
     pub zone_poll_interval_secs: u64,
 
-    /// Maximum time (in seconds) between withdrawal batch boundaries.
+    /// Number of zone blocks between withdrawal batch boundaries.
+    ///
+    /// Also used by the sequencer monitor to decide when enough chain progress has
+    /// occurred to look for empty finalized batches to submit to L1. Default 120 is
+    /// ~1 minute at Tempo's expected 500 ms block time.
     #[arg(
-        long = "zone.batch-interval-secs",
-        env = "ZONE_BATCH_INTERVAL_SECS",
-        default_value_t = DEFAULT_WITHDRAWAL_BATCH_INTERVAL.as_secs()
+        long = "zone.batch-interval-blocks",
+        env = "ZONE_BATCH_INTERVAL_BLOCKS",
+        default_value_t = DEFAULT_WITHDRAWAL_BATCH_INTERVAL_BLOCKS
     )]
-    pub zone_batch_interval_secs: u64,
+    pub zone_batch_interval_blocks: u64,
 
     /// How often (in seconds) the withdrawal processor polls the L1 queue.
     #[arg(
@@ -406,5 +449,48 @@ mod tests {
             .expect("provider must materialize for zero-bound config");
         assert_eq!(provider.max_deviation_bps, 0);
         assert_eq!(provider.max_staleness_secs, 0);
+    }
+}
+
+fn validate_l1_rpc_url(l1_rpc_url: &str) -> eyre::Result<()> {
+    let url: url::Url = l1_rpc_url
+        .parse()
+        .map_err(|err| eyre::eyre!("failed parsing --l1.rpc-url as URL: {err}"))?;
+    eyre::ensure!(
+        matches!(url.scheme(), "ws" | "wss"),
+        "--l1.rpc-url must use ws:// or wss://, got `{}`",
+        url.scheme()
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod upstream_tests {
+    use super::{ZoneCli, validate_l1_rpc_url};
+
+    #[test]
+    fn top_level_help_lists_dev_subcommand() {
+        let result = ZoneCli::try_parse_from(["tempo-zone", "--help"]);
+        let error = result.err().expect("--help exits through clap");
+        assert_eq!(error.kind(), clap::error::ErrorKind::DisplayHelp);
+        assert!(error.to_string().contains("  dev"));
+    }
+
+    #[test]
+    fn dev_is_parsed_by_the_top_level_cli() {
+        let parsed = ZoneCli::try_parse_from(["tempo-zone", "dev"]).unwrap();
+        assert!(matches!(parsed, ZoneCli::Dev(_)));
+    }
+
+    #[test]
+    fn l1_rpc_url_accepts_websocket_schemes() {
+        validate_l1_rpc_url("ws://localhost:8546").unwrap();
+        validate_l1_rpc_url("wss://rpc.moderato.tempo.xyz").unwrap();
+    }
+
+    #[test]
+    fn l1_rpc_url_rejects_non_websocket_schemes() {
+        assert!(validate_l1_rpc_url("http://localhost:8545").is_err());
+        assert!(validate_l1_rpc_url("https://rpc.moderato.tempo.xyz").is_err());
     }
 }

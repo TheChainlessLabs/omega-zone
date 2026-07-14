@@ -27,7 +27,7 @@ use reth_node_builder::{
         PayloadValidatorBuilder, RethRpcAddOns, RpcAddOns,
     },
 };
-use reth_primitives_traits::{SealedHeader, transaction::error::InvalidTransactionError};
+use reth_primitives_traits::SealedHeader;
 use reth_provider::ChainSpecProvider;
 use reth_rpc_builder::Identity;
 use reth_rpc_eth_api::EthApiTypes;
@@ -50,13 +50,13 @@ use tempo_transaction_pool::{
     AA2dPool, AA2dPoolConfig, TempoTransactionPool,
     amm::AmmLiquidityCache,
     ordering::TempoTipOrdering,
-    transaction::TempoPooledTransaction,
+    transaction::{TempoPoolTransactionError, TempoPooledTransaction},
     validator::{DEFAULT_MAX_TEMPO_AUTHORIZATIONS, TempoTransactionValidator},
 };
 use tempo_zone_contracts::{
     TEMPO_STATE_ADDRESS, ZONE_INBOX_ADDRESS, ZONE_OUTBOX_ADDRESS, ZonePortal,
 };
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use zone_evm::ZoneEvmConfig;
 use zone_l1::{
     DepositQueue, L1Subscriber, L1SubscriberConfig, PolicyCache, TempoStateExt,
@@ -66,12 +66,60 @@ use zone_l1::{
     },
 };
 use zone_payload::{
-    DEFAULT_WITHDRAWAL_BATCH_INTERVAL, ZonePayloadAttributes, ZonePayloadFactory, ZonePayloadTypes,
+    DEFAULT_WITHDRAWAL_BATCH_INTERVAL_BLOCKS, WithdrawalRevealEncryptor, ZonePayloadAttributes,
+    ZonePayloadFactory, ZonePayloadTypes,
 };
 use zone_sequencer::{BatchAnchorConfig, ZoneSequencerConfig, spawn_zone_sequencer};
 
 /// Network primitives for Zone Nodes
 type ZoneNetworkPrimitives = BasicNetworkPrimitives<TempoPrimitives, TempoTxEnvelope>;
+
+/// Sequencer-side sender reveal encryptor used while building
+/// `finalizeWithdrawalBatch` system transactions.
+///
+/// The encrypted sender payload is hashed into withdrawal data, so ECIES must
+/// not use fresh randomness here. This implementation derives reproducible
+/// encryption material from the sequencer encryption key, zone id, reveal key,
+/// sender, and withdrawal transaction hash, which keeps identical withdrawal
+/// batches byte-for-byte stable across sequencers.
+struct SequencerWithdrawalRevealEncryptor {
+    encryption_key: Arc<SecretKey>,
+    zone_id: u32,
+}
+
+impl SequencerWithdrawalRevealEncryptor {
+    fn new(encryption_key: SecretKey, zone_id: u32) -> Self {
+        Self {
+            encryption_key: Arc::new(encryption_key),
+            zone_id,
+        }
+    }
+}
+
+impl std::fmt::Debug for SequencerWithdrawalRevealEncryptor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SequencerWithdrawalRevealEncryptor")
+            .field("zone_id", &self.zone_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl WithdrawalRevealEncryptor for SequencerWithdrawalRevealEncryptor {
+    fn encrypt_sender(
+        &self,
+        reveal_to: &[u8],
+        sender: Address,
+        tx_hash: alloy_primitives::B256,
+    ) -> Option<Vec<u8>> {
+        zone_precompiles::ecies::encrypt_authenticated_withdrawal_deterministic(
+            &self.encryption_key,
+            self.zone_id,
+            reveal_to,
+            sender,
+            tx_hash,
+        )
+    }
+}
 
 /// Configuration for the sequencer background tasks
 #[derive(Clone)]
@@ -82,8 +130,8 @@ pub struct ZoneSequencerAddOnsConfig {
     pub zone_id: u32,
     /// How often the zone monitor polls for new L2 blocks.
     pub zone_poll_interval: Duration,
-    /// Maximum time between withdrawal batch boundaries/submissions.
-    pub batch_interval: Duration,
+    /// Number of zone blocks between withdrawal batch boundaries / L1 submissions.
+    pub batch_interval_blocks: u64,
     /// EIP-2935 history and safety-margin limits used by the batch submitter.
     pub batch_anchor_config: BatchAnchorConfig,
     /// How often the withdrawal processor polls the L1 queue.
@@ -100,7 +148,7 @@ impl std::fmt::Debug for ZoneSequencerAddOnsConfig {
             .field("sequencer_signer", &self.sequencer_signer.address())
             .field("zone_id", &self.zone_id)
             .field("zone_poll_interval", &self.zone_poll_interval)
-            .field("batch_interval", &self.batch_interval)
+            .field("batch_interval_blocks", &self.batch_interval_blocks)
             .field("batch_anchor_config", &self.batch_anchor_config)
             .field("withdrawal_poll_interval", &self.withdrawal_poll_interval)
             .field("proof_provider", &self.proof_provider.name())
@@ -144,8 +192,10 @@ pub struct ZoneNode {
     initial_tokens: Option<Vec<Address>>,
     /// Whether to start background workers that continuously read from or write to L1.
     l1_background_tasks: bool,
-    /// Maximum chain-time duration between withdrawal batch finalizations.
-    withdrawal_batch_interval: Duration,
+    /// Number of zone blocks between withdrawal batch boundaries.
+    withdrawal_batch_interval_blocks: u64,
+    /// Encrypts authenticated-withdrawal sender reveal data during payload construction.
+    withdrawal_reveal_encryptor: Option<Arc<dyn WithdrawalRevealEncryptor>>,
     /// Private RPC config.
     private_rpc_config: ZonePrivateRpcConfig,
     /// Optional sequencer config. When set, sequencer tasks are spawned.
@@ -191,7 +241,8 @@ impl ZoneNode {
             portal_address,
             initial_tokens: None,
             l1_background_tasks: true,
-            withdrawal_batch_interval: DEFAULT_WITHDRAWAL_BATCH_INTERVAL,
+            withdrawal_batch_interval_blocks: DEFAULT_WITHDRAWAL_BATCH_INTERVAL_BLOCKS,
+            withdrawal_reveal_encryptor: None,
             private_rpc_config: ZonePrivateRpcConfig::default(),
             sequencer_config: None,
         }
@@ -206,7 +257,21 @@ impl ZoneNode {
     /// Set the sequencer configuration. When set, batch submission and
     /// withdrawal processing tasks are spawned during node launch.
     pub fn with_sequencer(mut self, config: ZoneSequencerAddOnsConfig) -> Self {
+        let encryption_key = SecretKey::from(config.sequencer_signer.credential());
+        self.withdrawal_reveal_encryptor = Some(Arc::new(SequencerWithdrawalRevealEncryptor::new(
+            encryption_key,
+            config.zone_id,
+        )));
         self.sequencer_config = Some(config);
+        self
+    }
+
+    /// Set the encryptor used for authenticated-withdrawal sender reveal data.
+    pub fn with_withdrawal_reveal_encryptor(
+        mut self,
+        encryptor: Arc<dyn WithdrawalRevealEncryptor>,
+    ) -> Self {
+        self.withdrawal_reveal_encryptor = Some(encryptor);
         self
     }
 
@@ -223,10 +288,10 @@ impl ZoneNode {
         self
     }
 
-    /// Set the chain-time interval used by the payload builder for empty
-    /// withdrawal batch finalization.
-    pub fn with_withdrawal_batch_interval(mut self, interval: Duration) -> Self {
-        self.withdrawal_batch_interval = interval;
+    /// Set the number of zone blocks between empty withdrawal batch
+    /// finalization.
+    pub fn with_withdrawal_batch_interval_blocks(mut self, interval_blocks: u64) -> Self {
+        self.withdrawal_batch_interval_blocks = interval_blocks.max(1);
         self
     }
 
@@ -478,16 +543,47 @@ where
             info!(target: "reth::cli", count = tokens.len(), ?tokens, "Using pre-configured initial tokens");
             tokens
         } else {
-            let tokens = ZonePortal::new(portal, l1_provider)
-                .enabled_tokens()
-                .await?;
-            info!(target: "reth::cli", count = tokens.len(), ?tokens, "Discovered enabled tokens from L1");
+            let block_number = self.policy_cache.last_l1_block();
+            let tokens = match ZonePortal::new(portal, l1_provider)
+                .enabled_tokens_at(alloy_rpc_types_eth::BlockId::number(block_number))
+                .await
+            {
+                Ok(tokens) => tokens,
+                Err(err) => {
+                    warn!(
+                        target: "reth::cli",
+                        %err,
+                        block_number,
+                        %portal,
+                        "Failed to discover enabled tokens from L1 for policy cache seeding; continuing without initial token policy seed"
+                    );
+                    return Ok(());
+                }
+            };
+            info!(
+                target: "reth::cli",
+                count = tokens.len(),
+                ?tokens,
+                block_number,
+                "Discovered enabled tokens from L1"
+            );
             tokens
         };
 
-        self.policy_cache
+        if let Err(err) = self
+            .policy_cache
             .seed_token_policies(portal, &tracked_tokens, l1_provider)
-            .await?;
+            .await
+        {
+            warn!(
+                target: "reth::cli",
+                %err,
+                count = tracked_tokens.len(),
+                %portal,
+                "Failed to seed token policies from L1; continuing with RPC fallback"
+            );
+            return Ok(());
+        }
         info!(target: "reth::cli", "Seeded token policies from L1");
         Ok(())
     }
@@ -651,7 +747,7 @@ where
             tempo_state_address: TEMPO_STATE_ADDRESS,
             zone_rpc_url,
             zone_poll_interval: config.zone_poll_interval,
-            batch_interval: config.batch_interval,
+            batch_interval_blocks: config.batch_interval_blocks,
             proof_provider: config.proof_provider.clone(),
             batch_anchor_config: config.batch_anchor_config,
         };
@@ -738,7 +834,10 @@ where
             self.l1_state_cache.clone(),
             self.policy_cache.clone(),
         );
-        let payload_factory = ZonePayloadFactory::new(self.withdrawal_batch_interval);
+        let mut payload_factory = ZonePayloadFactory::new(self.withdrawal_batch_interval_blocks);
+        if let Some(encryptor) = self.withdrawal_reveal_encryptor.clone() {
+            payload_factory = payload_factory.with_withdrawal_reveal_encryptor(encryptor);
+        }
         Self::components_with_payload_factory(executor_builder, payload_factory)
     }
 
@@ -843,7 +942,7 @@ where
 
         let policy_provider = PolicyProvider::new(self.policy_cache, policy_l1, runtime_handle);
         evm_config = evm_config.with_policy_provider(policy_provider);
-        info!(target: "reth::cli", "Zone EVM initialized with TempoStateReader + TIP-403 proxy precompiles");
+        info!(target: "reth::cli", "Zone EVM initialized with TempoState + TIP-403 proxy precompiles");
 
         Ok(evm_config)
     }
@@ -905,13 +1004,11 @@ where
         .build::<TempoPooledTransaction, _>(blob_store.clone());
 
         validator.set_additional_stateless_validation(|_origin, tx| {
-            use alloy_consensus::Transaction;
-            if tx.is_create() {
-                return Err(InvalidPoolTransactionError::Consensus(
-                    InvalidTransactionError::TxTypeNotSupported,
-                ));
-            }
-            Ok(())
+            zone_evm::validate_transaction(
+                tx.tx_env(),
+                zone_primitives::constants::CONTRACT_DEPLOYER_ALLOWLIST,
+            )
+            .map_err(|err| InvalidPoolTransactionError::other(TempoPoolTransactionError::Evm(err)))
         });
 
         let validator =
@@ -956,5 +1053,74 @@ where
         debug!(target: "reth::cli", "Spawned txpool maintenance task");
 
         Ok(transaction_pool)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_consensus::{Signed, TxEip1559};
+    use alloy_primitives::{Bytes, Signature, TxKind, U256};
+    use reth_primitives_traits::Recovered;
+    use tempo_primitives::transaction::{
+        AASigned, Call, PrimitiveSignature, TempoSignature, TempoTransaction,
+    };
+
+    fn pooled_transaction(envelope: TempoTxEnvelope, sender: Address) -> TempoPooledTransaction {
+        TempoPooledTransaction::new(Recovered::new_unchecked(envelope, sender))
+    }
+
+    fn aa_transaction(sender: Address, calls: Vec<Call>) -> TempoPooledTransaction {
+        let transaction = TempoTransaction {
+            calls,
+            ..Default::default()
+        };
+        let signature =
+            TempoSignature::Primitive(PrimitiveSignature::Secp256k1(Signature::test_signature()));
+        pooled_transaction(
+            AASigned::new_unhashed(transaction, signature).into(),
+            sender,
+        )
+    }
+
+    #[test]
+    fn pool_policy_allows_allowlisted_plain_create() {
+        let sender = Address::repeat_byte(0x11);
+        let envelope = TempoTxEnvelope::Eip1559(Signed::new_unhashed(
+            TxEip1559 {
+                to: TxKind::Create,
+                ..Default::default()
+            },
+            Signature::test_signature(),
+        ));
+        let transaction = pooled_transaction(envelope, sender);
+
+        let err = zone_evm::validate_transaction(transaction.tx_env(), &[]).unwrap_err();
+        assert!(matches!(
+            err,
+            tempo_revm::TempoInvalidTransaction::CallsValidation(_)
+        ));
+        assert!(zone_evm::validate_transaction(transaction.tx_env(), &[sender]).is_ok());
+    }
+
+    #[test]
+    fn pool_policy_rejects_create_in_non_first_aa_call() {
+        let transaction = aa_transaction(
+            Address::repeat_byte(0x11),
+            vec![
+                Call {
+                    to: TxKind::Call(Address::repeat_byte(0x22)),
+                    value: U256::ZERO,
+                    input: Bytes::new(),
+                },
+                Call {
+                    to: TxKind::Create,
+                    value: U256::ZERO,
+                    input: Bytes::new(),
+                },
+            ],
+        );
+
+        assert!(zone_evm::validate_transaction(transaction.tx_env(), &[]).is_err());
     }
 }

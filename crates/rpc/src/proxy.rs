@@ -756,7 +756,13 @@ mod tests {
 
         let receipt: TempoTransactionReceipt =
             serde_json::from_str(raw.get()).expect("deserialize filtered receipt");
-        assert_eq!(receipt.inner.logs(), std::slice::from_ref(&visible));
+        let mut expected_visible = visible;
+        expected_visible.transaction_index = Some(0);
+        expected_visible.log_index = Some(0);
+        assert_eq!(
+            receipt.inner.logs(),
+            std::slice::from_ref(&expected_visible)
+        );
         assert_eq!(
             receipt.inner.inner.logs_bloom,
             alloy_primitives::logs_bloom(receipt.inner.logs().iter().map(|log| log.as_ref())),

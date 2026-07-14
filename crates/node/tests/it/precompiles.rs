@@ -1,7 +1,9 @@
 //! Tests for zone-specific precompile availability.
 
-use alloy::primitives::{U128, U256, address};
-use alloy::providers::{Provider, ProviderBuilder};
+use alloy::{
+    primitives::{U128, U256, address},
+    providers::{Provider, ProviderBuilder},
+};
 use alloy_signer_local::{MnemonicBuilder, PrivateKeySigner, coins_bip39::English};
 use alloy_sol_types::{SolEvent, sol};
 use tempo_chainspec::spec::TEMPO_T0_BASE_FEE;

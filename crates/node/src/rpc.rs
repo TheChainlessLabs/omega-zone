@@ -13,12 +13,12 @@ use std::{
 };
 
 use alloy_consensus::{BlockHeader, Transaction as _, TxReceipt};
-use alloy_network::{ReceiptResponse, TransactionResponse};
+use alloy_network::{ReceiptResponse, TransactionBuilder, TransactionResponse};
 use alloy_primitives::{Address, B256, Bloom, Bytes, U64, U128, U256};
 use alloy_provider::{DynProvider, Provider, ProviderBuilder};
 use alloy_rpc_types_eth::{
-    Block, BlockId, BlockNumberOrTag, BlockTransactions, Filter, FilterChanges, FilterId,
-    TransactionRequest,
+    Block, BlockId, BlockNumberOrTag, BlockTransactions, FeeHistory, Filter, FilterChanges,
+    FilterId, TransactionRequest,
     state::{EvmOverrides, StateOverride},
 };
 use alloy_sol_types::{SolCall, SolEvent, SolEventInterface};
@@ -37,11 +37,12 @@ use tempo_alloy::{
     TempoNetwork,
     rpc::{TempoHeaderResponse, TempoTransactionRequest},
 };
+use tempo_chainspec::spec::TEMPO_T0_BASE_FEE;
 use tempo_contracts::precompiles::{
     ACCOUNT_KEYCHAIN_ADDRESS, ITIP20,
     account_keychain::IAccountKeychain::{self, KeyInfo, getKeyCall},
 };
-use tempo_primitives::{TempoHeader, TempoTxEnvelope};
+use tempo_primitives::TempoTxEnvelope;
 use tokio::{
     sync::Mutex,
     time::{MissedTickBehavior, interval},
@@ -472,6 +473,7 @@ impl<Api: EthApiTypes + 'static> ZoneRpc<Api> {
                         deposit_hash: event.newCurrentDepositQueueHash,
                         sender: event.sender,
                         recipient: event.to,
+                        bounceback_recipient: event.bouncebackRecipient,
                         token: event.token,
                         amount: event.netAmount,
                         memo: event.memo,
@@ -481,6 +483,7 @@ impl<Api: EthApiTypes + 'static> ZoneRpc<Api> {
                     deposits.push(PortalDepositRecord::Encrypted {
                         deposit_hash: event.newCurrentDepositQueueHash,
                         sender: event.sender,
+                        bounceback_recipient: event.bouncebackRecipient,
                         token: event.token,
                         amount: event.netAmount,
                     });
@@ -1262,10 +1265,12 @@ where
         reward_percentiles: Option<Vec<f64>>,
     ) -> BoxFut<'_> {
         Box::pin(async move {
-            let history =
+            let mut history =
                 EthFees::fee_history(&self.eth.api, block_count, newest_block, reward_percentiles)
                     .await
                     .map_err(internal)?;
+            // Redact gas fields (like `gas_used_ratio`) that can be used to guess tx counts
+            redact_fee_history(&mut history);
             to_raw(&history)
         })
     }
@@ -1352,11 +1357,16 @@ where
                 .transpose()
                 .map_err(internal)?;
 
-            let Some(tx) = tx else { return Ok(raw_null()) };
+            let Some(mut tx) = tx else {
+                return Ok(raw_null());
+            };
 
             if tx.from() != auth.caller {
                 return Ok(raw_null());
             }
+
+            // transaction_index leaks how many txns were in this block, so redact
+            tx.transaction_index = Some(0);
 
             to_raw(&tx)
         })
@@ -1449,7 +1459,7 @@ where
         Box::pin(async move {
             zone_rpc::policy::verify_raw_tx_sender(&data, &auth)?;
 
-            let mut receipt = EthTransactions::send_raw_transaction_sync(&self.eth.api, data)
+            let mut receipt = EthTransactions::send_raw_transaction_sync(&self.eth.api, data, None)
                 .await
                 .map_err(internal)?;
 
@@ -1466,6 +1476,10 @@ where
     ) -> BoxFut<'_> {
         Box::pin(async move {
             self.enforce_authorized(&mut request, &auth).await?;
+
+            // Prefill the users request so the `fill_transaction` doesnt leak dynamic fee estimates via
+            // missing fee fields.
+            apply_public_fee_policy(&mut request);
 
             let result = EthTransactions::fill_transaction(&self.eth.api, request)
                 .await
@@ -1609,7 +1623,7 @@ where
                     futures::stream::iter(headers)
                 })
                 .map(move |mut header| {
-                    redact_ws_header(&mut header);
+                    redact_header(&mut header);
                     to_raw(&header)
                 });
             let stream: zone_rpc::WsSubscriptionStream = Box::pin(stream);
@@ -1643,9 +1657,15 @@ where
                     futures::stream::iter(all_logs)
                 });
 
+            // Renumber `log_index` per-transaction so a log seen live over the
+            // subscription carries the same `(transactionHash, logIndex)` it would
+            // via `eth_getLogs`/`eth_getTransactionReceipt`.
+            // Logs arrive in block order grouped by tx, which is what `LogOrderingRedactor` needs.
+            let mut log_redactor = zone_rpc::filter::LogOrderingRedactor::default();
             let stream = stream.filter_map(move |log| {
                 std::future::ready(
-                    zone_rpc::filter::is_log_visible(&log, &caller).then(|| to_raw(&log)),
+                    zone_rpc::filter::is_log_visible(&log, &caller)
+                        .then(|| to_raw(&log_redactor.redact(log))),
                 )
             });
             let stream: zone_rpc::WsSubscriptionStream = Box::pin(stream);
@@ -2073,11 +2093,15 @@ where
                         deposit_hash,
                         sender,
                         recipient,
+                        bounceback_recipient,
                         token,
                         amount,
                         memo,
                     } => {
-                        if sender != auth.caller && recipient != auth.caller {
+                        if sender != auth.caller
+                            && recipient != auth.caller
+                            && bounceback_recipient != auth.caller
+                        {
                             continue;
                         }
 
@@ -2098,12 +2122,16 @@ where
                     PortalDepositRecord::Encrypted {
                         deposit_hash,
                         sender,
+                        bounceback_recipient,
                         token,
                         amount,
                     } => {
                         let terminal = self.terminal_event_for_deposit(deposit_hash).await?;
 
-                        let include = match (&terminal, sender == auth.caller) {
+                        let include = match (
+                            &terminal,
+                            sender == auth.caller || bounceback_recipient == auth.caller,
+                        ) {
                             (_, true) => true,
                             (
                                 Some(TerminalDepositEvent::EncryptedProcessed {
@@ -2705,6 +2733,7 @@ enum PortalDepositRecord {
         deposit_hash: B256,
         sender: Address,
         recipient: Address,
+        bounceback_recipient: Address,
         token: Address,
         amount: u128,
         memo: B256,
@@ -2712,6 +2741,7 @@ enum PortalDepositRecord {
     Encrypted {
         deposit_hash: B256,
         sender: Address,
+        bounceback_recipient: Address,
         token: Address,
         amount: u128,
     },
@@ -2834,18 +2864,60 @@ fn encrypted_deposit_details(
     }
 }
 
-fn redact_tempo_header(header: &mut TempoHeader) {
-    header.inner.logs_bloom = Bloom::ZERO;
+/// Clear RPC header fields that reveal private execution state from the header
+fn redact_header(header: &mut TempoHeaderResponse) {
+    header.inner.size = header.inner.size.map(|_| U256::ZERO);
+    let inner = &mut header.inner.inner.inner;
+    inner.gas_used = 0;
+    inner.logs_bloom = Bloom::ZERO;
+    inner.blob_gas_used = inner.blob_gas_used.map(|_| 0);
+    inner.excess_blob_gas = inner.excess_blob_gas.map(|_| 0);
 }
 
-fn redact_ws_header(header: &mut TempoHeaderResponse) {
-    redact_tempo_header(&mut header.inner.inner);
+/// Clear gas related fields that leak the size (and therefore tx counts)
+fn redact_fee_history(history: &mut FeeHistory) {
+    history.base_fee_per_gas.fill(u128::from(TEMPO_T0_BASE_FEE));
+    history.gas_used_ratio.fill(0.0);
+    history.base_fee_per_blob_gas.fill(0);
+    history.blob_gas_used_ratio.fill(0.0);
+    if let Some(rewards) = &mut history.reward {
+        for block_rewards in rewards {
+            block_rewards.fill(0);
+        }
+    }
+}
+
+/// Prefill missing transaction fee fields with public, deterministic values before calling reth's
+/// transaction filler, so `eth_fillTransaction` does not expose dynamic fee estimates derived from
+/// private zone activity.
+fn apply_public_fee_policy(request: &mut TempoTransactionRequest) {
+    if request.inner.has_eip4844_fields() && request.inner.max_fee_per_blob_gas.is_none() {
+        request.inner.max_fee_per_blob_gas = Some(0);
+    }
+
+    if request.gas_price().is_some() {
+        return;
+    }
+
+    if matches!(request.inner.transaction_type, Some(0 | 1)) {
+        request.set_gas_price(u128::from(TEMPO_T0_BASE_FEE));
+        return;
+    }
+
+    let priority_fee = request.max_priority_fee_per_gas().unwrap_or(0);
+    if request.max_priority_fee_per_gas().is_none() {
+        request.set_max_priority_fee_per_gas(0);
+    }
+    if request.max_fee_per_gas().is_none() {
+        request.set_max_fee_per_gas(u128::from(TEMPO_T0_BASE_FEE) + priority_fee);
+    }
 }
 
 /// Strip privacy-sensitive fields from a block for non-sequencer callers.
 fn redact_block(block: &mut RpcBlock) {
-    redact_tempo_header(&mut block.header.inner);
+    redact_header(&mut block.header);
     block.transactions = BlockTransactions::Hashes(Vec::new());
+    block.withdrawals = block.withdrawals.take().map(|_| Default::default());
 }
 
 fn level_from_response(price: u128, quantity: u128) -> Option<OrderLevel> {
@@ -3250,6 +3322,7 @@ mod tests {
     fn sample_batch_event(batch: u64) -> ZonePortal::BatchSubmitted {
         ZonePortal::BatchSubmitted {
             withdrawalBatchIndex: batch,
+            withdrawalQueueIndex: U256::from(batch),
             nextProcessedDepositQueueHash: B256::repeat_byte(0x11),
             nextBlockHash: B256::repeat_byte(0x22),
             withdrawalQueueHash: B256::repeat_byte(0x33),
@@ -3723,6 +3796,117 @@ mod tests {
         assert_eq!(classify_batch_query("not-a-batch"), BatchQuery::Invalid);
         let too_short = format!("0x{}", "11".repeat(31));
         assert_eq!(classify_batch_query(&too_short), BatchQuery::Invalid);
+    }
+
+    #[test]
+    fn redact_fee_history_preserves_shape_and_public_values() {
+        let mut history = FeeHistory {
+            base_fee_per_gas: vec![1, 2, 3],
+            gas_used_ratio: vec![0.25, 0.75],
+            base_fee_per_blob_gas: vec![4, 5, 6],
+            blob_gas_used_ratio: vec![0.5, 1.0],
+            oldest_block: 42,
+            reward: Some(vec![vec![7, 8], vec![9, 10]]),
+        };
+
+        redact_fee_history(&mut history);
+
+        assert_eq!(history.oldest_block, 42);
+        assert_eq!(
+            history.base_fee_per_gas,
+            vec![u128::from(TEMPO_T0_BASE_FEE); 3]
+        );
+        assert_eq!(history.gas_used_ratio, vec![0.0; 2]);
+        assert_eq!(history.base_fee_per_blob_gas, vec![0; 3]);
+        assert_eq!(history.blob_gas_used_ratio, vec![0.0; 2]);
+        assert_eq!(history.reward, Some(vec![vec![0, 0], vec![0, 0]]));
+    }
+
+    #[test]
+    fn apply_public_fee_policy_prefills_missing_fees() {
+        let mut request = TempoTransactionRequest::default();
+
+        apply_public_fee_policy(&mut request);
+
+        assert_eq!(request.gas_price(), None);
+        assert_eq!(
+            request.max_fee_per_gas(),
+            Some(u128::from(TEMPO_T0_BASE_FEE))
+        );
+        assert_eq!(request.max_priority_fee_per_gas(), Some(0));
+    }
+
+    #[test]
+    fn apply_public_fee_policy_prefills_legacy_gas_price() {
+        let mut request = TempoTransactionRequest::default();
+        request.inner.transaction_type = Some(0);
+
+        apply_public_fee_policy(&mut request);
+
+        assert_eq!(request.gas_price(), Some(u128::from(TEMPO_T0_BASE_FEE)));
+        assert_eq!(request.max_fee_per_gas(), None);
+        assert_eq!(request.max_priority_fee_per_gas(), None);
+    }
+
+    #[test]
+    fn apply_public_fee_policy_preserves_supplied_priority_fee() {
+        let mut request = TempoTransactionRequest::default();
+        request.set_max_priority_fee_per_gas(7);
+
+        apply_public_fee_policy(&mut request);
+
+        assert_eq!(request.max_priority_fee_per_gas(), Some(7));
+        assert_eq!(
+            request.max_fee_per_gas(),
+            Some(u128::from(TEMPO_T0_BASE_FEE) + 7)
+        );
+    }
+
+    #[test]
+    fn apply_public_fee_policy_prefills_blob_fee() {
+        let mut request = TempoTransactionRequest::default();
+        request.inner.blob_versioned_hashes = Some(Vec::new());
+
+        apply_public_fee_policy(&mut request);
+
+        assert_eq!(request.inner.max_fee_per_blob_gas, Some(0));
+    }
+
+    #[test]
+    fn redact_header_clears_activity_metadata() {
+        let mut header = TempoHeaderResponse {
+            inner: alloy_rpc_types_eth::Header {
+                hash: B256::with_last_byte(7),
+                inner: tempo_primitives::TempoHeader {
+                    inner: alloy_consensus::Header {
+                        gas_used: 123,
+                        state_root: B256::with_last_byte(1),
+                        transactions_root: B256::with_last_byte(2),
+                        receipts_root: B256::with_last_byte(3),
+                        extra_data: Bytes::from_static(b"private"),
+                        blob_gas_used: Some(4),
+                        excess_blob_gas: Some(5),
+                        withdrawals_root: Some(B256::with_last_byte(6)),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                size: Some(U256::from(8)),
+                ..Default::default()
+            },
+            timestamp_millis: 123_000,
+        };
+
+        redact_header(&mut header);
+
+        let inner = &header.inner.inner.inner;
+        assert_eq!(header.inner.hash, B256::with_last_byte(7));
+        assert_eq!(header.inner.size, Some(U256::ZERO));
+        assert_eq!(header.timestamp_millis, 123_000);
+        assert_eq!(inner.gas_used, 0);
+        assert_eq!(inner.logs_bloom, Bloom::ZERO);
+        assert_eq!(inner.blob_gas_used, Some(0));
+        assert_eq!(inner.excess_blob_gas, Some(0));
     }
 
     #[test]

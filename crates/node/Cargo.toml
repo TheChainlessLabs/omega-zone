@@ -54,9 +54,10 @@ reth-transaction-pool.workspace = true
 # alloy
 alloy-consensus.workspace = true
 alloy-contract.workspace = true
+alloy-genesis.workspace = true
 alloy-network.workspace = true
 alloy-primitives.workspace = true
-alloy-provider.workspace = true
+alloy-provider = { workspace = true, features = ["ws"] }
 alloy-rpc-client.workspace = true
 alloy-rpc-types-engine.workspace = true
 alloy-rpc-types-eth.workspace = true
@@ -71,6 +72,7 @@ parking_lot.workspace = true
 url = { version = "2", features = ["serde"] }
 eyre.workspace = true
 futures.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 
@@ -102,7 +104,6 @@ tempo-contracts.workspace = true
 reqwest.workspace = true
 revm.workspace = true
 serde = { workspace = true, features = ["derive"] }
-serde_json.workspace = true
 sha2.workspace = true
 tempo-payload-types.workspace = true
 tempo-precompiles = { workspace = true, features = ["test-utils"] }
@@ -110,7 +111,6 @@ tempo-revm.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros"] }
 tokio-tungstenite.workspace = true
-url = "2"
 
 [features]
 default = []

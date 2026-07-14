@@ -38,18 +38,14 @@ use tempo_precompiles::{
     tip20_factory::TIP20Factory,
     tip403_registry::TIP403Registry,
 };
+use tempo_primitives::TempoHeader;
 use tempo_revm::{TempoBlockEnv, TempoTxEnv};
-use zone_precompiles::{DarkpoolOrderbook, ZoneTokenFactory};
+use zone_precompiles::{DarkpoolOrderbook, TempoState as NativeTempoState, ZoneTokenFactory};
 
 const TEMPO_STATE_ADDRESS: Address = address!("0x1c00000000000000000000000000000000000000");
 const ZONE_INBOX_ADDRESS: Address = address!("0x1c00000000000000000000000000000000000001");
 const ZONE_OUTBOX_ADDRESS: Address = address!("0x1c00000000000000000000000000000000000002");
 const ZONE_CONFIG_ADDRESS: Address = address!("0x1c00000000000000000000000000000000000003");
-
-/// TempoStateReader precompile address — has no deployed contract code, but the zone EVM
-/// registers a custom precompile here. We must insert dummy bytecode (`0xFE`) in genesis
-/// so that Solidity's `EXTCODESIZE` check passes before issuing the STATICCALL.
-const TEMPO_STATE_READER_ADDRESS: Address = address!("0x1c00000000000000000000000000000000000004");
 
 const DEPLOYER: Address = address!("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
 
@@ -70,8 +66,12 @@ pub(crate) struct GenerateZoneGenesis {
     #[arg(long)]
     pub(crate) tempo_portal: Address,
 
+    /// RLP-encoded Tempo genesis header. Defaults to `TempoHeader::default()`.
     #[arg(long)]
-    pub(crate) tempo_genesis_header_rlp: String,
+    pub(crate) tempo_genesis_header_rlp: Option<String>,
+
+    #[arg(long)]
+    pub(crate) admin: Address,
 
     #[arg(long)]
     pub(crate) sequencer: Option<Address>,
@@ -92,6 +92,10 @@ pub(crate) struct GenerateZoneGenesis {
     /// controls whether it remains in the final genesis state.
     #[arg(long)]
     pub(crate) with_create2_factory: bool,
+
+    /// Bundle ZoneFactory creation bytecode as dev-only top-level metadata.
+    #[arg(long)]
+    pub(crate) with_zone_factory_bytecode: bool,
 }
 
 #[derive(serde::Deserialize)]
@@ -106,8 +110,16 @@ struct BytecodeField {
 
 impl GenerateZoneGenesis {
     pub(crate) async fn run(self) -> eyre::Result<()> {
-        let header_rlp = const_hex::decode(&self.tempo_genesis_header_rlp)
-            .wrap_err("failed to decode hex string")?;
+        if self.admin == Address::ZERO {
+            return Err(eyre!("--admin must not be the zero address"));
+        }
+
+        let header_rlp = match &self.tempo_genesis_header_rlp {
+            Some(header_rlp) => {
+                const_hex::decode(header_rlp).wrap_err("failed to decode hex string")?
+            }
+            None => alloy_rlp::encode(TempoHeader::default()),
+        };
 
         let mut evm = setup_zone_evm(self.chain_id, self.gas_limit);
 
@@ -127,27 +139,16 @@ impl GenerateZoneGenesis {
 
         initialize_tip403_registry(&mut evm)?;
         initialize_tip20_factory(&mut evm)?;
-        create_path_usd_token(&mut evm)?;
+        create_path_usd_token(&mut evm, self.admin)?;
         initialize_fee_manager(&mut evm)?;
         initialize_stablecoin_dex(&mut evm)?;
         initialize_nonce_manager(&mut evm)?;
         initialize_account_keychain(&mut evm)?;
         initialize_darkpool_orderbook(&mut evm)?;
 
-        let tempo_state_bytecode = load_artifact(&self.specs_out, "TempoState")?;
-        let tempo_state_args = (Bytes::from(header_rlp),).abi_encode_params();
         let mut nonce = 0u64;
 
-        deploy_contract(
-            &mut evm,
-            &tempo_state_bytecode,
-            &tempo_state_args,
-            TEMPO_STATE_ADDRESS,
-            "TempoState",
-            self.chain_id,
-            nonce,
-        )?;
-        nonce += 1;
+        initialize_tempo_state(&mut evm, &header_rlp)?;
 
         let zone_config_bytecode = load_artifact(&self.specs_out, "ZoneConfig")?;
         let zone_config_args = (self.tempo_portal, TEMPO_STATE_ADDRESS).abi_encode_params();
@@ -187,28 +188,6 @@ impl GenerateZoneGenesis {
             self.chain_id,
             nonce,
         )?;
-
-        // Insert dummy bytecode at the TempoStateReader precompile address.
-        //
-        // The zone EVM registers a custom precompile at this address, but Solidity ≥0.8
-        // checks `EXTCODESIZE` before every high-level external call. If the address has
-        // no code, the call reverts immediately without issuing the STATICCALL — the
-        // precompile never gets a chance to execute. `0xFE` (INVALID opcode) is safe
-        // because revm routes to the precompile before ever executing bytecode.
-        {
-            use reth_evm::revm::bytecode::Bytecode;
-            evm.db_mut().insert_account_info(
-                TEMPO_STATE_READER_ADDRESS,
-                AccountInfo {
-                    code: Some(Bytecode::new_raw(Bytes::from_static(&[0xFE]))),
-                    nonce: 1,
-                    ..Default::default()
-                },
-            );
-            println!(
-                "Inserted dummy bytecode at TempoStateReader precompile {TEMPO_STATE_READER_ADDRESS}"
-            );
-        }
 
         let db = evm.db_mut();
         for (name, addr) in [
@@ -299,6 +278,8 @@ impl GenerateZoneGenesis {
             genesis_alloc.entry(sequencer).or_default().balance =
                 U256::from(1_000_000_000_000_000_000_000u128);
         }
+        genesis_alloc.entry(self.admin).or_default().balance =
+            U256::from(1_000_000_000_000_000_000_000u128);
 
         let chain_config = ChainConfig {
             chain_id: self.chain_id,
@@ -332,8 +313,21 @@ impl GenerateZoneGenesis {
         genesis.alloc = genesis_alloc;
         genesis.config = chain_config;
 
-        let json =
-            serde_json::to_string_pretty(&genesis).wrap_err("failed encoding genesis as JSON")?;
+        let mut genesis_json =
+            serde_json::to_value(&genesis).wrap_err("failed encoding genesis as JSON")?;
+        if self.with_zone_factory_bytecode {
+            let factory_bytecode = load_artifact(&self.specs_out, "ZoneFactory")?;
+            genesis_json
+                .as_object_mut()
+                .ok_or_else(|| eyre!("encoded genesis is not a JSON object"))?
+                .insert(
+                    "zoneFactoryBytecode".to_owned(),
+                    serde_json::Value::String(format!("0x{}", const_hex::encode(factory_bytecode))),
+                );
+        }
+        let mut json = serde_json::to_string_pretty(&genesis_json)
+            .wrap_err("failed encoding genesis as JSON")?;
+        json.push('\n');
 
         std::fs::create_dir_all(&self.output).wrap_err_with(|| {
             format!(
@@ -469,6 +463,24 @@ fn deploy_permit2(evm: &mut TempoEvm<CacheDB<EmptyDB>>) -> eyre::Result<()> {
     Ok(())
 }
 
+/// Initialize the native TempoState precompile storage from the L1 genesis header.
+fn initialize_tempo_state(
+    evm: &mut TempoEvm<CacheDB<EmptyDB>>,
+    header_rlp: &[u8],
+) -> eyre::Result<()> {
+    let ctx = evm.ctx_mut();
+    StorageCtx::enter_evm(
+        &mut ctx.journaled_state,
+        &ctx.block,
+        &ctx.cfg,
+        &ctx.tx,
+        StorageActions::disabled(),
+        || NativeTempoState::new().initialize(header_rlp),
+    )?;
+    println!("Initialized native TempoState at {TEMPO_STATE_ADDRESS}");
+    Ok(())
+}
+
 /// Initialize the TIP403Registry precompile (required for fee token transfer checks).
 fn initialize_tip403_registry(evm: &mut TempoEvm<CacheDB<EmptyDB>>) -> eyre::Result<()> {
     let ctx = evm.ctx_mut();
@@ -504,9 +516,7 @@ fn initialize_tip20_factory(evm: &mut TempoEvm<CacheDB<EmptyDB>>) -> eyre::Resul
 /// This mirrors the L1 genesis setup: the Tempo EVM handler defaults to pathUSD
 /// (`0x20C0...`) as the fee token and validates its `currency == "USD"` storage.
 /// Without this, user transactions on the zone revert with `InvalidFeeToken`.
-fn create_path_usd_token(evm: &mut TempoEvm<CacheDB<EmptyDB>>) -> eyre::Result<()> {
-    let admin = DEPLOYER;
-
+fn create_path_usd_token(evm: &mut TempoEvm<CacheDB<EmptyDB>>, admin: Address) -> eyre::Result<()> {
     let ctx = evm.ctx_mut();
     StorageCtx::enter_evm(
         &mut ctx.journaled_state,

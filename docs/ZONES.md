@@ -53,6 +53,26 @@ just check-balance "$ADDR"
 
 See [Interact with the Zone](#6-interact-with-the-zone) for withdrawals and private RPC usage.
 
+For a fully local development stack, use Foundry 1.8 or newer, or a nightly
+build from July 11, 2026 or later. Run Anvil in Tempo mode and point the dev
+command at its WebSocket endpoint:
+
+```bash
+# Terminal 1
+anvil --network tempo --block-time 1
+
+# Terminal 2
+cargo run --release --bin tempo-zone -- dev \
+  --l1.rpc-url ws://127.0.0.1:8545
+```
+
+This provisions a new ZoneFactory and portal, writes the generated zone files to
+`/tmp/tempo-zone-dev`, and serves the zone HTTP RPC at `http://127.0.0.1:9545`.
+
+Older Anvil builds are rejected because they mine Ethereum header hashes and only
+add Tempo fields to the RPC response. Zones require canonical Tempo header hashes
+to verify L1 ancestry.
+
 To restart the zone later:
 
 ```bash
@@ -82,26 +102,30 @@ export L1_RPC_URL="wss://rpc.moderato.tempo.xyz"
 export L1_RPC_URL="wss://rpc.devnet.tempoxyz.dev"
 ```
 
-### 2. Generate a Sequencer Key
+### 2. Generate Admin and Sequencer Keys
 
-The sequencer is the operator that builds zone blocks, processes deposits, and submits batch proofs back to L1.
+The admin controls portal governance such as token enablement and deposit pause/resume. The sequencer is the operator that builds zone blocks, processes deposits, and submits batch proofs back to L1. The same key may be used for both roles, but pass it explicitly as both `ADMIN_KEY` and `SEQUENCER_KEY` when that is intentional.
 
 ```bash
 cast wallet new
+cast wallet new
 ```
 
-Save both the **address** and **private key**.
+Save both **addresses** and **private keys**.
 
 ```bash
+export ADMIN_KEY="0x<admin-private-key>"
 export SEQUENCER_KEY="0x<your-private-key>"
+ADMIN_ADDR=$(cast wallet address "$ADMIN_KEY")
 SEQUENCER_ADDR=$(cast wallet address "$SEQUENCER_KEY")
 ```
 
-### 3. Fund the Sequencer on L1
+### 3. Fund the Admin and Sequencer on L1
 
-The sequencer needs pathUSD on L1 to pay for the `createZone` transaction and deposit fees.
+The sequencer needs pathUSD on L1 to pay for the `createZone` transaction and deposit fees. The admin needs funds for later governance calls.
 
 ```bash
+cast rpc tempo_fundAddress "$ADMIN_ADDR" --rpc-url "$L1_RPC_URL"
 cast rpc tempo_fundAddress "$SEQUENCER_ADDR" --rpc-url "$L1_RPC_URL"
 ```
 
@@ -142,11 +166,12 @@ You can also run the xtask directly for more control:
 cargo run -p tempo-xtask -- create-zone \
   --output generated/my-zone \
   --initial-token 0x20c0000000000000000000000000000000000001 \
+  --admin "$ADMIN_ADDR" \
   --sequencer "$SEQUENCER_ADDR" \
   --private-key "$SEQUENCER_KEY"
 ```
 
-By default, `create-zone` sets the portal admin to the sequencer. To separate the cold admin role from the hot sequencer role, pass `--admin "$ADMIN_ADDR"` to the direct xtask command and keep the matching `ADMIN_KEY` available for admin-only portal calls such as `enable-token`, `pause-deposits`, and `resume-deposits`.
+`create-zone` requires the admin address explicitly. Keep the matching `ADMIN_KEY` available for admin-only portal calls such as `enable-token`, `pause-deposits`, and `resume-deposits`.
 
 ### 5. Start the Zone Node
 
@@ -570,7 +595,7 @@ graph TB
     subgraph L2["Zone L2 Node"]
         direction TB
         Tasks["Sequencer Tasks<br/>• L1 subscriber (deposit backfill + live)<br/>• Zone engine (L1-driven block building)<br/>• Zone monitor (batch submission to L1)<br/>• Withdrawal processor (L1 queue drain)"]
-        Predeploys["Predeploys<br/>0x1c00…0000 TempoState<br/>0x1c00…0001 ZoneInbox<br/>0x1c00…0002 ZoneOutbox<br/>0x1c00…0003 ZoneConfig<br/>0x1c00…0004 TempoStateReader<br/>0x20C0…0000 pathUSD"]
+        Predeploys["Predeploys<br/>0x1c00…0000 TempoState<br/>0x1c00…0001 ZoneInbox<br/>0x1c00…0002 ZoneOutbox<br/>0x1c00…0003 ZoneConfig<br/>0x20C0…0000 pathUSD"]
     end
 
     Portal -- "WSS subscription<br/>(deposits, headers)" --> Tasks
@@ -602,7 +627,7 @@ Zones inherit the Tempo L1 EVM but replace, disable, or pass through each precom
 
 | Precompile | Address | Description |
 |------------|---------|-------------|
-| TempoStateReader | `0x1c00…0004` | Reads L1 contract storage from zone contracts via the L1 state cache. |
+| TempoState | `0x1c00…0000` | Tracks the finalized Tempo checkpoint and lets zone system contracts read L1 storage through the L1 state cache. |
 | ZoneTxContext | `0x1c00…0005` | Exposes the hash of the currently executing zone transaction (`currentTxHash`), used by ZoneOutbox for authenticated withdrawals. |
 | ChaumPedersenVerify | `0x1c00…0100` | Verifies DLOG equality proofs for ECDH key exchange (encrypted deposits). |
 | AesGcmDecrypt | `0x1c00…0101` | AES-256-GCM authenticated decryption (encrypted deposit payloads). |
@@ -614,7 +639,7 @@ Zones inherit the Tempo L1 EVM but replace, disable, or pass through each precom
 | Contract | Address |
 |----------|---------|
 | pathUSD (TIP-20) | `0x20C0000000000000000000000000000000000000` |
-| ZoneFactory (moderato) | `0xcDf1101C60B34Cc5205BB27C88F02Db36A373C68` |
+| ZoneFactory (moderato) | `0x179B44a4B7eC74f3957Ed5137Dc4F1a6dEeBB19b` |
 
 The xtasks use this Moderato `ZoneFactory` as their built-in default: `create-zone` and `zone-info` point at it automatically, and `deploy-router` uses `zoneFactory` from `zone.json` before falling back to this address. Pass `--zone-factory` or set `ZONE_FACTORY` to override it.
 
@@ -628,7 +653,7 @@ export ETH_RPC_URL=https://rpc.moderato.tempo.xyz
 export PRIVATE_KEY=<deployer_private_key>
 
 forge build
-forge create --broadcast --rpc-url "$ETH_RPC_URL" --private-key "$PRIVATE_KEY" src/l1/ZoneFactory.sol:ZoneFactory
+forge create --broadcast --rpc-url "$ETH_RPC_URL" --private-key "$PRIVATE_KEY" src/tempo/ZoneFactory.sol:ZoneFactory
 ```
 
 The `--private-key "$PRIVATE_KEY"` form is useful for controlled non-interactive deployments. For manual deployments, prefer replacing it with `--interactive` and paste the key at Foundry's prompt so the key is not written into shell history or process arguments.
@@ -649,23 +674,23 @@ Current deployment:
 
 | Field | Value |
 |-------|-------|
-| Address | `0xcDf1101C60B34Cc5205BB27C88F02Db36A373C68` |
-| Transaction | `0xb3d519f55fd6b0b349b3f118d8966edf3e20f2cc1d1ca24df60c333a23f4e1cf` |
-| Block | `24532374` |
-| Deployed | `2026-06-30 19:22:56 UTC` |
+| Address | `0x179B44a4B7eC74f3957Ed5137Dc4F1a6dEeBB19b` |
+| Transaction | `0x91b6ae5d07b7a6589242bd6c4a1ae7caffcd18d918e915e66ad40f67d5348ef9` |
+| Block | `26198694` |
+| Deployed | `2026-07-12 08:36:09 UTC` |
 
 ### Zone Node CLI Options
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--l1.rpc-url` | (required) | L1 WebSocket RPC URL |
+| `--l1.rpc-url` | (required) | Certified Tempo follower WebSocket RPC URL |
 | `--l1.portal-address` | (from zone.json) | ZonePortal contract on L1 |
 | `--l1.genesis-block-number` | (from zone.json) | L1 block when the zone was created |
 | `--zone.id` | 0 | Zone ID from ZoneFactory (for private RPC auth). The zone's chain ID is derived as `421700000 + (zone_id % 1002610000)` (mainnet) or `1424310000 + (zone_id % 723173648)` (testnet). |
 | `--sequencer` | false | Enable sequencer mode for block production and withdrawal batch submission |
 | `--sequencer-key` | (optional) | Sequencer private key used when `--sequencer` is enabled |
 | `--block.interval-ms` | 250 | Block building interval |
-| `--zone.batch-interval-secs` | 60 | Max seconds to accumulate zone blocks before submitting a batch to L1 |
+| `--zone.batch-interval-blocks` | 120 | Zone blocks between empty withdrawal batch boundaries / L1 submissions (~1 minute at Tempo's 500 ms block time) |
 | `--zone.poll-interval-secs` | 1 | How often (seconds) the zone monitor polls for new L2 blocks |
 | `--withdrawal-poll-interval-secs` | 5 | How often (seconds) the withdrawal processor polls the L1 queue |
 | `--http.port` | 8546 | HTTP JSON-RPC port |
@@ -676,7 +701,7 @@ Current deployment:
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `L1_RPC_URL` | Yes | L1 WebSocket URL (`wss://...`) |
+| `L1_RPC_URL` | Yes | Certified Tempo follower WebSocket RPC URL (`wss://...`) |
 | `SEQUENCER_KEY` | For sequencing | Sequencer private key |
 | `ADMIN_KEY` | For portal governance | Portal admin private key for `enableToken` / deposit pause controls. `SEQUENCER_KEY` only works for legacy zones where admin == sequencer. |
 | `PRIVATE_KEY` | For transactions | Key for L1 transactions (deposits, approvals) |
@@ -691,7 +716,7 @@ Current deployment:
 | Command | Description |
 |---------|-------------|
 | `just deploy-zone <name> [<tip20>]` | One-shot: keygen → fund → create → genesis → start node |
-| `just create-zone <name> [<tip20>]` | Create zone on L1 + generate genesis (requires `PRIVATE_KEY`, `SEQUENCER_KEY`) |
+| `just create-zone <name> [<tip20>]` | Create zone on L1 + generate genesis (requires `PRIVATE_KEY`, `SEQUENCER_KEY`, and `ADMIN_KEY` or `ADMIN_ADDR`) |
 | `just deploy-router <name> [dex]` | Deploy `SwapAndDepositRouter` on L1 for the zone and save it to `zone.json` |
 | `just zone-up <name> [reset] [profile]` | Start the zone node. `reset=true` wipes datadir. `profile=release` for production. |
 | `just max-approve-portal [token]` | Approve portal to spend tokens on L1 |

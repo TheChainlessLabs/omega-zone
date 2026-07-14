@@ -5,6 +5,10 @@ use alloy_primitives::{Address, B256, U256, address};
 /// Sentinel value for empty withdrawal queue slots.
 pub const EMPTY_SENTINEL: B256 = B256::new([0xff; 32]);
 
+/// Sentinel emitted as `BatchSubmitted.withdrawalQueueIndex` when a batch carried no
+/// withdrawals and therefore consumed no queue index (`NO_QUEUE_INDEX` in Solidity).
+pub const NO_QUEUE_INDEX: U256 = U256::MAX;
+
 /// Maximum callback gas a withdrawal may request.
 ///
 /// The L1 processor adds fixed overhead plus an EIP-150 cushion, so this value
@@ -13,17 +17,6 @@ pub const MAX_WITHDRAWAL_GAS_LIMIT: u64 = 10_000_000;
 
 /// TempoState predeploy address on Zone L2.
 pub const TEMPO_STATE_ADDRESS: Address = address!("0x1c00000000000000000000000000000000000000");
-
-/// TempoState storage slot for `tempoBlockHash` (slot 0).
-pub const TEMPO_BLOCK_HASH_SLOT: B256 = B256::ZERO;
-
-/// TempoState storage slot for packed
-/// `(tempoBlockNumber, tempoGasLimit, tempoGasUsed, tempoTimestamp)` (slot 7).
-pub const TEMPO_PACKED_SLOT: B256 = {
-    let mut bytes = [0u8; 32];
-    bytes[31] = 7;
-    B256::new(bytes)
-};
 
 /// ZoneInbox predeploy address on Zone L2.
 pub const ZONE_INBOX_ADDRESS: Address = address!("0x1c00000000000000000000000000000000000001");
@@ -34,9 +27,10 @@ pub const ZONE_OUTBOX_ADDRESS: Address = address!("0x1c0000000000000000000000000
 /// ZoneConfig predeploy address on Zone L2.
 pub const ZONE_CONFIG_ADDRESS: Address = address!("0x1c00000000000000000000000000000000000003");
 
-/// TempoStateReader precompile address on Zone L2.
-pub const TEMPO_STATE_READER_ADDRESS: Address =
-    address!("0x1c00000000000000000000000000000000000004");
+/// Protocol-level contract deployers permitted to create contracts on Zones.
+///
+/// WARNING: Updating this list is a consensus change.
+pub const CONTRACT_DEPLOYER_ALLOWLIST: &[Address] = &[];
 
 /// ZoneTxContext precompile address on Zone L2.
 pub const ZONE_TX_CONTEXT_ADDRESS: Address = address!("0x1c00000000000000000000000000000000000005");

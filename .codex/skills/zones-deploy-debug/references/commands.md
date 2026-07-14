@@ -15,11 +15,13 @@ just deploy-zone my-zone
 That recipe creates the zone, stores `sequencerKey` and `adminKey` in `generated/my-zone/zone.json`, and starts the node immediately. If you need tighter control, run:
 
 ```bash
-target/debug/tempo-xtask create-zone --output generated/my-zone --l1-rpc-url "$HTTP_RPC" --sequencer "$SEQUENCER_ADDR" --private-key "$SEQUENCER_KEY"
+PRIVATE_KEY="$SEQUENCER_KEY" target/debug/tempo-xtask create-zone --output generated/my-zone --l1-rpc-url "$HTTP_RPC" --admin "$ADMIN_ADDR" --sequencer "$SEQUENCER_ADDR"
 target/debug/tempo-xtask set-encryption-key --l1-rpc-url "$HTTP_RPC" --portal "$PORTAL" --private-key "$SEQUENCER_KEY"
 ```
 
-`deploy-zone` also stores `adminKey` and `adminAddress` using the generated sequencer key, because that convenience flow creates zones with `admin == sequencer`. For manual `create-zone` flows, pass `--admin "$ADMIN_ADDR"` when separating the cold admin role from the hot sequencer role, and keep the matching `ADMIN_KEY` available for admin-only portal calls.
+`deploy-zone` stores separate generated admin and sequencer credentials unless
+`ADMIN_KEY` or `ADMIN_ADDR` selects an existing admin. For manual `create-zone`
+flows, keep the matching `ADMIN_KEY` available for admin-only portal calls.
 
 ## Start a zone in release
 

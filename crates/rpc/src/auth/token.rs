@@ -1,8 +1,7 @@
 use alloy_primitives::{Address, B256, hex, keccak256};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::auth::eip712;
-use crate::error::AuthError;
+use crate::{auth::eip712, error::AuthError};
 
 /// Magic prefix: "TempoZoneRPC" left-padded to 32 bytes.
 const TEMPO_ZONE_RPC_MAGIC: [u8; 32] = {
