@@ -40,3 +40,6 @@ docs/.sonda
 _
 .vercel
 .env*.local
+
+# Cloned external repo (propeller-heads/fynd) — keep out of this tree
+fynd/
