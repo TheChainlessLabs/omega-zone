@@ -936,17 +936,17 @@ main() {
     local zone_path_fees=0
 
     maker_ask_gas="$(buffered_gas_limit "$ORDER_GAS_FALLBACK" "$ZONE_RPC_URL" "$maker_account" \
-        "$DARKPOOL" "place(address,uint128,uint128,bool)" "$ALPHAUSD" "$MARKET_ORDER_AMOUNT" "$MARKET_ASK_PRICE" false)"
+        "$DARKPOOL" "place(address,address,uint128,uint128,bool)" "$ALPHAUSD" "$PATHUSD" "$MARKET_ORDER_AMOUNT" "$MARKET_ASK_PRICE" false)"
     maker_ask_tx="$(send_checked "maker ask for market buy" \
-        cast send "$DARKPOOL" "place(address,uint128,uint128,bool)" "$ALPHAUSD" "$MARKET_ORDER_AMOUNT" "$MARKET_ASK_PRICE" false \
+        cast send "$DARKPOOL" "place(address,address,uint128,uint128,bool)" "$ALPHAUSD" "$PATHUSD" "$MARKET_ORDER_AMOUNT" "$MARKET_ASK_PRICE" false \
         --rpc-url "$ZONE_RPC_URL" --private-key "$maker_key" --gas-limit "$maker_ask_gas")"
     echo "  maker ask tx: $maker_ask_tx (gas $maker_ask_gas)"
     print_specific_order_status "maker ask for market buy" "$maker_ask_tx" "$maker_auth" "sell" "$MARKET_ORDER_AMOUNT" "$MARKET_ASK_PRICE"
 
     market_buy_gas="$(buffered_gas_limit "$ORDER_GAS_FALLBACK" "$ZONE_RPC_URL" "$account" \
-        "$DARKPOOL" "marketBuy(address,uint128,uint128)" "$ALPHAUSD" "$MARKET_ORDER_AMOUNT" "$MARKET_BUY_MAX_QUOTE_IN")"
+        "$DARKPOOL" "marketBuy(address,address,uint128,uint128)" "$ALPHAUSD" "$PATHUSD" "$MARKET_ORDER_AMOUNT" "$MARKET_BUY_MAX_QUOTE_IN")"
     market_buy_tx="$(send_checked "market buy" \
-        cast send "$DARKPOOL" "marketBuy(address,uint128,uint128)" "$ALPHAUSD" "$MARKET_ORDER_AMOUNT" "$MARKET_BUY_MAX_QUOTE_IN" \
+        cast send "$DARKPOOL" "marketBuy(address,address,uint128,uint128)" "$ALPHAUSD" "$PATHUSD" "$MARKET_ORDER_AMOUNT" "$MARKET_BUY_MAX_QUOTE_IN" \
         --rpc-url "$ZONE_RPC_URL" --private-key "$private_key" --gas-limit "$market_buy_gas")"
     zone_path_fees=$((zone_path_fees + $(zone_path_fee_paid "$market_buy_tx" "$account")))
     echo "  market buy tx: $market_buy_tx (gas $market_buy_gas)"
@@ -954,17 +954,17 @@ main() {
     print_order_status "market buy" "$account" "$auth" "$market_buy_tx"
 
     maker_bid_gas="$(buffered_gas_limit "$ORDER_GAS_FALLBACK" "$ZONE_RPC_URL" "$maker_account" \
-        "$DARKPOOL" "place(address,uint128,uint128,bool)" "$ALPHAUSD" "$MARKET_ORDER_AMOUNT" "$MARKET_BID_PRICE" true)"
+        "$DARKPOOL" "place(address,address,uint128,uint128,bool)" "$ALPHAUSD" "$PATHUSD" "$MARKET_ORDER_AMOUNT" "$MARKET_BID_PRICE" true)"
     maker_bid_tx="$(send_checked "maker bid for market sell" \
-        cast send "$DARKPOOL" "place(address,uint128,uint128,bool)" "$ALPHAUSD" "$MARKET_ORDER_AMOUNT" "$MARKET_BID_PRICE" true \
+        cast send "$DARKPOOL" "place(address,address,uint128,uint128,bool)" "$ALPHAUSD" "$PATHUSD" "$MARKET_ORDER_AMOUNT" "$MARKET_BID_PRICE" true \
         --rpc-url "$ZONE_RPC_URL" --private-key "$maker_key" --gas-limit "$maker_bid_gas")"
     echo "  maker bid tx: $maker_bid_tx (gas $maker_bid_gas)"
     print_specific_order_status "maker bid for market sell" "$maker_bid_tx" "$maker_auth" "buy" "$MARKET_ORDER_AMOUNT" "$MARKET_BID_PRICE"
 
     market_sell_gas="$(buffered_gas_limit "$ORDER_GAS_FALLBACK" "$ZONE_RPC_URL" "$account" \
-        "$DARKPOOL" "marketSell(address,uint128,uint128)" "$ALPHAUSD" "$MARKET_ORDER_AMOUNT" "$MARKET_SELL_MIN_QUOTE_OUT")"
+        "$DARKPOOL" "marketSell(address,address,uint128,uint128)" "$ALPHAUSD" "$PATHUSD" "$MARKET_ORDER_AMOUNT" "$MARKET_SELL_MIN_QUOTE_OUT")"
     market_sell_tx="$(send_checked "market sell" \
-        cast send "$DARKPOOL" "marketSell(address,uint128,uint128)" "$ALPHAUSD" "$MARKET_ORDER_AMOUNT" "$MARKET_SELL_MIN_QUOTE_OUT" \
+        cast send "$DARKPOOL" "marketSell(address,address,uint128,uint128)" "$ALPHAUSD" "$PATHUSD" "$MARKET_ORDER_AMOUNT" "$MARKET_SELL_MIN_QUOTE_OUT" \
         --rpc-url "$ZONE_RPC_URL" --private-key "$private_key" --gas-limit "$market_sell_gas")"
     zone_path_fees=$((zone_path_fees + $(zone_path_fee_paid "$market_sell_tx" "$account")))
     echo "  market sell tx: $market_sell_tx (gas $market_sell_gas)"
@@ -975,9 +975,9 @@ main() {
     local sell_tx buy_tx
     local sell_gas buy_gas
     sell_gas="$(buffered_gas_limit "$ORDER_GAS_FALLBACK" "$ZONE_RPC_URL" "$account" \
-        "$DARKPOOL" "place(address,uint128,uint128,bool)" "$ALPHAUSD" "$ORDER_AMOUNT" "$SELL_PRICE" false)"
+        "$DARKPOOL" "place(address,address,uint128,uint128,bool)" "$ALPHAUSD" "$PATHUSD" "$ORDER_AMOUNT" "$SELL_PRICE" false)"
     sell_tx="$(send_checked "sell order" \
-        cast send "$DARKPOOL" "place(address,uint128,uint128,bool)" "$ALPHAUSD" "$ORDER_AMOUNT" "$SELL_PRICE" false \
+        cast send "$DARKPOOL" "place(address,address,uint128,uint128,bool)" "$ALPHAUSD" "$PATHUSD" "$ORDER_AMOUNT" "$SELL_PRICE" false \
         --rpc-url "$ZONE_RPC_URL" --private-key "$private_key" --gas-limit "$sell_gas")"
     zone_path_fees=$((zone_path_fees + $(zone_path_fee_paid "$sell_tx" "$account")))
     echo "  sell tx: $sell_tx (gas $sell_gas)"
@@ -985,9 +985,9 @@ main() {
     print_order_status "sell order" "$account" "$auth" "$sell_tx"
 
     buy_gas="$(buffered_gas_limit "$ORDER_GAS_FALLBACK" "$ZONE_RPC_URL" "$account" \
-        "$DARKPOOL" "place(address,uint128,uint128,bool)" "$ALPHAUSD" "$ORDER_AMOUNT" "$BUY_PRICE" true)"
+        "$DARKPOOL" "place(address,address,uint128,uint128,bool)" "$ALPHAUSD" "$PATHUSD" "$ORDER_AMOUNT" "$BUY_PRICE" true)"
     buy_tx="$(send_checked "buy order" \
-        cast send "$DARKPOOL" "place(address,uint128,uint128,bool)" "$ALPHAUSD" "$ORDER_AMOUNT" "$BUY_PRICE" true \
+        cast send "$DARKPOOL" "place(address,address,uint128,uint128,bool)" "$ALPHAUSD" "$PATHUSD" "$ORDER_AMOUNT" "$BUY_PRICE" true \
         --rpc-url "$ZONE_RPC_URL" --private-key "$private_key" --gas-limit "$buy_gas")"
     zone_path_fees=$((zone_path_fees + $(zone_path_fee_paid "$buy_tx" "$account")))
     echo "  buy tx:  $buy_tx (gas $buy_gas)"

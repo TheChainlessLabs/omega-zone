@@ -1096,13 +1096,13 @@ alpha-seed-liquidity amount="1000000" bid_price="1" ask_price="2" rpc=zone_rpc:
     MAKER_ADDR=$(cast wallet address "$MK")
     echo "Seeding OALPHA / pathUSD darkpool liquidity from maker $MAKER_ADDR..."
     echo "  bid: {{amount}} OALPHA @ {{bid_price}}  (escrows {{amount}}*{{bid_price}} pathUSD)"
-    BID_TX=$(cast send "{{alpha_darkpool}}" "place(address,uint128,uint128,bool)" \
-        "{{alpha_oalpha}}" "{{amount}}" "{{bid_price}}" true \
+    BID_TX=$(cast send "{{alpha_darkpool}}" "place(address,address,uint128,uint128,bool)" \
+        "{{alpha_oalpha}}" "{{alpha_pathusd}}" "{{amount}}" "{{bid_price}}" true \
         --rpc-url "{{rpc}}" --private-key "$MK" --gas-limit 500000 --json | jq -r '.transactionHash')
     echo "  bid tx: $BID_TX"
     echo "  ask: {{amount}} OALPHA @ {{ask_price}}  (escrows {{amount}} OALPHA)"
-    ASK_TX=$(cast send "{{alpha_darkpool}}" "place(address,uint128,uint128,bool)" \
-        "{{alpha_oalpha}}" "{{amount}}" "{{ask_price}}" false \
+    ASK_TX=$(cast send "{{alpha_darkpool}}" "place(address,address,uint128,uint128,bool)" \
+        "{{alpha_oalpha}}" "{{alpha_pathusd}}" "{{amount}}" "{{ask_price}}" false \
         --rpc-url "{{rpc}}" --private-key "$MK" --gas-limit 500000 --json | jq -r '.transactionHash')
     echo "  ask tx: $ASK_TX"
 
@@ -1145,8 +1145,8 @@ alpha-state rpc=zone_rpc:
     fi
     echo
     echo "Darkpool {{alpha_darkpool}} — OALPHA/pathUSD top of book:"
-    BID=$(cast call "{{alpha_darkpool}}" "bestBid(address)(uint128,uint128)" "{{alpha_oalpha}}" --rpc-url "{{rpc}}")
-    ASK=$(cast call "{{alpha_darkpool}}" "bestAsk(address)(uint128,uint128)" "{{alpha_oalpha}}" --rpc-url "{{rpc}}")
+    BID=$(cast call "{{alpha_darkpool}}" "bestBid(address,address)(uint128,uint128)" "{{alpha_oalpha}}" "{{alpha_pathusd}}" --rpc-url "{{rpc}}")
+    ASK=$(cast call "{{alpha_darkpool}}" "bestAsk(address,address)(uint128,uint128)" "{{alpha_oalpha}}" "{{alpha_pathusd}}" --rpc-url "{{rpc}}")
     echo "  best bid (price, quantity): $(echo "$BID" | tr '\n' ' ')"
     echo "  best ask (price, quantity): $(echo "$ASK" | tr '\n' ' ')"
 

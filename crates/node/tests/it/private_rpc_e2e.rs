@@ -43,7 +43,7 @@ use zone_precompiles::DARKPOOL_ADDRESS;
 sol! {
     #[sol(rpc)]
     contract DarkpoolRegistry {
-        function createPair(address base) external returns (bytes32);
+        function createPair(address base, address quote) external returns (bytes32);
     }
 }
 
@@ -158,28 +158,38 @@ async fn test_market_rpcs_follow_darkpool_pair_registry() -> eyre::Result<()> {
 
     let mut ctx = start_zone_with_private_rpc().await?;
     let base = address!("0x20C0000000000000000000000000000000000001");
-    let quote = PATH_USD_ADDRESS;
+    let quote = address!("0x20C0000000000000000000000000000000000002");
     let signer = MnemonicBuilder::<English>::default()
         .phrase(TEST_MNEMONIC)
         .build()?;
     let signer_address = signer.address();
     ctx.fixture.inject_enabled_tokens(
         ctx.zone.deposit_queue(),
-        vec![EnabledToken {
-            token: base,
-            name: "Alpha USD".to_string(),
-            symbol: "ALPHAUSD".to_string(),
-            currency: "USD".to_string(),
-        }],
+        vec![
+            EnabledToken {
+                token: base,
+                name: "Alpha USD".to_string(),
+                symbol: "ALPHAUSD".to_string(),
+                currency: "USD".to_string(),
+            },
+            EnabledToken {
+                token: quote,
+                name: "USDC".to_string(),
+                symbol: "USDC".to_string(),
+                currency: "USD".to_string(),
+            },
+        ],
     );
     ctx.inject_deposit(quote, signer_address, signer_address, 1_000_000)
+        .await?;
+    ctx.inject_deposit(PATH_USD_ADDRESS, signer_address, signer_address, 1_000_000)
         .await?;
     let provider = ProviderBuilder::new()
         .wallet(signer)
         .connect_http(ctx.zone.http_url().clone());
     let darkpool = DarkpoolRegistry::new(DARKPOOL_ADDRESS, &provider);
     let pending = darkpool
-        .createPair(base)
+        .createPair(base, quote)
         .gas_price(TEMPO_T0_BASE_FEE as u128)
         .gas(1_000_000)
         .send()

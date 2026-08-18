@@ -24,8 +24,8 @@ pub mod abi {
             function pairCount() external view returns (uint256);
             function pairAt(uint256 index) external view returns (address base, address quote);
             function pairExists(address base, address quote) external view returns (bool);
-            function bestBid(address base) external view returns (uint128 price, uint128 quantity);
-            function bestAsk(address base) external view returns (uint128 price, uint128 quantity);
+            function bestBid(address base, address quote) external view returns (uint128 price, uint128 quantity);
+            function bestAsk(address base, address quote) external view returns (uint128 price, uint128 quantity);
             #[allow(non_snake_case)]
             function MIN_ORDER_AMOUNT() external pure returns (uint128);
         }

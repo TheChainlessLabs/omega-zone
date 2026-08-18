@@ -98,7 +98,7 @@ alloy_sol_types::sol! {
         uint128 quantity;
     }
 
-    function place(address base, uint128 amount, uint128 price, bool isBid)
+    function place(address base, address quote, uint128 amount, uint128 price, bool isBid)
         external returns (uint128 orderId);
     function cancel(uint128 orderId) external;
     function getOrder(uint128 orderId) external view returns (OrderView memory);
@@ -107,16 +107,16 @@ alloy_sol_types::sol! {
     function balanceOf(address user, address token) external view returns (uint128);
     function availableBalanceOf(address user, address token) external view returns (uint128);
     function pairKey(address base, address quote) external pure returns (bytes32);
-    function createPair(address base) external returns (bytes32);
+    function createPair(address base, address quote) external returns (bytes32);
     function pairCount() external view returns (uint256);
     function pairAt(uint256 index) external view returns (address base, address quote);
     function pairExists(address base, address quote) external view returns (bool);
-    function bestBid(address base) external view returns (uint128 price, uint128 quantity);
-    function bestAsk(address base) external view returns (uint128 price, uint128 quantity);
+    function bestBid(address base, address quote) external view returns (uint128 price, uint128 quantity);
+    function bestAsk(address base, address quote) external view returns (uint128 price, uint128 quantity);
     function MIN_ORDER_AMOUNT() external pure returns (uint128);
-    function marketBuy(address base, uint128 amount, uint128 maxQuoteIn)
+    function marketBuy(address base, address quote, uint128 amount, uint128 maxQuoteIn)
         external returns (uint128 quoteSpent);
-    function marketSell(address base, uint128 amount, uint128 minQuoteOut)
+    function marketSell(address base, address quote, uint128 amount, uint128 minQuoteOut)
         external returns (uint128 quoteReceived);
 
     error OrderDoesNotExist();
@@ -319,9 +319,19 @@ impl DarkpoolOrderbook {
 
     // ── pair management ───────────────────────────────────────────────────
 
-    fn validate_or_create_pair(&mut self, base: Address) -> tempo_precompiles::Result<B256> {
-        let tip20 = TIP20Token::from_address(base)?;
-        let quote = tip20.quote_token()?;
+    fn validate_pair_tokens(&self, base: Address, quote: Address) -> tempo_precompiles::Result<()> {
+        // Reading initialized token storage rejects arbitrary TIP-20-shaped addresses.
+        TIP20Token::from_address(base)?.quote_token()?;
+        TIP20Token::from_address(quote)?.quote_token()?;
+        Ok(())
+    }
+
+    fn validate_or_create_pair(
+        &mut self,
+        base: Address,
+        quote: Address,
+    ) -> tempo_precompiles::Result<B256> {
+        self.validate_pair_tokens(base, quote)?;
         let book_key = compute_book_key(base, quote);
         let book = self.books[book_key].read()?;
         if book.base == Address::ZERO {
@@ -336,9 +346,11 @@ impl DarkpoolOrderbook {
         Ok(book_key)
     }
 
-    pub fn create_pair(&mut self, base: Address) -> PrecompileResult {
-        let tip20 = try_storage!(TIP20Token::from_address(base));
-        let quote = try_storage!(tip20.quote_token());
+    pub fn create_pair(&mut self, base: Address, quote: Address) -> PrecompileResult {
+        if base == quote {
+            revert!(InvalidToken {});
+        }
+        try_storage!(self.validate_pair_tokens(base, quote));
         let book_key = compute_book_key(base, quote);
         let book = try_storage!(self.books[book_key].read());
         if book.base != Address::ZERO {
@@ -414,10 +426,14 @@ impl DarkpoolOrderbook {
         &mut self,
         sender: Address,
         base: Address,
+        quote: Address,
         amount: u128,
         price: u128,
         is_bid: bool,
     ) -> PrecompileResult {
+        if base == quote {
+            revert!(InvalidToken {});
+        }
         if amount < MIN_ORDER_AMOUNT {
             revert!(AmountBelowMinimum {});
         }
@@ -425,9 +441,7 @@ impl DarkpoolOrderbook {
             revert!(PriceOutOfRange {});
         }
 
-        let tip20 = try_storage!(TIP20Token::from_address(base));
-        let quote = try_storage!(tip20.quote_token());
-        let book_key = try_storage!(self.validate_or_create_pair(base));
+        let book_key = try_storage!(self.validate_or_create_pair(base, quote));
 
         if is_bid {
             let escrow = match amount.checked_mul(price) {
@@ -767,16 +781,18 @@ impl DarkpoolOrderbook {
         &mut self,
         sender: Address,
         base: Address,
+        quote: Address,
         amount: u128,
         max_quote_in: u128,
     ) -> PrecompileResult {
+        if base == quote {
+            revert!(InvalidToken {});
+        }
         if amount < MIN_ORDER_AMOUNT {
             revert!(AmountBelowMinimum {});
         }
 
-        let tip20 = try_storage!(TIP20Token::from_address(base));
-        let quote = try_storage!(tip20.quote_token());
-        let _book_key = try_storage!(self.validate_or_create_pair(base));
+        let _book_key = try_storage!(self.validate_or_create_pair(base, quote));
 
         try_storage!(self.ensure_internal_balance(sender, quote, max_quote_in));
 
@@ -799,16 +815,18 @@ impl DarkpoolOrderbook {
         &mut self,
         sender: Address,
         base: Address,
+        quote: Address,
         amount: u128,
         min_quote_out: u128,
     ) -> PrecompileResult {
+        if base == quote {
+            revert!(InvalidToken {});
+        }
         if amount < MIN_ORDER_AMOUNT {
             revert!(AmountBelowMinimum {});
         }
 
-        let tip20 = try_storage!(TIP20Token::from_address(base));
-        let quote = try_storage!(tip20.quote_token());
-        let _book_key = try_storage!(self.validate_or_create_pair(base));
+        let _book_key = try_storage!(self.validate_or_create_pair(base, quote));
 
         try_storage!(self.ensure_internal_balance(sender, base, amount));
 
@@ -966,9 +984,7 @@ impl DarkpoolOrderbook {
         Ok(StorageCtx.success_output(view.abi_encode().into()))
     }
 
-    pub fn best_bid(&self, base: Address) -> PrecompileResult {
-        let tip20 = try_storage!(TIP20Token::from_address(base));
-        let quote = try_storage!(tip20.quote_token());
+    pub fn best_bid(&self, base: Address, quote: Address) -> PrecompileResult {
         let book_key = compute_book_key(base, quote);
         let book = try_storage!(self.books[book_key].read());
         if book.best_bid_id == 0 {
@@ -982,9 +998,7 @@ impl DarkpoolOrderbook {
         ))
     }
 
-    pub fn best_ask(&self, base: Address) -> PrecompileResult {
-        let tip20 = try_storage!(TIP20Token::from_address(base));
-        let quote = try_storage!(tip20.quote_token());
+    pub fn best_ask(&self, base: Address, quote: Address) -> PrecompileResult {
         let book_key = compute_book_key(base, quote);
         let book = try_storage!(self.books[book_key].read());
         if book.best_ask_id == 0 {
@@ -1053,7 +1067,14 @@ impl TempoPrecompile for DarkpoolOrderbook {
                 let Ok(call) = placeCall::abi_decode(calldata) else {
                     return Ok(StorageCtx.revert_output(Bytes::new()));
                 };
-                self.place(msg_sender, call.base, call.amount, call.price, call.isBid)
+                self.place(
+                    msg_sender,
+                    call.base,
+                    call.quote,
+                    call.amount,
+                    call.price,
+                    call.isBid,
+                )
             }
             s if s == cancelCall::SELECTOR => {
                 let Ok(call) = cancelCall::abi_decode(calldata) else {
@@ -1110,7 +1131,7 @@ impl TempoPrecompile for DarkpoolOrderbook {
                 let Ok(call) = createPairCall::abi_decode(calldata) else {
                     return Ok(StorageCtx.revert_output(Bytes::new()));
                 };
-                self.create_pair(call.base)
+                self.create_pair(call.base, call.quote)
             }
             s if s == pairCountCall::SELECTOR => self.pair_count(),
             s if s == pairAtCall::SELECTOR => {
@@ -1129,13 +1150,13 @@ impl TempoPrecompile for DarkpoolOrderbook {
                 let Ok(call) = bestBidCall::abi_decode(calldata) else {
                     return Ok(StorageCtx.revert_output(Bytes::new()));
                 };
-                self.best_bid(call.base)
+                self.best_bid(call.base, call.quote)
             }
             s if s == bestAskCall::SELECTOR => {
                 let Ok(call) = bestAskCall::abi_decode(calldata) else {
                     return Ok(StorageCtx.revert_output(Bytes::new()));
                 };
-                self.best_ask(call.base)
+                self.best_ask(call.base, call.quote)
             }
             s if s == MIN_ORDER_AMOUNTCall::SELECTOR => {
                 Ok(StorageCtx.success_output(U256::from(MIN_ORDER_AMOUNT).abi_encode().into()))
@@ -1144,13 +1165,25 @@ impl TempoPrecompile for DarkpoolOrderbook {
                 let Ok(call) = marketBuyCall::abi_decode(calldata) else {
                     return Ok(StorageCtx.revert_output(Bytes::new()));
                 };
-                self.market_buy(msg_sender, call.base, call.amount, call.maxQuoteIn)
+                self.market_buy(
+                    msg_sender,
+                    call.base,
+                    call.quote,
+                    call.amount,
+                    call.maxQuoteIn,
+                )
             }
             s if s == marketSellCall::SELECTOR => {
                 let Ok(call) = marketSellCall::abi_decode(calldata) else {
                     return Ok(StorageCtx.revert_output(Bytes::new()));
                 };
-                self.market_sell(msg_sender, call.base, call.amount, call.minQuoteOut)
+                self.market_sell(
+                    msg_sender,
+                    call.base,
+                    call.quote,
+                    call.amount,
+                    call.minQuoteOut,
+                )
             }
             _ => Ok(StorageCtx.revert_output(Bytes::new())),
         }

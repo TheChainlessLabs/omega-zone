@@ -389,10 +389,10 @@ impl<Api: EthApiTypes + 'static> ZoneRpc<Api> {
                     let Ok(pair) = darkpool.pairAt(U256::from(index)).call().await else {
                         continue;
                     };
-                    let Ok(best_bid) = darkpool.bestBid(pair.base).call().await else {
+                    let Ok(best_bid) = darkpool.bestBid(pair.base, pair.quote).call().await else {
                         continue;
                     };
-                    let Ok(best_ask) = darkpool.bestAsk(pair.base).call().await else {
+                    let Ok(best_ask) = darkpool.bestAsk(pair.base, pair.quote).call().await else {
                         continue;
                     };
 
@@ -1897,8 +1897,16 @@ where
             let pair = self.market_label(base, quote).await?;
 
             let darkpool = DarkpoolReader::new(DARKPOOL_ADDRESS, &self.zone_provider);
-            let best_bid = darkpool.bestBid(base).call().await.map_err(internal)?;
-            let best_ask = darkpool.bestAsk(base).call().await.map_err(internal)?;
+            let best_bid = darkpool
+                .bestBid(base, quote)
+                .call()
+                .await
+                .map_err(internal)?;
+            let best_ask = darkpool
+                .bestAsk(base, quote)
+                .call()
+                .await
+                .map_err(internal)?;
             let as_of_block = self
                 .zone_provider
                 .get_block_number()
