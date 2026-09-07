@@ -1,7 +1,7 @@
 //! Owner-scoped darkpool history types and helpers.
 //!
 //! The darkpool orderbook precompile emits `OrderSubmitted`, `OrderPlaced`,
-//! `OrderFilled`, `OrderMatched`, and `OrderCancelled` events. These events
+//! `OrderFilled`, and `OrderCancelled` events. These events
 //! always carry the maker (and for fills, the taker) address as an indexed
 //! topic. This module wraps that wire format in stable, owner-scoped response
 //! types so the frontend can reconstruct an authenticated user's order, fill,
@@ -39,8 +39,10 @@ sol! {
         address base,
         address quote,
         uint128 amount,
-        uint128 price,
-        bool isBid
+        uint128 priceLimit,
+        bool isBid,
+        uint8 orderKind,
+        uint8 timeInForce
     );
 
     /// `OrderPlaced` — fires when a residual quantity rests on the book.
@@ -58,20 +60,10 @@ sol! {
     /// `OrderFilled` — fires for each resting-order leg consumed by a taker.
     /// Indexed: orderId (topic1), maker (topic2), taker (topic3).
     event OrderFilled(
-        uint128 indexed orderId,
+        uint128 indexed makerOrderId,
         address indexed maker,
         address indexed taker,
-        uint128 amountFilled,
-        uint128 price
-    );
-
-    /// `OrderMatched` — fires alongside `OrderFilled` for limit matches.
-    /// Indexed: makerOrderId (topic1), takerOrderId (topic2), maker (topic3).
-    event OrderMatched(
-        uint128 indexed makerOrderId,
-        uint128 indexed takerOrderId,
-        address indexed maker,
-        address taker,
+        uint128 takerOrderId,
         uint128 amountFilled,
         uint128 price
     );
@@ -80,18 +72,27 @@ sol! {
     /// Indexed: orderId (topic1), maker (topic2).
     event OrderCancelled(
         uint128 indexed orderId,
-        address indexed maker
+        address indexed maker,
+        uint128 cancelledAmount,
+        uint8 reason
     );
 }
 
 /// All darkpool event topic hashes, derived from the sol! definitions above.
-pub const DARKPOOL_TOPICS: [B256; 5] = [
+pub const DARKPOOL_TOPICS: [B256; 4] = [
     OrderSubmitted::SIGNATURE_HASH,
     OrderPlaced::SIGNATURE_HASH,
     OrderFilled::SIGNATURE_HASH,
-    OrderMatched::SIGNATURE_HASH,
     OrderCancelled::SIGNATURE_HASH,
 ];
+
+pub const TIME_IN_FORCE_GTC: u8 = 0;
+pub const TIME_IN_FORCE_IOC: u8 = 1;
+pub const TIME_IN_FORCE_FOK: u8 = 2;
+pub const ORDER_KIND_LIMIT: u8 = 0;
+pub const ORDER_KIND_MARKET: u8 = 1;
+pub const CANCEL_REASON_USER: u8 = 0;
+pub const CANCEL_REASON_IOC_REMAINDER: u8 = 1;
 
 /// Maximum number of items returned per page from a `zone_getMy*` call. The
 /// upstream `eth_getLogs` scan is bounded separately by `from_block`/`to_block`.
@@ -108,6 +109,69 @@ pub enum Side {
     Bid,
     /// Selling base in exchange for quote.
     Ask,
+}
+
+/// Price behavior of an accepted darkpool order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OrderKind {
+    /// Price-constrained order that may rest on the book.
+    Limit,
+    /// Immediate order constrained by a worst acceptable price.
+    Market,
+}
+
+impl OrderKind {
+    fn from_abi(value: u8) -> Option<Self> {
+        match value {
+            ORDER_KIND_LIMIT => Some(Self::Limit),
+            ORDER_KIND_MARKET => Some(Self::Market),
+            _ => None,
+        }
+    }
+}
+
+/// Lifetime instruction attached to an order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TimeInForce {
+    /// Rest until filled or explicitly cancelled.
+    Gtc,
+    /// Fill immediately available liquidity and cancel the remainder.
+    Ioc,
+    /// Fill completely and immediately or revert atomically.
+    Fok,
+}
+
+impl TimeInForce {
+    fn from_abi(value: u8) -> Option<Self> {
+        match value {
+            TIME_IN_FORCE_GTC => Some(Self::Gtc),
+            TIME_IN_FORCE_IOC => Some(Self::Ioc),
+            TIME_IN_FORCE_FOK => Some(Self::Fok),
+            _ => None,
+        }
+    }
+}
+
+/// Why an accepted order ended with unfilled quantity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CancelReason {
+    /// Explicit cancellation of a resting order.
+    User,
+    /// Automatic cancellation of an IOC remainder.
+    IocRemainder,
+}
+
+impl CancelReason {
+    fn from_abi(value: u8) -> Option<Self> {
+        match value {
+            CANCEL_REASON_USER => Some(Self::User),
+            CANCEL_REASON_IOC_REMAINDER => Some(Self::IocRemainder),
+            _ => None,
+        }
+    }
 }
 
 /// Status of an order at the time the response is returned.
@@ -155,6 +219,10 @@ pub struct OrderEntry {
     pub order_id: U128,
     /// Caller's side of the book.
     pub side: Side,
+    /// Limit or market price behavior.
+    pub order_kind: OrderKind,
+    /// Order lifetime instruction.
+    pub time_in_force: TimeInForce,
     /// Current status reconstructed from the event stream.
     pub status: OrderStatus,
     /// Base TIP-20 token.
@@ -167,9 +235,12 @@ pub struct OrderEntry {
     pub remaining: U128,
     /// Total filled amount. `amount - remaining` for open / partially-filled.
     pub filled: U128,
-    /// Limit price (raw integer units, quote-per-base; the frontend handles
-    /// the decimals).
-    pub price: U128,
+    /// Limit price or market protection price as a six-decimal integer.
+    pub price_limit: U128,
+    /// Quantity cancelled rather than filled.
+    pub cancelled: U128,
+    /// Cancellation reason for terminal cancelled orders.
+    pub cancel_reason: Option<CancelReason>,
     /// Block in which `OrderSubmitted` was observed.
     pub created_at_block: U256,
     /// Block of the most recent state-changing event.
@@ -182,33 +253,34 @@ pub struct OrderEntry {
 
 /// A single darkpool fill belonging to the authenticated caller.
 ///
-/// `order_id` is the caller-owned order id when one exists in the event
-/// stream:
+/// `order_id` is always the caller-owned order id:
 /// - **Maker-side fill**: the caller's resting order id, carried directly in
-///   `OrderFilled.orderId`.
-/// - **Taker-side limit fill**: the caller's incoming order id, resolved by
-///   correlating the fill tx with the caller's same-tx `OrderSubmitted`.
-/// - **Taker-side market fill**: `None`, because market orders do not emit
-///   `OrderSubmitted` and `OrderFilled.orderId` is the counterparty's resting
-///   order id.
+///   `OrderFilled.makerOrderId`.
+/// - **Taker-side fill**: the caller's incoming order id, carried in
+///   `OrderFilled.takerOrderId` for both limit and market orders.
 ///
 /// This response intentionally never exposes a counterparty order id; the
 /// API is owner-scoped.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FillEntry {
-    /// Caller-owned darkpool order id for this fill, if the precompile emitted
-    /// one. `None` for market-order taker fills.
-    pub order_id: Option<U128>,
+    /// Caller-owned darkpool order id for this fill.
+    pub order_id: U128,
     /// Caller's role in this fill.
     pub role: FillRole,
+    /// Caller's side of the execution.
+    pub side: Side,
+    /// Limit or market price behavior.
+    pub order_kind: OrderKind,
+    /// Order lifetime instruction.
+    pub time_in_force: TimeInForce,
     /// Base token of the pair.
     pub base_token: Address,
     /// Quote token of the pair.
     pub quote_token: Address,
     /// Filled amount in base-token units.
     pub amount_filled: U128,
-    /// Fill price (raw integer units, quote-per-base).
+    /// Fill price as a six-decimal fixed-point quote-per-base integer.
     pub price: U128,
     /// Block of the fill.
     pub block_number: U256,
@@ -276,6 +348,16 @@ pub struct TransferQuery {
     pub limit: Option<u32>,
 }
 
+/// Query params for the unified owner-scoped activity feed.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ActivityQuery {
+    /// Opaque cursor returned by a previous page.
+    pub cursor: Option<String>,
+    /// Caller-supplied page size, clamped to `MAX_PAGE_LIMIT`.
+    pub limit: Option<u32>,
+}
+
 /// Verify the optional caller-supplied `account` matches the authenticated caller.
 ///
 /// Returns an `Account mismatch` error on conflict. Returning the JSON-RPC
@@ -333,13 +415,18 @@ impl Cursor {
             log_index,
         })
     }
+
+    /// Whether an event is strictly older than this newest-first page cursor.
+    pub fn includes_older(&self, block_number: U256, log_index: U256) -> bool {
+        block_number < U256::from(self.block_number)
+            || (block_number == U256::from(self.block_number)
+                && log_index < U256::from(self.log_index))
+    }
 }
 
 /// Returns `true` if the caller is the `maker` recorded in this darkpool event.
 ///
-/// Maker sits at topic2 for `OrderSubmitted`/`OrderPlaced`/`OrderCancelled` and
-/// for the resting-side address on `OrderFilled`; for `OrderMatched` it shifts
-/// to topic3 because the first two indexed topics are the two order ids.
+/// Maker sits at topic2 for every darkpool event.
 pub fn caller_is_maker(log: &Log, caller: &Address) -> bool {
     let topics = log.topics();
     let Some(topic0) = topics.first() else {
@@ -349,17 +436,12 @@ pub fn caller_is_maker(log: &Log, caller: &Address) -> bool {
         return false;
     }
     let caller_word = B256::left_padding_from(caller.as_slice());
-    if *topic0 == OrderMatched::SIGNATURE_HASH {
-        topics.get(3) == Some(&caller_word)
-    } else {
-        topics.get(2) == Some(&caller_word)
-    }
+    topics.get(2) == Some(&caller_word)
 }
 
 /// Returns `true` if the caller is the `taker` recorded in this darkpool fill event.
 ///
-/// `OrderFilled` indexes `taker` at topic3; `OrderMatched` carries `taker`
-/// in the non-indexed body, so this check applies only to `OrderFilled`.
+/// `OrderFilled` indexes `taker` at topic3.
 pub fn caller_is_taker(log: &Log, caller: &Address) -> bool {
     let topics = log.topics();
     let Some(topic0) = topics.first() else {
@@ -377,9 +459,113 @@ pub fn caller_is_party(log: &Log, caller: &Address) -> bool {
     caller_is_maker(log, caller) || caller_is_taker(log, caller)
 }
 
+/// Whether an `OrderFilled` log references `order_id` on either side.
+pub fn fill_references_order(log: &Log, order_id: u128) -> bool {
+    if log.topic0().copied() != Some(OrderFilled::SIGNATURE_HASH) {
+        return false;
+    }
+    OrderFilled::decode_log(&log.inner)
+        .is_ok_and(|fill| fill.makerOrderId == order_id || fill.takerOrderId == order_id)
+}
+
 /// Encode a 20-byte address as a left-padded 32-byte topic word.
 pub fn topic_for_address(addr: &Address) -> B256 {
     B256::left_padding_from(addr.as_slice())
+}
+
+/// Restrict an authenticated log filter to owner-visible darkpool events.
+///
+/// Lifecycle events and maker fills use topic2. A taker-only fill filter may
+/// instead use topic3. Mixed foreign owner topics are rejected rather than
+/// intersected so callers cannot probe whether another owner has activity.
+pub fn scope_darkpool_event_filter(
+    filter: &mut Filter,
+    caller: &Address,
+) -> Result<bool, JsonRpcError> {
+    let requested_topics = filter.topics[0].iter().copied().collect::<Vec<_>>();
+    let requested_addresses = filter.address.iter().copied().collect::<Vec<_>>();
+    let requests_darkpool = requested_addresses.contains(&DARKPOOL_ADDRESS)
+        || requested_topics
+            .iter()
+            .any(|topic| DARKPOOL_TOPICS.contains(topic));
+    if !requests_darkpool {
+        return Ok(false);
+    }
+    if requested_topics.is_empty()
+        || requested_topics
+            .iter()
+            .any(|topic| !DARKPOOL_TOPICS.contains(topic))
+    {
+        return Err(JsonRpcError::invalid_params(
+            "darkpool log filters must specify only darkpool event topics",
+        ));
+    }
+    if requested_addresses
+        .iter()
+        .any(|address| *address != DARKPOOL_ADDRESS)
+    {
+        return Err(JsonRpcError::invalid_params(
+            "darkpool log filters must target only the darkpool",
+        ));
+    }
+
+    let caller_topic = topic_for_address(caller);
+    let maker_requested = filter.topics[2].contains(&caller_topic);
+    let taker_requested = filter.topics[3].contains(&caller_topic);
+    if !maker_requested && !taker_requested {
+        return Err(JsonRpcError::invalid_params(
+            "darkpool log filters must include the authenticated account in topic2 or topic3",
+        ));
+    }
+    if taker_requested
+        && requested_topics
+            .iter()
+            .any(|topic| *topic != OrderFilled::SIGNATURE_HASH)
+    {
+        return Err(JsonRpcError::invalid_params(
+            "topic3 is only available for OrderFilled",
+        ));
+    }
+    for (position, requested) in [(2usize, maker_requested), (3usize, taker_requested)] {
+        if filter.topics[position]
+            .iter()
+            .any(|topic| *topic != caller_topic)
+        {
+            return Err(JsonRpcError::invalid_params(
+                "darkpool log filters cannot include foreign owners",
+            ));
+        }
+        if requested {
+            filter.topics[position] = FilterSet::from(caller_topic);
+        }
+    }
+    filter.address = FilterSet::from(DARKPOOL_ADDRESS);
+    filter.topics[0] = FilterSet::from(requested_topics);
+    Ok(true)
+}
+
+/// Restrict a live darkpool fill subscription to the authenticated maker
+/// and/or taker.
+///
+/// Ordinary private log subscriptions remain TIP-20-only. A caller must
+/// explicitly request only `OrderFilled` and include its own address at
+/// topic2/topic3 before the darkpool precompile address is exposed to the
+/// backend.
+pub fn scope_maker_fill_subscription(
+    filter: &mut Filter,
+    caller: &Address,
+) -> Result<bool, JsonRpcError> {
+    let requested_topics = filter.topics[0].iter().copied().collect::<Vec<_>>();
+    if !requested_topics.contains(&OrderFilled::SIGNATURE_HASH) {
+        return Ok(false);
+    }
+    if requested_topics.len() != 1 {
+        return Err(JsonRpcError::invalid_params(
+            "darkpool fill subscriptions cannot include other event topics",
+        ));
+    }
+
+    scope_darkpool_event_filter(filter, caller)
 }
 
 /// Encode a `uint128` order id as a left-padded 32-byte topic word.
@@ -425,6 +611,22 @@ pub fn build_darkpool_filter(
     filter
 }
 
+/// Build a newest-first history scan bounded above by the page cursor.
+///
+/// Same-block cursor exclusivity is applied to decoded events because an
+/// `eth_getLogs` filter cannot select an individual log index.
+pub fn build_darkpool_history_filter(
+    topic0: &[B256],
+    maker_topic: Option<B256>,
+    cursor: Option<Cursor>,
+) -> Filter {
+    let filter = build_darkpool_filter(topic0, maker_topic, None);
+    match cursor {
+        Some(cursor) => filter.to_block(cursor.block_number),
+        None => filter,
+    }
+}
+
 /// Build a darkpool filter for `OrderFilled` scoped to a single order id and
 /// owner. Used by `zone_getOrder`.
 pub fn build_order_filter(order_id: u128, owner: &Address) -> Filter {
@@ -464,6 +666,20 @@ pub fn build_tip20_filter(
     filter
 }
 
+/// Build an owner-scoped TIP-20 history scan that walks toward older blocks.
+pub fn build_tip20_history_filter(
+    topic0: &[B256],
+    owner_topic: Option<B256>,
+    cursor: Option<Cursor>,
+    as_from: bool,
+) -> Filter {
+    let filter = build_tip20_filter(topic0, owner_topic, None, as_from);
+    match cursor {
+        Some(cursor) => filter.to_block(cursor.block_number),
+        None => filter,
+    }
+}
+
 /// Reconstruct caller-owned orders from an iterator of darkpool logs.
 ///
 /// Walks the events in block / log-index order and folds them into per-id
@@ -485,16 +701,26 @@ pub fn reconstruct_orders<'a, I: IntoIterator<Item = &'a Log>>(logs: I) -> Vec<O
 
         if topic0 == OrderSubmitted::SIGNATURE_HASH {
             if let Ok(decoded) = OrderSubmitted::decode_log(&log.inner) {
+                let Some(order_kind) = OrderKind::from_abi(decoded.orderKind) else {
+                    continue;
+                };
+                let Some(time_in_force) = TimeInForce::from_abi(decoded.timeInForce) else {
+                    continue;
+                };
                 let entry = by_id.entry(decoded.orderId).or_insert_with(|| OrderEntry {
                     order_id: U128::from(decoded.orderId),
                     side: if decoded.isBid { Side::Bid } else { Side::Ask },
+                    order_kind,
+                    time_in_force,
                     status: OrderStatus::Open,
                     base_token: decoded.base,
                     quote_token: decoded.quote,
                     amount: U128::from(decoded.amount),
                     remaining: U128::from(decoded.amount),
                     filled: U128::ZERO,
-                    price: U128::from(decoded.price),
+                    price_limit: U128::from(decoded.priceLimit),
+                    cancelled: U128::ZERO,
+                    cancel_reason: None,
                     created_at_block: block,
                     updated_at_block: block,
                     created_tx_hash: tx_hash,
@@ -510,13 +736,17 @@ pub fn reconstruct_orders<'a, I: IntoIterator<Item = &'a Log>>(logs: I) -> Vec<O
                 let entry = by_id.entry(decoded.orderId).or_insert_with(|| OrderEntry {
                     order_id: U128::from(decoded.orderId),
                     side: if decoded.isBid { Side::Bid } else { Side::Ask },
+                    order_kind: OrderKind::Limit,
+                    time_in_force: TimeInForce::Gtc,
                     status: OrderStatus::Open,
                     base_token: decoded.base,
                     quote_token: decoded.quote,
                     amount: U128::from(decoded.amount),
                     remaining: U128::from(decoded.amount),
                     filled: U128::ZERO,
-                    price: U128::from(decoded.price),
+                    price_limit: U128::from(decoded.price),
+                    cancelled: U128::ZERO,
+                    cancel_reason: None,
                     created_at_block: block,
                     updated_at_block: block,
                     created_tx_hash: tx_hash,
@@ -538,7 +768,10 @@ pub fn reconstruct_orders<'a, I: IntoIterator<Item = &'a Log>>(logs: I) -> Vec<O
             }
         } else if topic0 == OrderFilled::SIGNATURE_HASH {
             if let Ok(decoded) = OrderFilled::decode_log(&log.inner) {
-                if let Some(entry) = by_id.get_mut(&decoded.orderId) {
+                for order_id in [decoded.makerOrderId, decoded.takerOrderId] {
+                    let Some(entry) = by_id.get_mut(&order_id) else {
+                        continue;
+                    };
                     entry.filled = entry
                         .filled
                         .saturating_add(U128::from(decoded.amountFilled));
@@ -556,61 +789,44 @@ pub fn reconstruct_orders<'a, I: IntoIterator<Item = &'a Log>>(logs: I) -> Vec<O
                 if let Some(entry) = by_id.get_mut(&decoded.orderId) {
                     entry.status = OrderStatus::Cancelled;
                     entry.remaining = U128::ZERO;
+                    entry.cancelled = U128::from(decoded.cancelledAmount);
+                    entry.cancel_reason = CancelReason::from_abi(decoded.reason);
                     entry.cancel_tx_hash = Some(tx_hash);
                     entry.updated_at_block = block;
                 }
             }
         }
-        // OrderMatched is informational only — every match also emits
-        // OrderFilled, which is the single source of truth for fill state.
     }
 
     by_id.into_values().collect()
 }
 
-/// Index of `OrderSubmitted` events, used to attach pair metadata to fills
-/// (whose own event payload lacks it) and to derive the caller's incoming
-/// order id for taker-side limit fills.
-///
-/// Lookups are keyed three ways:
-/// - `pair_by_order_id` — global resting-order id → pair. Used internally for
-///   taker market fills where the only available pair reference is the resting
-///   order id; the id is never returned.
-/// - `own_pair_by_order_id` — caller's order id → pair. Used for maker fills.
-/// - `own_by_tx_hash` — for taker limit fills, the matching `OrderFilled` is
-///   emitted in the same precompile call as the caller's `OrderSubmitted`,
-///   so the transaction hash links them. The map stores the caller's own
-///   incoming order id and pair.
+/// Owner-scoped metadata indexed by the caller's accepted order ids.
 #[derive(Debug, Default, Clone)]
 pub struct PairIndex {
-    pair_by_order_id: std::collections::BTreeMap<u128, (Address, Address)>,
-    own_pair_by_order_id: std::collections::BTreeMap<u128, (Address, Address)>,
-    own_by_tx_hash: std::collections::BTreeMap<B256, (u128, Address, Address)>,
+    own_by_order_id: std::collections::BTreeMap<u128, OrderContext>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct OrderContext {
+    base: Address,
+    quote: Address,
+    side: Side,
+    order_kind: OrderKind,
+    time_in_force: TimeInForce,
 }
 
 impl PairIndex {
-    /// Any resting order id → `(base, quote)`. Used only for metadata.
-    pub fn pair_for_order(&self, order_id: u128) -> Option<(Address, Address)> {
-        self.pair_by_order_id.get(&order_id).copied()
-    }
-
-    /// Caller's own order id → `(base, quote)`.
-    pub fn own_pair_for_order(&self, order_id: u128) -> Option<(Address, Address)> {
-        self.own_pair_by_order_id.get(&order_id).copied()
-    }
-
-    /// Caller's submission tx → `(own incoming order id, base, quote)`.
-    pub fn taker_context_for_tx(&self, tx_hash: &B256) -> Option<(u128, Address, Address)> {
-        self.own_by_tx_hash.get(tx_hash).copied()
+    fn own_order(&self, order_id: u128) -> Option<OrderContext> {
+        self.own_by_order_id.get(&order_id).copied()
     }
 }
 
 /// Build a [`PairIndex`] from an iterator of `OrderSubmitted` logs.
 ///
 /// Non-`OrderSubmitted` logs are silently ignored, so callers can pass a raw
-/// `eth_getLogs` response without pre-filtering. Logs owned by `owner` are
-/// additionally indexed as caller-owned; foreign logs are used only for pair
-/// metadata keyed by resting order id and never surface in the response.
+/// `eth_getLogs` response without pre-filtering. Foreign submissions are
+/// ignored; they are no longer needed to resolve taker fills.
 pub fn build_pair_index<'a, I: IntoIterator<Item = &'a Log>>(
     logs: I,
     owner: &Address,
@@ -624,42 +840,31 @@ pub fn build_pair_index<'a, I: IntoIterator<Item = &'a Log>>(
         let Ok(decoded) = OrderSubmitted::decode_log(&log.inner) else {
             continue;
         };
-        index
-            .pair_by_order_id
-            .insert(decoded.orderId, (decoded.base, decoded.quote));
-
         if !caller_is_maker(log, owner) {
             continue;
         }
-        index
-            .own_pair_by_order_id
-            .insert(decoded.orderId, (decoded.base, decoded.quote));
-        if let Some(tx) = log.transaction_hash {
-            index
-                .own_by_tx_hash
-                .insert(tx, (decoded.orderId, decoded.base, decoded.quote));
-        }
+        let Some(order_kind) = OrderKind::from_abi(decoded.orderKind) else {
+            continue;
+        };
+        let Some(time_in_force) = TimeInForce::from_abi(decoded.timeInForce) else {
+            continue;
+        };
+        index.own_by_order_id.insert(
+            decoded.orderId,
+            OrderContext {
+                base: decoded.base,
+                quote: decoded.quote,
+                side: if decoded.isBid { Side::Bid } else { Side::Ask },
+                order_kind,
+                time_in_force,
+            },
+        );
     }
     index
 }
 
 /// Build a [`FillEntry`] from an `OrderFilled` log using the caller's
-/// [`PairIndex`] to attach pair metadata (and, for taker-side limit fills, to
-/// resolve the caller's own incoming order id).
-///
-/// Returns `None` when:
-/// - the log is not `OrderFilled`,
-/// - the maker-side fill's order id is not in `pair_index.own_pair_by_order_id`
-///   (the caller's submission history is incomplete — should not happen
-///   for the caller's own activity),
-/// - the taker-side fill has neither a caller same-tx `OrderSubmitted` nor a
-///   resting-order pair lookup.
-///
-/// `OrderMatched` logs are intentionally **not** consumed here: every match
-/// also emits `OrderFilled`, so handling both would double-count limit
-/// fills, and the counterparty order id from `OrderMatched.makerOrderId` /
-/// `takerOrderId` would leak counterparty information into an owner-scoped
-/// response.
+/// [`PairIndex`] to attach the caller's pair, side, kind, and TIF metadata.
 pub fn fill_entry_from_log(log: &Log, role: FillRole, pair_index: &PairIndex) -> Option<FillEntry> {
     let topic0 = log.topic0().copied()?;
     if topic0 != OrderFilled::SIGNATURE_HASH {
@@ -669,33 +874,20 @@ pub fn fill_entry_from_log(log: &Log, role: FillRole, pair_index: &PairIndex) ->
     let block = log.block_number.map(U256::from).unwrap_or(U256::ZERO);
     let tx_hash = log.transaction_hash.unwrap_or_default();
 
-    let (order_id, base, quote) = match role {
-        FillRole::Maker => {
-            // OrderFilled.orderId is the caller's own resting order id; the
-            // pair comes from the caller's own OrderSubmitted index.
-            let (base, quote) = pair_index.own_pair_for_order(decoded.orderId)?;
-            (Some(decoded.orderId), base, quote)
-        }
-        FillRole::Taker => {
-            // OrderFilled.orderId is the *counterparty's* resting order id
-            // and must not be surfaced. Limit takers have a same-tx
-            // OrderSubmitted for their incoming order; market takers do not,
-            // so we return order_id=None but still derive pair metadata from
-            // the resting order id.
-            if let Some((own_id, base, quote)) = pair_index.taker_context_for_tx(&tx_hash) {
-                (Some(own_id), base, quote)
-            } else {
-                let (base, quote) = pair_index.pair_for_order(decoded.orderId)?;
-                (None, base, quote)
-            }
-        }
+    let order_id = match role {
+        FillRole::Maker => decoded.makerOrderId,
+        FillRole::Taker => decoded.takerOrderId,
     };
+    let context = pair_index.own_order(order_id)?;
 
     Some(FillEntry {
-        order_id: order_id.map(U128::from),
+        order_id: U128::from(order_id),
         role,
-        base_token: base,
-        quote_token: quote,
+        side: context.side,
+        order_kind: context.order_kind,
+        time_in_force: context.time_in_force,
+        base_token: context.base,
+        quote_token: context.quote,
         amount_filled: U128::from(decoded.amountFilled),
         price: U128::from(decoded.price),
         block_number: block,
@@ -813,7 +1005,9 @@ pub fn next_transfer_cursor(transfers: &[TransferEntry], limit: u32) -> Option<S
 mod tests {
     use super::*;
     use alloy_primitives::{B256, Bytes, LogData, address, b256, keccak256};
-    use alloy_sol_types::SolValue;
+
+    const PRICE_TWO: u128 = 2_000_000;
+    const PRICE_FIVE: u128 = 5_000_000;
 
     fn make_log(emitter: Address, topics: Vec<B256>) -> Log {
         Log {
@@ -861,22 +1055,42 @@ mod tests {
         B256::left_padding_from(&order_id.to_be_bytes())
     }
 
-    /// Encode the non-indexed body of an `OrderSubmitted` event:
-    /// `(address base, address quote, uint128 amount, uint128 price, bool isBid)`.
+    fn abi_word(value: impl AsRef<[u8]>) -> [u8; 32] {
+        let value = value.as_ref();
+        let mut word = [0u8; 32];
+        word[32 - value.len()..].copy_from_slice(value);
+        word
+    }
+
+    /// Encode the non-indexed body of an `OrderSubmitted` event.
     fn order_submitted_body(
         base: Address,
         quote: Address,
         amount: u128,
         price: u128,
         is_bid: bool,
+        order_kind: u8,
+        time_in_force: u8,
     ) -> Bytes {
-        (base, quote, amount, price, is_bid).abi_encode().into()
+        let mut data = Vec::with_capacity(7 * 32);
+        data.extend_from_slice(&abi_word(base));
+        data.extend_from_slice(&abi_word(quote));
+        data.extend_from_slice(&abi_word(amount.to_be_bytes()));
+        data.extend_from_slice(&abi_word(price.to_be_bytes()));
+        data.extend_from_slice(&abi_word([u8::from(is_bid)]));
+        data.extend_from_slice(&abi_word([order_kind]));
+        data.extend_from_slice(&abi_word([time_in_force]));
+        data.into()
     }
 
     /// Encode the non-indexed body of an `OrderFilled` event:
-    /// `(uint128 amountFilled, uint128 price)`.
-    fn order_filled_body(amount_filled: u128, price: u128) -> Bytes {
-        (amount_filled, price).abi_encode().into()
+    /// `(uint128 takerOrderId, uint128 amountFilled, uint128 price)`.
+    fn order_filled_body(taker_order_id: u128, amount_filled: u128, price: u128) -> Bytes {
+        let mut data = Vec::with_capacity(3 * 32);
+        data.extend_from_slice(&abi_word(taker_order_id.to_be_bytes()));
+        data.extend_from_slice(&abi_word(amount_filled.to_be_bytes()));
+        data.extend_from_slice(&abi_word(price.to_be_bytes()));
+        data.into()
     }
 
     fn make_order_submitted_log(
@@ -890,6 +1104,35 @@ mod tests {
         block: u64,
         tx_hash: B256,
     ) -> Log {
+        make_order_submitted_log_with_metadata(
+            maker,
+            order_id,
+            base,
+            quote,
+            amount,
+            price,
+            is_bid,
+            ORDER_KIND_LIMIT,
+            TIME_IN_FORCE_GTC,
+            block,
+            tx_hash,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn make_order_submitted_log_with_metadata(
+        maker: Address,
+        order_id: u128,
+        base: Address,
+        quote: Address,
+        amount: u128,
+        price: u128,
+        is_bid: bool,
+        order_kind: u8,
+        time_in_force: u8,
+        block: u64,
+        tx_hash: B256,
+    ) -> Log {
         make_log_full(
             DARKPOOL_ADDRESS,
             vec![
@@ -897,7 +1140,15 @@ mod tests {
                 order_id_topic(order_id),
                 topic_addr(&maker),
             ],
-            order_submitted_body(base, quote, amount, price, is_bid),
+            order_submitted_body(
+                base,
+                quote,
+                amount,
+                price,
+                is_bid,
+                order_kind,
+                time_in_force,
+            ),
             Some(block),
             Some(tx_hash),
         )
@@ -907,6 +1158,7 @@ mod tests {
         resting_order_id: u128,
         resting_maker: Address,
         taker: Address,
+        taker_order_id: u128,
         amount_filled: u128,
         price: u128,
         block: u64,
@@ -920,7 +1172,7 @@ mod tests {
                 topic_addr(&resting_maker),
                 topic_addr(&taker),
             ],
-            order_filled_body(amount_filled, price),
+            order_filled_body(taker_order_id, amount_filled, price),
             Some(block),
             Some(tx_hash),
         )
@@ -934,7 +1186,12 @@ mod tests {
                 order_id_topic(order_id),
                 topic_addr(&maker),
             ],
-            Bytes::new(),
+            {
+                let mut data = Vec::with_capacity(2 * 32);
+                data.extend_from_slice(&abi_word(300_000u128.to_be_bytes()));
+                data.extend_from_slice(&abi_word([CANCEL_REASON_USER]));
+                data.into()
+            },
             Some(block),
             Some(tx_hash),
         )
@@ -952,7 +1209,9 @@ mod tests {
     fn topic_hashes_match_signatures() {
         assert_eq!(
             OrderSubmitted::SIGNATURE_HASH,
-            keccak256(b"OrderSubmitted(uint128,address,address,address,uint128,uint128,bool)")
+            keccak256(
+                b"OrderSubmitted(uint128,address,address,address,uint128,uint128,bool,uint8,uint8)"
+            )
         );
         assert_eq!(
             OrderPlaced::SIGNATURE_HASH,
@@ -960,15 +1219,11 @@ mod tests {
         );
         assert_eq!(
             OrderFilled::SIGNATURE_HASH,
-            keccak256(b"OrderFilled(uint128,address,address,uint128,uint128)")
-        );
-        assert_eq!(
-            OrderMatched::SIGNATURE_HASH,
-            keccak256(b"OrderMatched(uint128,uint128,address,address,uint128,uint128)")
+            keccak256(b"OrderFilled(uint128,address,address,uint128,uint128,uint128)")
         );
         assert_eq!(
             OrderCancelled::SIGNATURE_HASH,
-            keccak256(b"OrderCancelled(uint128,address)")
+            keccak256(b"OrderCancelled(uint128,address,uint128,uint8)")
         );
     }
 
@@ -1070,6 +1325,102 @@ mod tests {
     }
 
     #[test]
+    fn history_cursor_scans_from_genesis_through_its_block() {
+        use alloy_rpc_types_eth::BlockNumberOrTag;
+
+        let cursor = Some(Cursor {
+            block_number: 12345,
+            log_index: 7,
+        });
+        let darkpool = build_darkpool_history_filter(&[OrderFilled::SIGNATURE_HASH], None, cursor);
+        assert_eq!(
+            darkpool.block_option.get_from_block(),
+            Some(&BlockNumberOrTag::Earliest)
+        );
+        assert_eq!(
+            darkpool.block_option.get_to_block(),
+            Some(&BlockNumberOrTag::Number(12345))
+        );
+
+        let tip20 = build_tip20_history_filter(&[filter::TRANSFER_TOPIC], None, cursor, false);
+        assert_eq!(
+            tip20.block_option.get_from_block(),
+            Some(&BlockNumberOrTag::Earliest)
+        );
+        assert_eq!(
+            tip20.block_option.get_to_block(),
+            Some(&BlockNumberOrTag::Number(12345))
+        );
+    }
+
+    #[test]
+    fn cursor_excludes_previously_seen_and_newer_same_block_events() {
+        let cursor = Cursor {
+            block_number: 12,
+            log_index: 7,
+        };
+
+        assert!(cursor.includes_older(U256::from(11), U256::from(99)));
+        assert!(cursor.includes_older(U256::from(12), U256::from(6)));
+        assert!(!cursor.includes_older(U256::from(12), U256::from(7)));
+        assert!(!cursor.includes_older(U256::from(12), U256::from(8)));
+        assert!(!cursor.includes_older(U256::from(13), U256::ZERO));
+    }
+
+    #[test]
+    fn maker_fill_subscription_scopes_the_authenticated_owner_and_darkpool() {
+        let caller = Address::repeat_byte(0xaa);
+        let mut filter = Filter::default();
+        filter.topics[0] = FilterSet::from(OrderFilled::SIGNATURE_HASH);
+        filter.topics[2] = FilterSet::from(topic_for_address(&caller));
+
+        assert!(scope_maker_fill_subscription(&mut filter, &caller).unwrap());
+        assert_eq!(filter.address.len(), 1);
+        assert!(filter.address.contains(&DARKPOOL_ADDRESS));
+        assert_eq!(filter.topics[2].len(), 1);
+        assert!(filter.topics[2].contains(&topic_for_address(&caller)));
+    }
+
+    #[test]
+    fn maker_fill_subscription_rejects_foreign_owners_addresses_and_mixed_topics() {
+        let caller = Address::repeat_byte(0xaa);
+        let other = Address::repeat_byte(0xbb);
+
+        let mut foreign_owner = Filter::default();
+        foreign_owner.topics[0] = FilterSet::from(OrderFilled::SIGNATURE_HASH);
+        foreign_owner.topics[2] = FilterSet::from(topic_for_address(&other));
+        assert!(scope_maker_fill_subscription(&mut foreign_owner, &caller).is_err());
+
+        let mut foreign_address = Filter {
+            address: FilterSet::from(other),
+            ..Default::default()
+        };
+        foreign_address.topics[0] = FilterSet::from(OrderFilled::SIGNATURE_HASH);
+        foreign_address.topics[2] = FilterSet::from(topic_for_address(&caller));
+        assert!(scope_maker_fill_subscription(&mut foreign_address, &caller).is_err());
+
+        let mut mixed_events = Filter::default();
+        mixed_events.topics[0] = FilterSet::from(vec![
+            OrderFilled::SIGNATURE_HASH,
+            OrderSubmitted::SIGNATURE_HASH,
+        ]);
+        mixed_events.topics[2] = FilterSet::from(topic_for_address(&caller));
+        assert!(scope_maker_fill_subscription(&mut mixed_events, &caller).is_err());
+    }
+
+    #[test]
+    fn maker_fill_subscription_does_not_broaden_normal_token_filters() {
+        let caller = Address::repeat_byte(0xaa);
+        let mut filter = Filter::default();
+        filter.topics[0] = FilterSet::from(filter::TRANSFER_TOPIC);
+        filter.topics[2] = FilterSet::from(topic_for_address(&caller));
+
+        assert!(!scope_maker_fill_subscription(&mut filter, &caller).unwrap());
+        assert!(filter.address.is_empty());
+        assert!(filter.topics[0].contains(&filter::TRANSFER_TOPIC));
+    }
+
+    #[test]
     fn caller_is_maker_matches_topic_2_for_submitted() {
         let caller = address!("0x000000000000000000000000000000000000beef");
         let other = address!("0x000000000000000000000000000000000000c0de");
@@ -1094,25 +1445,25 @@ mod tests {
     }
 
     #[test]
-    fn caller_is_maker_matches_topic_3_for_matched() {
+    fn caller_is_maker_matches_topic_2_for_filled() {
         let caller = address!("0x000000000000000000000000000000000000beef");
         let other = address!("0x000000000000000000000000000000000000c0de");
         let mine_as_maker = make_log(
             DARKPOOL_ADDRESS,
             vec![
-                OrderMatched::SIGNATURE_HASH,
+                OrderFilled::SIGNATURE_HASH,
                 order_id_topic(1),
-                order_id_topic(2),
                 topic_addr(&caller),
+                topic_addr(&other),
             ],
         );
         let mine_as_taker_only = make_log(
             DARKPOOL_ADDRESS,
             vec![
-                OrderMatched::SIGNATURE_HASH,
+                OrderFilled::SIGNATURE_HASH,
                 order_id_topic(1),
-                order_id_topic(2),
                 topic_addr(&other),
+                topic_addr(&caller),
             ],
         );
         assert!(caller_is_maker(&mine_as_maker, &caller));
@@ -1135,9 +1486,8 @@ mod tests {
         let unrelated = make_log(
             DARKPOOL_ADDRESS,
             vec![
-                OrderMatched::SIGNATURE_HASH,
+                OrderSubmitted::SIGNATURE_HASH,
                 order_id_topic(1),
-                order_id_topic(2),
                 topic_addr(&caller),
             ],
         );
@@ -1205,8 +1555,11 @@ mod tests {
         // Compile-time guard: serialized FillEntry must NOT include
         // counterpartyOrderId. The privacy review explicitly removed it.
         let entry = FillEntry {
-            order_id: Some(U128::from(1u128)),
+            order_id: U128::from(1u128),
             role: FillRole::Maker,
+            side: Side::Bid,
+            order_kind: OrderKind::Limit,
+            time_in_force: TimeInForce::Gtc,
             base_token: Address::ZERO,
             quote_token: Address::ZERO,
             amount_filled: U128::ZERO,
@@ -1223,7 +1576,7 @@ mod tests {
     }
 
     #[test]
-    fn build_pair_index_indexes_caller_submissions_by_order_id_and_tx() {
+    fn build_pair_index_indexes_only_caller_submissions_by_order_id() {
         let caller = address!("0x000000000000000000000000000000000000beef");
         let base = address!("0x0000000000000000000000000000000000ba51e1");
         let quote = address!("0x0000000000000000000000000000000000600073");
@@ -1234,21 +1587,19 @@ mod tests {
             base,
             quote,
             1_000_000,
-            5,
+            PRICE_FIVE,
             true,
             10,
             B256::with_last_byte(0xa1),
         );
 
         let index = build_pair_index(std::iter::once(&submitted), &caller);
-        assert_eq!(index.pair_for_order(7), Some((base, quote)));
-        assert_eq!(index.own_pair_for_order(7), Some((base, quote)));
-        assert_eq!(
-            index.taker_context_for_tx(&B256::with_last_byte(0xa1)),
-            Some((7, base, quote)),
-            "tx-hash lookup must return the caller's own incoming order id and pair"
-        );
-        assert_eq!(index.pair_for_order(99), None);
+        let context = index.own_order(7).expect("caller order context");
+        assert_eq!((context.base, context.quote), (base, quote));
+        assert_eq!(context.side, Side::Bid);
+        assert_eq!(context.order_kind, OrderKind::Limit);
+        assert_eq!(context.time_in_force, TimeInForce::Gtc);
+        assert!(index.own_order(99).is_none());
     }
 
     #[test]
@@ -1258,15 +1609,14 @@ mod tests {
             1,
             caller,
             address!("0x000000000000000000000000000000000000c0de"),
+            2,
             500,
-            5,
+            PRICE_FIVE,
             11,
             B256::with_last_byte(0xa2),
         );
         let index = build_pair_index(std::iter::once(&filled), &caller);
-        assert!(index.pair_by_order_id.is_empty());
-        assert!(index.own_pair_by_order_id.is_empty());
-        assert!(index.own_by_tx_hash.is_empty());
+        assert!(index.own_by_order_id.is_empty());
     }
 
     #[test]
@@ -1284,7 +1634,7 @@ mod tests {
             base,
             quote,
             1_000_000,
-            5,
+            PRICE_FIVE,
             true,
             10,
             B256::with_last_byte(0xa1),
@@ -1292,19 +1642,27 @@ mod tests {
         let index = build_pair_index(std::iter::once(&submitted), &caller);
 
         // Someone else takes the caller's resting bid (orderId=1, caller is maker).
-        let filled =
-            make_order_filled_log(1, caller, other, 250_000, 5, 12, B256::with_last_byte(0xa2));
+        let filled = make_order_filled_log(
+            1,
+            caller,
+            other,
+            2,
+            250_000,
+            PRICE_FIVE,
+            12,
+            B256::with_last_byte(0xa2),
+        );
 
         let entry =
             fill_entry_from_log(&filled, FillRole::Maker, &index).expect("maker fill resolves");
-        assert_eq!(entry.order_id, Some(U128::from(1u128)));
+        assert_eq!(entry.order_id, U128::from(1u128));
         assert_eq!(
             entry.base_token, base,
             "maker fill must carry the caller's order pair base"
         );
         assert_eq!(entry.quote_token, quote);
         assert_eq!(entry.amount_filled, U128::from(250_000u128));
-        assert_eq!(entry.price, U128::from(5u128));
+        assert_eq!(entry.price, U128::from(PRICE_FIVE));
         assert_eq!(entry.tx_hash, B256::with_last_byte(0xa2));
     }
 
@@ -1320,10 +1678,12 @@ mod tests {
         let fill_two_tx = B256::with_last_byte(0xa3);
         let cancel_tx = B256::with_last_byte(0xa4);
 
-        let logs = vec![
-            make_order_submitted_log(maker, 7, base, quote, 1_000_000, 2, false, 10, submit_tx),
-            make_order_filled_log(7, maker, taker_one, 300_000, 2, 11, fill_one_tx),
-            make_order_filled_log(7, maker, taker_two, 400_000, 2, 12, fill_two_tx),
+        let logs = [
+            make_order_submitted_log(
+                maker, 7, base, quote, 1_000_000, PRICE_TWO, false, 10, submit_tx,
+            ),
+            make_order_filled_log(7, maker, taker_one, 8, 300_000, PRICE_TWO, 11, fill_one_tx),
+            make_order_filled_log(7, maker, taker_two, 9, 400_000, PRICE_TWO, 12, fill_two_tx),
             make_order_cancelled_log(maker, 7, 13, cancel_tx),
         ];
 
@@ -1346,11 +1706,7 @@ mod tests {
     }
 
     #[test]
-    fn fill_entry_taker_side_resolves_callers_own_order_id_via_tx_hash() {
-        // For taker fills, OrderFilled.orderId is the counterparty's resting
-        // order — exposing it would leak counterparty info. The caller's
-        // own incoming order id comes from the OrderSubmitted emitted by
-        // the caller's same-tx limit order.
+    fn fill_entry_taker_side_resolves_callers_own_order_id_from_event() {
         let caller = address!("0x000000000000000000000000000000000000beef");
         let other = address!("0x000000000000000000000000000000000000c0de");
         let base = address!("0x0000000000000000000000000000000000ba51e1");
@@ -1358,24 +1714,25 @@ mod tests {
 
         let same_tx = B256::with_last_byte(0xb3);
 
-        // Caller's incoming taker order — orderId=42, same tx as the fill.
-        let submitted =
-            make_order_submitted_log(caller, 42, base, quote, 200_000, 5, false, 13, same_tx);
+        // Caller's incoming taker order is indexed by its accepted order id.
+        let submitted = make_order_submitted_log(
+            caller, 42, base, quote, 200_000, PRICE_FIVE, false, 13, same_tx,
+        );
         let index = build_pair_index(std::iter::once(&submitted), &caller);
 
         // Counterparty's resting bid (orderId=99) is taken by the caller.
-        let filled = make_order_filled_log(99, other, caller, 200_000, 5, 13, same_tx);
+        let filled = make_order_filled_log(99, other, caller, 42, 200_000, PRICE_FIVE, 13, same_tx);
 
         let entry =
             fill_entry_from_log(&filled, FillRole::Taker, &index).expect("taker fill resolves");
         assert_eq!(
             entry.order_id,
-            Some(U128::from(42u128)),
+            U128::from(42u128),
             "taker fill order_id must be the caller's own incoming order id, not the counterparty's"
         );
         assert_ne!(
             entry.order_id,
-            Some(U128::from(99u128)),
+            U128::from(99u128),
             "taker fill must not surface the counterparty resting order id"
         );
         assert_eq!(entry.base_token, base);
@@ -1391,15 +1748,16 @@ mod tests {
         let quote = address!("0x0000000000000000000000000000000000600073");
         let same_tx = B256::with_last_byte(0xc3);
 
-        let taker_submission =
-            make_order_submitted_log(caller, 42, base, quote, 700_000, 2, true, 20, same_tx);
+        let taker_submission = make_order_submitted_log(
+            caller, 42, base, quote, 700_000, PRICE_TWO, true, 20, same_tx,
+        );
         let maker_one_submission = make_order_submitted_log(
             maker_one,
             1,
             base,
             quote,
             300_000,
-            2,
+            PRICE_TWO,
             false,
             10,
             B256::with_last_byte(0xa1),
@@ -1410,7 +1768,7 @@ mod tests {
             base,
             quote,
             400_000,
-            2,
+            PRICE_TWO,
             false,
             11,
             B256::with_last_byte(0xa2),
@@ -1425,11 +1783,11 @@ mod tests {
         );
 
         let fill_one = with_log_index(
-            make_order_filled_log(1, maker_one, caller, 300_000, 2, 20, same_tx),
+            make_order_filled_log(1, maker_one, caller, 42, 300_000, PRICE_TWO, 20, same_tx),
             4,
         );
         let fill_two = with_log_index(
-            make_order_filled_log(2, maker_two, caller, 400_000, 2, 20, same_tx),
+            make_order_filled_log(2, maker_two, caller, 42, 400_000, PRICE_TWO, 20, same_tx),
             6,
         );
 
@@ -1438,8 +1796,8 @@ mod tests {
         let entry_two =
             fill_entry_from_log(&fill_two, FillRole::Taker, &index).expect("second fill resolves");
 
-        assert_eq!(entry_one.order_id, Some(U128::from(42u128)));
-        assert_eq!(entry_two.order_id, Some(U128::from(42u128)));
+        assert_eq!(entry_one.order_id, U128::from(42u128));
+        assert_eq!(entry_two.order_id, U128::from(42u128));
         assert_eq!(entry_one.tx_hash, same_tx);
         assert_eq!(entry_two.tx_hash, same_tx);
         assert_ne!(
@@ -1451,56 +1809,62 @@ mod tests {
     }
 
     #[test]
-    fn fill_entry_taker_market_fill_uses_resting_pair_without_order_id() {
-        // Market orders do not emit OrderSubmitted for the taker. We can still
-        // return the fill with pair metadata by using the resting order's
-        // submitted pair, but the counterparty resting id is not surfaced.
+    fn fill_entry_taker_market_fill_uses_own_order_metadata() {
         let caller = address!("0x000000000000000000000000000000000000beef");
         let other = address!("0x000000000000000000000000000000000000c0de");
         let base = address!("0x0000000000000000000000000000000000ba51e1");
         let quote = address!("0x0000000000000000000000000000000000600073");
 
-        let resting_submitted = make_order_submitted_log(
-            other,
-            99,
+        let market_submitted = make_order_submitted_log_with_metadata(
+            caller,
+            42,
             base,
             quote,
-            1_000_000,
-            5,
+            200_000,
+            PRICE_FIVE,
             true,
-            10,
-            B256::with_last_byte(0xa1),
+            ORDER_KIND_MARKET,
+            TIME_IN_FORCE_IOC,
+            13,
+            B256::with_last_byte(0xb3),
         );
-        let index = build_pair_index(std::iter::once(&resting_submitted), &caller);
+        let index = build_pair_index(std::iter::once(&market_submitted), &caller);
         let filled = make_order_filled_log(
             99,
             other,
             caller,
+            42,
             200_000,
-            5,
+            PRICE_FIVE,
             13,
             B256::with_last_byte(0xb3),
         );
 
         let entry =
             fill_entry_from_log(&filled, FillRole::Taker, &index).expect("market fill resolves");
-        assert_eq!(entry.order_id, None);
+        assert_eq!(entry.order_id, U128::from(42u128));
         assert_eq!(entry.base_token, base);
         assert_eq!(entry.quote_token, quote);
+        assert_eq!(entry.order_kind, OrderKind::Market);
+        assert_eq!(entry.time_in_force, TimeInForce::Ioc);
     }
 
     #[test]
-    fn fill_entry_taker_returns_none_when_caller_has_no_same_tx_submission() {
-        // Defensive: if upstream returns a taker-side OrderFilled but the
-        // caller's OrderSubmitted index has no matching tx (shouldn't
-        // happen for the caller's own activity), drop the fill rather
-        // than fabricate a pair.
+    fn fill_entry_taker_returns_none_when_caller_has_no_order_submission() {
         let other = address!("0x000000000000000000000000000000000000c0de");
         let caller = address!("0x000000000000000000000000000000000000beef");
 
         let index = PairIndex::default();
-        let filled =
-            make_order_filled_log(99, other, caller, 100, 5, 13, B256::with_last_byte(0xb3));
+        let filled = make_order_filled_log(
+            99,
+            other,
+            caller,
+            42,
+            100,
+            PRICE_FIVE,
+            13,
+            B256::with_last_byte(0xb3),
+        );
 
         assert!(fill_entry_from_log(&filled, FillRole::Taker, &index).is_none());
     }
@@ -1511,8 +1875,16 @@ mod tests {
         let other = address!("0x000000000000000000000000000000000000c0de");
 
         let index = PairIndex::default();
-        let filled =
-            make_order_filled_log(1, caller, other, 100, 5, 12, B256::with_last_byte(0xa2));
+        let filled = make_order_filled_log(
+            1,
+            caller,
+            other,
+            2,
+            100,
+            PRICE_FIVE,
+            12,
+            B256::with_last_byte(0xa2),
+        );
 
         assert!(fill_entry_from_log(&filled, FillRole::Maker, &index).is_none());
     }
@@ -1524,15 +1896,14 @@ mod tests {
         let bogus = make_log(
             DARKPOOL_ADDRESS,
             vec![
-                OrderMatched::SIGNATURE_HASH,
+                OrderPlaced::SIGNATURE_HASH,
                 order_id_topic(1),
-                order_id_topic(2),
                 topic_addr(&caller),
             ],
         );
         assert!(
             fill_entry_from_log(&bogus, FillRole::Maker, &index).is_none(),
-            "OrderMatched must not produce a FillEntry — it would double-count"
+            "non-fill events must not produce FillEntry rows"
         );
     }
 }

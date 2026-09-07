@@ -14,7 +14,7 @@ use tracing::warn;
 
 use crate::{
     auth::AuthContext,
-    darkpool::{HistoryQuery, TransferQuery},
+    darkpool::{ActivityQuery, HistoryQuery, TransferQuery},
     subscription::BoxWsSubscriptionFut,
     types::{
         BoxEyreFut, BoxFut, JsonRpcError, JsonRpcRequest, JsonRpcResponse, MarketPair, MethodTier,
@@ -241,6 +241,7 @@ pub trait ZoneRpcApi: Send + Sync + 'static {
                 age_secs: None,
                 max_deviation_bps: None,
                 max_staleness_secs: None,
+                price_decimals: 6,
                 price_unit: crate::types::REFERENCE_PRICE_UNIT.to_string(),
                 disclaimer: crate::types::REFERENCE_PRICE_DISCLAIMER.to_string(),
                 reason: Some("reference-price provider not configured".to_string()),
@@ -274,6 +275,12 @@ pub trait ZoneRpcApi: Send + Sync + 'static {
     /// `zone_getMyTransfers(query)` — returns the authenticated caller's
     /// TIP-20 transfer history.
     fn zone_get_my_transfers(&self, query: TransferQuery, auth: AuthContext) -> BoxFut<'_>;
+
+    /// `zone_getMyActivity(query)` — returns a unified, owner-scoped activity
+    /// page across Zone and Tempo sources.
+    fn zone_get_my_activity(&self, _query: ActivityQuery, _auth: AuthContext) -> BoxFut<'_> {
+        Box::pin(async { Err(JsonRpcError::method_disabled()) })
+    }
 
     /// `zone_getOrder(orderId)` — returns a single owner-scoped darkpool order.
     fn zone_get_order(&self, order_id: u128, auth: AuthContext) -> BoxFut<'_>;
@@ -463,6 +470,7 @@ pub async fn dispatch(
         "zone_getMyOrders" => handle_zone_get_my_orders(id, raw, auth, api).await,
         "zone_getMyFills" => handle_zone_get_my_fills(id, raw, auth, api).await,
         "zone_getMyTransfers" => handle_zone_get_my_transfers(id, raw, auth, api).await,
+        "zone_getMyActivity" => handle_zone_get_my_activity(id, raw, auth, api).await,
         "zone_getOrder" => handle_zone_get_order(id, raw, auth, api).await,
         "zone_getWithdrawalStatus" => handle_zone_get_withdrawal_status(id, raw, auth, api).await,
         _ => {
@@ -1078,6 +1086,36 @@ async fn handle_zone_get_my_transfers(
     )
 }
 
+/// Handle `zone_getMyActivity(query)`.
+async fn handle_zone_get_my_activity(
+    id: Value,
+    raw: &str,
+    auth: &AuthContext,
+    api: &dyn ZoneRpcApi,
+) -> JsonRpcResponse {
+    let parsed: Vec<Option<ActivityQuery>> = match serde_json::from_str(raw) {
+        Ok(value) => value,
+        Err(_) => {
+            return JsonRpcResponse::error(
+                id,
+                JsonRpcError::invalid_params("expected [{cursor?, limit?}]"),
+            );
+        }
+    };
+    if parsed.len() > 1 {
+        return JsonRpcResponse::error(
+            id,
+            JsonRpcError::invalid_params("expected [{cursor?, limit?}]"),
+        );
+    }
+    let query = parsed.into_iter().next().flatten().unwrap_or_default();
+    api_result(
+        id,
+        "zone_getMyActivity",
+        api.zone_get_my_activity(query, auth.clone()).await,
+    )
+}
+
 /// Handle `zone_getOrder(orderId)`.
 async fn handle_zone_get_order(
     id: Value,
@@ -1629,7 +1667,8 @@ mod tests {
             body["disclaimer"],
             "alpha infrastructure; not a production oracle"
         );
-        assert_eq!(body["priceUnit"], "raw integer; quote = baseAmount * price");
+        assert_eq!(body["priceDecimals"], 6);
+        assert_eq!(body["priceUnit"], crate::types::REFERENCE_PRICE_UNIT);
     }
 
     #[tokio::test]

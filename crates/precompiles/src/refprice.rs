@@ -5,8 +5,8 @@
 //! sequencer-side configuration provides (typically a static value), and the
 //! guard only enforces a configurable max-deviation and staleness bound.
 //!
-//! Units match the orderbook precompile: prices are raw integer values and
-//! `quote = baseAmount * price`. The guard treats `max_staleness_secs == 0`
+//! Units match the orderbook precompile: prices are six-decimal fixed-point and
+//! `quote = floor(baseAmount * price / 1_000_000)`. The guard treats `max_staleness_secs == 0`
 //! as "never stale" so static providers can opt out of the freshness check.
 //!
 //! The helper is `no_std`-friendly so it can be reused inside the precompile
@@ -17,7 +17,7 @@ use alloc::string::String;
 /// A single snapshot of a public market reference price.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReferencePrice {
-    /// Raw integer price; same units as the orderbook precompile.
+    /// Six-decimal fixed-point price; same units as the orderbook.
     pub price: u128,
     /// Origin tag (e.g. `"static:alpha"`).
     pub source: String,

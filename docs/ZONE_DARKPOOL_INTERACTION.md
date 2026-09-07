@@ -120,15 +120,17 @@ tracks resting-order escrow internally.
 
 Important rules:
 
-- price is a raw integer: `quote = baseAmount * price`
-- bid escrow is `amount * price` in quote token
+- prices are six-decimal fixed-point integers: `quote = floor(baseAmount * price / 1_000_000)`
+- bid escrow is `ceil(amount * price / 1_000_000)` in quote token
 - ask escrow is `amount` in base token
 - `availableBalanceOf` excludes resting-order escrow
-- market orders must fully fill or revert
-- market orders do not create order ids
-- limit orders emit `OrderSubmitted`; resting residuals also emit `OrderPlaced`
-- each consumed resting leg emits `OrderFilled`
-- limit-order matches also emit `OrderMatched`; market-order fills do not
+- stable time-in-force values are GTC `0`, IOC `1`, and FOK `2`
+- limit orders currently accept GTC only; market orders accept IOC or FOK
+- every accepted limit or market order creates an order id and emits `OrderSubmitted`
+- resting GTC residuals also emit `OrderPlaced`
+- each consumed resting leg emits one `OrderFilled` with maker and taker order ids
+- IOC succeeds with full, partial, or zero fill and emits `OrderCancelled` for any remainder
+- FOK fills the entire amount inside its protection price or reverts atomically
 
 Darkpool write methods:
 
@@ -136,10 +138,10 @@ Darkpool write methods:
 |---|---|
 | `deposit(address token, uint128 amount)` | Pull TIP-20 tokens from the caller's zone wallet into internal darkpool balance. |
 | `withdraw(address token, uint128 amount)` | Move available internal darkpool balance back to the caller's zone wallet. |
-| `place(address base, uint128 amount, uint128 price, bool isBid)` | Submit a limit bid or ask. Bids use `isBid=true`; asks use `false`. |
+| `place(address base, address quote, uint128 amount, uint128 price, bool isBid, uint8 timeInForce)` | Submit a GTC limit bid or ask. Bids use `isBid=true`; asks use `false`. |
 | `cancel(uint128 orderId)` | Cancel a live resting order owned by the caller. |
-| `marketBuy(address base, uint128 amount, uint128 maxQuoteIn)` | Buy exact base amount from resting asks, bounded by quote spend. |
-| `marketSell(address base, uint128 amount, uint128 minQuoteOut)` | Sell exact base amount into resting bids, bounded by minimum quote received. |
+| `marketBuy(address base, address quote, uint128 amount, uint128 maxPrice, uint8 timeInForce)` | Buy base from resting asks at or below the per-unit maximum price, using IOC or FOK. |
+| `marketSell(address base, address quote, uint128 amount, uint128 minPrice, uint8 timeInForce)` | Sell base into resting bids at or above the per-unit minimum price, using IOC or FOK. |
 
 Darkpool read methods:
 
@@ -149,7 +151,7 @@ Darkpool read methods:
 | `balanceOf(address user, address token)` | Owner-scoped total internal balance. |
 | `availableBalanceOf(address user, address token)` | Owner-scoped internal balance excluding resting-order escrow. |
 | `pairKey(address base, address quote)` | Pure pair-key helper. |
-| `createPair(address base)` | Explicit pair creation; `place` also lazily creates pairs. |
+| `createPair(address base, address quote)` | Explicit pair creation; `place` also lazily creates pairs. |
 | `pairCount()` | Number of markets currently registered by `createPair` or `place`. |
 | `pairAt(uint256 index)` | Base and quote addresses for a registered market. |
 | `pairExists(address base, address quote)` | Whether the exact market is registered. |
@@ -200,8 +202,8 @@ cast send "$DARKPOOL" "withdraw(address,uint128)" "$PATHUSD" 1000000 \
 Place a limit ask: sell `alphaUSD` for `pathUSD`.
 
 ```bash
-cast send "$DARKPOOL" "place(address,uint128,uint128,bool)" \
-  "$ALPHAUSD" 1000000 2 false \
+cast send "$DARKPOOL" "place(address,address,uint128,uint128,bool,uint8)" \
+  "$ALPHAUSD" "$PATHUSD" 1000000 2000000 false 0 \
   --rpc-url "$ZONE_RPC_URL" \
   --private-key "$PRIVATE_KEY" \
   --gas-limit 4000000
@@ -210,8 +212,8 @@ cast send "$DARKPOOL" "place(address,uint128,uint128,bool)" \
 Place a limit bid: buy `alphaUSD` with `pathUSD`.
 
 ```bash
-cast send "$DARKPOOL" "place(address,uint128,uint128,bool)" \
-  "$ALPHAUSD" 1000000 1 true \
+cast send "$DARKPOOL" "place(address,address,uint128,uint128,bool,uint8)" \
+  "$ALPHAUSD" "$PATHUSD" 1000000 1000000 true 0 \
   --rpc-url "$ZONE_RPC_URL" \
   --private-key "$PRIVATE_KEY" \
   --gas-limit 4000000
@@ -245,38 +247,64 @@ cast send "$DARKPOOL" "cancel(uint128)" 1 \
 Market orders consume existing opposite-side liquidity. They never rest on the
 book.
 
-Market buy: buy exactly `amount` of base, spending up to `maxQuoteIn`.
+Market buy: buy `amount` of base with a per-unit `maxPrice`. The final argument
+is FOK (`2`); use IOC (`1`) to accept a partial or zero fill.
 
 ```bash
-cast send "$DARKPOOL" "marketBuy(address,uint128,uint128)" \
-  "$ALPHAUSD" 1000000 2000000 \
+cast send "$DARKPOOL" "marketBuy(address,address,uint128,uint128,uint8)" \
+  "$ALPHAUSD" "$PATHUSD" 1000000 2000000 2 \
   --rpc-url "$ZONE_RPC_URL" \
   --private-key "$PRIVATE_KEY" \
   --gas-limit 4000000
 ```
 
-Market sell: sell exactly `amount` of base, receiving at least `minQuoteOut`.
+Market sell: sell `amount` of base with a per-unit `minPrice`.
 
 ```bash
-cast send "$DARKPOOL" "marketSell(address,uint128,uint128)" \
-  "$ALPHAUSD" 1000000 1000000 \
+cast send "$DARKPOOL" "marketSell(address,address,uint128,uint128,uint8)" \
+  "$ALPHAUSD" "$PATHUSD" 1000000 1000000 2 \
   --rpc-url "$ZONE_RPC_URL" \
   --private-key "$PRIVATE_KEY" \
   --gas-limit 4000000
 ```
 
-Use explicit guards. `maxQuoteIn=0` usually makes a market buy unable to fill
-any nonzero-priced ask. `minQuoteOut=0` means no minimum for a market sell.
+Use explicit per-unit guards. `maxPrice=0` makes a market buy unable to fill
+any nonzero-priced ask. `minPrice=0` means no minimum for a market sell. Buy
+escrow is `ceil(amount * maxPrice / 1_000_000)`; price improvement remains
+available in the caller's internal darkpool balance.
+
+## Unified Private Activity
+
+Use authenticated `zone_getMyActivity` as the primary portfolio/activity read:
+
+```bash
+cast rpc zone_getMyActivity \
+  '{"cursor":null,"limit":50}' \
+  --rpc-url "$PRIVATE_ZONE_RPC_URL" \
+  --rpc-headers "X-Authorization-Token: $TOKEN"
+```
+
+The response is a newest-first `{ items, nextCursor, indexedThrough }` page.
+Items merge owner-scoped order summaries, individual fills, transfers,
+deposits, and withdrawals across Zone and Tempo. Order and fill payloads carry
+`orderType` and `timeInForce`; `indexedThrough` reports the actual Zone and
+Tempo tips used for the page. Pass `nextCursor` unchanged for the next stable
+page.
+
+`zone_getMyOrders`, `zone_getMyFills`, and `zone_getMyTransfers` remain
+available to consumers that need a single record type. Fill reconstruction uses
+the maker and taker order ids carried by `OrderFilled`; clients must not scan
+foreign submissions or decode private transaction calldata.
 
 ## Book Reads
 
 Read aggregate top-of-book from the public zone RPC:
 
 ```bash
-cast call "$DARKPOOL" "bestBid(address)(uint128,uint128)" "$ALPHAUSD" \
+cast call "$DARKPOOL" "bestBid(address,address)(uint128,uint128)" "$ALPHAUSD" "$PATHUSD" \
   --rpc-url "$ZONE_RPC_URL"
 
-cast call "$DARKPOOL" "bestAsk(address)(uint128,uint128)" "$ALPHAUSD" \
+cast call "$DARKPOOL" "bestAsk(address,address)(uint128,uint128)" "$ALPHAUSD" "$PATHUSD" \
   --rpc-url "$ZONE_RPC_URL"
 ```
 

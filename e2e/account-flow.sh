@@ -16,15 +16,18 @@ WITHDRAWAL_PROCESSED_TOPIC="0x49ae2215ae0dc5cb44364a538a7007364db417143d69e45cf5
 PATHUSD_AMOUNT="${PATHUSD_AMOUNT:-10000000}"
 ALPHAUSD_AMOUNT="${ALPHAUSD_AMOUNT:-10000000}"
 ORDER_AMOUNT="${ORDER_AMOUNT:-1000000}"
-SELL_PRICE="${SELL_PRICE:-2}"
-BUY_PRICE="${BUY_PRICE:-1}"
+PRICE_SCALE=1000000
+SELL_PRICE="${SELL_PRICE:-2000000}"
+BUY_PRICE="${BUY_PRICE:-1000000}"
 MARKET_ORDER_AMOUNT="${MARKET_ORDER_AMOUNT:-$ORDER_AMOUNT}"
-MARKET_ASK_PRICE="${MARKET_ASK_PRICE:-2}"
-MARKET_BID_PRICE="${MARKET_BID_PRICE:-3}"
-MARKET_BUY_MAX_QUOTE_IN="${MARKET_BUY_MAX_QUOTE_IN:-$((MARKET_ORDER_AMOUNT * MARKET_ASK_PRICE))}"
-MARKET_SELL_MIN_QUOTE_OUT="${MARKET_SELL_MIN_QUOTE_OUT:-$((MARKET_ORDER_AMOUNT * MARKET_BID_PRICE))}"
+MARKET_ASK_PRICE="${MARKET_ASK_PRICE:-2000000}"
+MARKET_BID_PRICE="${MARKET_BID_PRICE:-3000000}"
+MARKET_BUY_MAX_PRICE="${MARKET_BUY_MAX_PRICE:-$MARKET_ASK_PRICE}"
+MARKET_SELL_MIN_PRICE="${MARKET_SELL_MIN_PRICE:-$MARKET_BID_PRICE}"
+TIME_IN_FORCE_GTC=0
+TIME_IN_FORCE_FOK=2
 MAKER_FEE_BUFFER="${MAKER_FEE_BUFFER:-2000000}"
-MAKER_PATHUSD_AMOUNT="${MAKER_PATHUSD_AMOUNT:-$((MARKET_ORDER_AMOUNT * MARKET_BID_PRICE + MAKER_FEE_BUFFER))}"
+MAKER_PATHUSD_AMOUNT="${MAKER_PATHUSD_AMOUNT:-$(((MARKET_ORDER_AMOUNT * MARKET_BID_PRICE + PRICE_SCALE - 1) / PRICE_SCALE + MAKER_FEE_BUFFER))}"
 MAKER_ALPHAUSD_AMOUNT="${MAKER_ALPHAUSD_AMOUNT:-$MARKET_ORDER_AMOUNT}"
 WITHDRAW_PATHUSD_AMOUNT="${WITHDRAW_PATHUSD_AMOUNT:-$((PATHUSD_AMOUNT / 2))}"
 WITHDRAW_ALPHAUSD_AMOUNT="${WITHDRAW_ALPHAUSD_AMOUNT:-$((ALPHAUSD_AMOUNT / 2))}"
@@ -594,13 +597,13 @@ print_specific_order_status() {
     local expected_side="$4"
     local expected_amount="$5"
     local expected_price="$6"
-    local receipt submitted_topic placed_topic matched_topic darkpool_lower
+    local receipt submitted_topic placed_topic filled_topic darkpool_lower
     local submitted_id="" submitted_amount="" submitted_price="" submitted_side=""
     local placed_amount="0" placed_price="" matched_amount="0" matched_price="" status=""
 
-    submitted_topic="$(cast keccak "OrderSubmitted(uint128,address,address,address,uint128,uint128,bool)")"
+    submitted_topic="$(cast keccak "OrderSubmitted(uint128,address,address,address,uint128,uint128,bool,uint8,uint8)")"
     placed_topic="$(cast keccak "OrderPlaced(uint128,address,address,address,uint128,uint128,bool)")"
-    matched_topic="$(cast keccak "OrderMatched(uint128,uint128,address,address,uint128,uint128)")"
+    filled_topic="$(cast keccak "OrderFilled(uint128,address,address,uint128,uint128,uint128)")"
     darkpool_lower="$(echo "$DARKPOOL" | tr '[:upper:]' '[:lower:]')"
     receipt="$(cast receipt "$tx_hash" --rpc-url "$ZONE_RPC_URL" --json)"
 
@@ -629,8 +632,8 @@ print_specific_order_status() {
                     placed_price="$(normalize_uint "$(data_word "$data" 3)")"
                 fi
                 ;;
-            "$matched_topic")
-                taker_order_id="$(topic_uint "$(echo "$log_entry" | jq -r '.topics[2]')")"
+            "$filled_topic")
+                taker_order_id="$(normalize_uint "$(data_word "$data" 0)")"
                 if [[ -n "$submitted_id" && "$taker_order_id" == "$submitted_id" ]]; then
                     amount="$(normalize_uint "$(data_word "$data" 1)")"
                     price="$(normalize_uint "$(data_word "$data" 2)")"
@@ -671,7 +674,7 @@ print_specific_order_status() {
         status="resting open"
         expected_status="open"
     else
-        fail "$label emitted OrderSubmitted without OrderPlaced or OrderMatched"
+        fail "$label emitted OrderSubmitted without OrderPlaced or OrderFilled"
     fi
 
     echo "  specific $label status:"
@@ -691,7 +694,7 @@ print_specific_order_status() {
     order_side="$(echo "$zone_order" | jq -r '.result.side')"
     order_status="$(echo "$zone_order" | jq -r '.result.status')"
     order_amount="$(json_required_quantity "$zone_order" ".result.amount" "zone_getOrder($order_hex).amount")"
-    order_price="$(json_required_quantity "$zone_order" ".result.price" "zone_getOrder($order_hex).price")"
+    order_price="$(json_required_quantity "$zone_order" ".result.priceLimit" "zone_getOrder($order_hex).priceLimit")"
     order_remaining="$(json_required_quantity "$zone_order" ".result.remaining" "zone_getOrder($order_hex).remaining")"
     order_filled="$(json_required_quantity "$zone_order" ".result.filled" "zone_getOrder($order_hex).filled")"
     order_base="$(json_required_address "$zone_order" ".result.baseToken" "zone_getOrder($order_hex).baseToken")"
@@ -709,7 +712,7 @@ print_specific_order_status() {
     assert_address_equal "zone_getOrder($order_hex) baseToken" "$order_base" "$ALPHAUSD"
     assert_address_equal "zone_getOrder($order_hex) quoteToken" "$order_quote" "$PATHUSD"
     assert_uint_equal "zone_getOrder($order_hex) amount" "$order_amount" "$submitted_amount"
-    assert_uint_equal "zone_getOrder($order_hex) price" "$order_price" "$submitted_price"
+    assert_uint_equal "zone_getOrder($order_hex) priceLimit" "$order_price" "$submitted_price"
     assert_uint_equal "zone_getOrder($order_hex) remaining" "$order_remaining" "$expected_remaining"
     assert_uint_equal "zone_getOrder($order_hex) filled" "$order_filled" "$expected_filled"
     echo "    zone_getOrder: status=$order_status remaining=$order_remaining filled=$order_filled"
@@ -722,33 +725,35 @@ validate_market_fill_status() {
     local expected_taker="$4"
     local expected_amount="$5"
     local expected_price="$6"
-    local receipt filled_topic submitted_topic matched_topic darkpool_lower
-    local total_filled=0 fill_count=0
+    local receipt filled_topic submitted_topic darkpool_lower
+    local submitted_id="" submitted_kind="" submitted_tif="" total_filled=0 fill_count=0
 
-    filled_topic="$(cast keccak "OrderFilled(uint128,address,address,uint128,uint128)")"
-    submitted_topic="$(cast keccak "OrderSubmitted(uint128,address,address,address,uint128,uint128,bool)")"
-    matched_topic="$(cast keccak "OrderMatched(uint128,uint128,address,address,uint128,uint128)")"
+    filled_topic="$(cast keccak "OrderFilled(uint128,address,address,uint128,uint128,uint128)")"
+    submitted_topic="$(cast keccak "OrderSubmitted(uint128,address,address,address,uint128,uint128,bool,uint8,uint8)")"
     darkpool_lower="$(echo "$DARKPOOL" | tr '[:upper:]' '[:lower:]')"
     receipt="$(cast receipt "$tx_hash" --rpc-url "$ZONE_RPC_URL" --json)"
 
     while IFS= read -r log_entry; do
-        local topic0 maker taker data amount price
+        local topic0 maker taker data taker_order_id amount price
         topic0="$(echo "$log_entry" | jq -r '.topics[0]')"
+        data="$(echo "$log_entry" | jq -r '.data')"
         case "$topic0" in
             "$submitted_topic")
-                fail "$label market order unexpectedly emitted OrderSubmitted"
-                ;;
-            "$matched_topic")
-                fail "$label market order unexpectedly emitted OrderMatched"
+                submitted_id="$(topic_uint "$(echo "$log_entry" | jq -r '.topics[1]')")"
+                submitted_kind="$(normalize_uint "$(data_word "$data" 5)")"
+                submitted_tif="$(normalize_uint "$(data_word "$data" 6)")"
                 ;;
             "$filled_topic")
                 maker="$(word_address "$(echo "$log_entry" | jq -r '.topics[2]')")"
                 taker="$(word_address "$(echo "$log_entry" | jq -r '.topics[3]')")"
                 assert_address_equal "$label OrderFilled maker" "$maker" "$expected_maker"
                 assert_address_equal "$label OrderFilled taker" "$taker" "$expected_taker"
-                data="$(echo "$log_entry" | jq -r '.data')"
-                amount="$(normalize_uint "$(data_word "$data" 0)")"
-                price="$(normalize_uint "$(data_word "$data" 1)")"
+                taker_order_id="$(normalize_uint "$(data_word "$data" 0)")"
+                amount="$(normalize_uint "$(data_word "$data" 1)")"
+                price="$(normalize_uint "$(data_word "$data" 2)")"
+                if [[ -n "$submitted_id" ]]; then
+                    assert_uint_equal "$label OrderFilled taker order id" "$taker_order_id" "$submitted_id"
+                fi
                 assert_uint_equal "$label OrderFilled price" "$price" "$expected_price"
                 total_filled=$((total_filled + amount))
                 fill_count=$((fill_count + 1))
@@ -759,6 +764,11 @@ validate_market_fill_status() {
     if (( fill_count == 0 )); then
         fail "$label market order emitted no OrderFilled events"
     fi
+    if [[ -z "$submitted_id" ]]; then
+        fail "$label market order emitted no OrderSubmitted event"
+    fi
+    assert_uint_equal "$label order kind" "$submitted_kind" 1
+    assert_uint_equal "$label time in force" "$submitted_tif" "$TIME_IN_FORCE_FOK"
     assert_uint_equal "$label total market fill amount" "$total_filled" "$expected_amount"
 
     echo "  $label market fill:"
@@ -798,14 +808,15 @@ main() {
     echo "  pathUSD:        $PATHUSD amount=$PATHUSD_AMOUNT"
     echo "  alphaUSD:       $ALPHAUSD amount=$ALPHAUSD_AMOUNT"
     echo "  orders:         sell $ORDER_AMOUNT @ $SELL_PRICE, buy $ORDER_AMOUNT @ $BUY_PRICE"
-    echo "  market orders:  buy $MARKET_ORDER_AMOUNT maxQuote=$MARKET_BUY_MAX_QUOTE_IN, sell $MARKET_ORDER_AMOUNT minQuote=$MARKET_SELL_MIN_QUOTE_OUT"
+    echo "  market orders:  buy $MARKET_ORDER_AMOUNT maxPrice=$MARKET_BUY_MAX_PRICE FOK, sell $MARKET_ORDER_AMOUNT minPrice=$MARKET_SELL_MIN_PRICE FOK"
     echo "  maker deposits: pathUSD=$MAKER_PATHUSD_AMOUNT alphaUSD=$MAKER_ALPHAUSD_AMOUNT"
     echo "  L1 settlement:  $VERIFY_L1_WITHDRAWAL_SETTLEMENT"
     echo "  gas fallbacks:  approve=$APPROVE_GAS_FALLBACK deposit=$DEPOSIT_GAS_FALLBACK order=$ORDER_GAS_FALLBACK withdraw=$WITHDRAW_GAS_FALLBACK"
 
-    local required_path_available required_alpha_available
-    required_path_available=$((ORDER_AMOUNT * BUY_PRICE + MARKET_BUY_MAX_QUOTE_IN + WITHDRAW_PATHUSD_AMOUNT))
+    local required_path_available required_alpha_available required_maker_bid
+    required_path_available=$(((ORDER_AMOUNT * BUY_PRICE + PRICE_SCALE - 1) / PRICE_SCALE + (MARKET_ORDER_AMOUNT * MARKET_BUY_MAX_PRICE + PRICE_SCALE - 1) / PRICE_SCALE + WITHDRAW_PATHUSD_AMOUNT))
     required_alpha_available=$((ORDER_AMOUNT + MARKET_ORDER_AMOUNT + WITHDRAW_ALPHAUSD_AMOUNT))
+    required_maker_bid=$(((MARKET_ORDER_AMOUNT * MARKET_BID_PRICE + PRICE_SCALE - 1) / PRICE_SCALE))
     if (( PATHUSD_AMOUNT < required_path_available )); then
         echo "ERROR: PATHUSD_AMOUNT must cover buy escrow plus withdrawal." >&2
         echo "       Need at least $required_path_available, got $PATHUSD_AMOUNT." >&2
@@ -816,9 +827,9 @@ main() {
         echo "       Need at least $required_alpha_available, got $ALPHAUSD_AMOUNT." >&2
         exit 1
     fi
-    if (( MAKER_PATHUSD_AMOUNT < MARKET_ORDER_AMOUNT * MARKET_BID_PRICE )); then
+    if (( MAKER_PATHUSD_AMOUNT < required_maker_bid )); then
         echo "ERROR: MAKER_PATHUSD_AMOUNT must cover market-sell bid liquidity." >&2
-        echo "       Need at least $((MARKET_ORDER_AMOUNT * MARKET_BID_PRICE)), got $MAKER_PATHUSD_AMOUNT." >&2
+        echo "       Need at least $required_maker_bid, got $MAKER_PATHUSD_AMOUNT." >&2
         exit 1
     fi
     if (( MAKER_ALPHAUSD_AMOUNT < MARKET_ORDER_AMOUNT )); then
@@ -900,24 +911,24 @@ main() {
     local path_deposit_tx alpha_deposit_tx maker_path_deposit_tx maker_alpha_deposit_tx
     local path_deposit_gas alpha_deposit_gas maker_path_deposit_gas maker_alpha_deposit_gas
     path_deposit_gas="$(buffered_gas_limit "$DEPOSIT_GAS_FALLBACK" "$HTTP_L1_RPC" "$account" \
-        "$L1_PORTAL_ADDRESS" "deposit(address,address,uint128,bytes32)" "$PATHUSD" "$account" "$PATHUSD_AMOUNT" "$memo")"
+        "$L1_PORTAL_ADDRESS" "deposit(address,address,uint128,bytes32,address)" "$PATHUSD" "$account" "$PATHUSD_AMOUNT" "$memo" "$account")"
     alpha_deposit_gas="$(buffered_gas_limit "$DEPOSIT_GAS_FALLBACK" "$HTTP_L1_RPC" "$account" \
-        "$L1_PORTAL_ADDRESS" "deposit(address,address,uint128,bytes32)" "$ALPHAUSD" "$account" "$ALPHAUSD_AMOUNT" "$memo")"
+        "$L1_PORTAL_ADDRESS" "deposit(address,address,uint128,bytes32,address)" "$ALPHAUSD" "$account" "$ALPHAUSD_AMOUNT" "$memo" "$account")"
     path_deposit_tx="$(send_checked "pathUSD deposit" \
-        cast send "$L1_PORTAL_ADDRESS" "deposit(address,address,uint128,bytes32)" "$PATHUSD" "$account" "$PATHUSD_AMOUNT" "$memo" \
+        cast send "$L1_PORTAL_ADDRESS" "deposit(address,address,uint128,bytes32,address)" "$PATHUSD" "$account" "$PATHUSD_AMOUNT" "$memo" "$account" \
         --rpc-url "$HTTP_L1_RPC" --private-key "$private_key" --gas-limit "$path_deposit_gas")"
     alpha_deposit_tx="$(send_checked "alphaUSD deposit" \
-        cast send "$L1_PORTAL_ADDRESS" "deposit(address,address,uint128,bytes32)" "$ALPHAUSD" "$account" "$ALPHAUSD_AMOUNT" "$memo" \
+        cast send "$L1_PORTAL_ADDRESS" "deposit(address,address,uint128,bytes32,address)" "$ALPHAUSD" "$account" "$ALPHAUSD_AMOUNT" "$memo" "$account" \
         --rpc-url "$HTTP_L1_RPC" --private-key "$private_key" --gas-limit "$alpha_deposit_gas")"
     maker_path_deposit_gas="$(buffered_gas_limit "$DEPOSIT_GAS_FALLBACK" "$HTTP_L1_RPC" "$maker_account" \
-        "$L1_PORTAL_ADDRESS" "deposit(address,address,uint128,bytes32)" "$PATHUSD" "$maker_account" "$MAKER_PATHUSD_AMOUNT" "$memo")"
+        "$L1_PORTAL_ADDRESS" "deposit(address,address,uint128,bytes32,address)" "$PATHUSD" "$maker_account" "$MAKER_PATHUSD_AMOUNT" "$memo" "$maker_account")"
     maker_alpha_deposit_gas="$(buffered_gas_limit "$DEPOSIT_GAS_FALLBACK" "$HTTP_L1_RPC" "$maker_account" \
-        "$L1_PORTAL_ADDRESS" "deposit(address,address,uint128,bytes32)" "$ALPHAUSD" "$maker_account" "$MAKER_ALPHAUSD_AMOUNT" "$memo")"
+        "$L1_PORTAL_ADDRESS" "deposit(address,address,uint128,bytes32,address)" "$ALPHAUSD" "$maker_account" "$MAKER_ALPHAUSD_AMOUNT" "$memo" "$maker_account")"
     maker_path_deposit_tx="$(send_checked "maker pathUSD deposit" \
-        cast send "$L1_PORTAL_ADDRESS" "deposit(address,address,uint128,bytes32)" "$PATHUSD" "$maker_account" "$MAKER_PATHUSD_AMOUNT" "$memo" \
+        cast send "$L1_PORTAL_ADDRESS" "deposit(address,address,uint128,bytes32,address)" "$PATHUSD" "$maker_account" "$MAKER_PATHUSD_AMOUNT" "$memo" "$maker_account" \
         --rpc-url "$HTTP_L1_RPC" --private-key "$maker_key" --gas-limit "$maker_path_deposit_gas")"
     maker_alpha_deposit_tx="$(send_checked "maker alphaUSD deposit" \
-        cast send "$L1_PORTAL_ADDRESS" "deposit(address,address,uint128,bytes32)" "$ALPHAUSD" "$maker_account" "$MAKER_ALPHAUSD_AMOUNT" "$memo" \
+        cast send "$L1_PORTAL_ADDRESS" "deposit(address,address,uint128,bytes32,address)" "$ALPHAUSD" "$maker_account" "$MAKER_ALPHAUSD_AMOUNT" "$memo" "$maker_account" \
         --rpc-url "$HTTP_L1_RPC" --private-key "$maker_key" --gas-limit "$maker_alpha_deposit_gas")"
     echo "  pathUSD deposit tx:  $path_deposit_tx (gas $path_deposit_gas)"
     echo "  alphaUSD deposit tx: $alpha_deposit_tx (gas $alpha_deposit_gas)"
@@ -936,17 +947,17 @@ main() {
     local zone_path_fees=0
 
     maker_ask_gas="$(buffered_gas_limit "$ORDER_GAS_FALLBACK" "$ZONE_RPC_URL" "$maker_account" \
-        "$DARKPOOL" "place(address,address,uint128,uint128,bool)" "$ALPHAUSD" "$PATHUSD" "$MARKET_ORDER_AMOUNT" "$MARKET_ASK_PRICE" false)"
+        "$DARKPOOL" "place(address,address,uint128,uint128,bool,uint8)" "$ALPHAUSD" "$PATHUSD" "$MARKET_ORDER_AMOUNT" "$MARKET_ASK_PRICE" false "$TIME_IN_FORCE_GTC")"
     maker_ask_tx="$(send_checked "maker ask for market buy" \
-        cast send "$DARKPOOL" "place(address,address,uint128,uint128,bool)" "$ALPHAUSD" "$PATHUSD" "$MARKET_ORDER_AMOUNT" "$MARKET_ASK_PRICE" false \
+        cast send "$DARKPOOL" "place(address,address,uint128,uint128,bool,uint8)" "$ALPHAUSD" "$PATHUSD" "$MARKET_ORDER_AMOUNT" "$MARKET_ASK_PRICE" false "$TIME_IN_FORCE_GTC" \
         --rpc-url "$ZONE_RPC_URL" --private-key "$maker_key" --gas-limit "$maker_ask_gas")"
     echo "  maker ask tx: $maker_ask_tx (gas $maker_ask_gas)"
     print_specific_order_status "maker ask for market buy" "$maker_ask_tx" "$maker_auth" "sell" "$MARKET_ORDER_AMOUNT" "$MARKET_ASK_PRICE"
 
     market_buy_gas="$(buffered_gas_limit "$ORDER_GAS_FALLBACK" "$ZONE_RPC_URL" "$account" \
-        "$DARKPOOL" "marketBuy(address,address,uint128,uint128)" "$ALPHAUSD" "$PATHUSD" "$MARKET_ORDER_AMOUNT" "$MARKET_BUY_MAX_QUOTE_IN")"
+        "$DARKPOOL" "marketBuy(address,address,uint128,uint128,uint8)" "$ALPHAUSD" "$PATHUSD" "$MARKET_ORDER_AMOUNT" "$MARKET_BUY_MAX_PRICE" "$TIME_IN_FORCE_FOK")"
     market_buy_tx="$(send_checked "market buy" \
-        cast send "$DARKPOOL" "marketBuy(address,address,uint128,uint128)" "$ALPHAUSD" "$PATHUSD" "$MARKET_ORDER_AMOUNT" "$MARKET_BUY_MAX_QUOTE_IN" \
+        cast send "$DARKPOOL" "marketBuy(address,address,uint128,uint128,uint8)" "$ALPHAUSD" "$PATHUSD" "$MARKET_ORDER_AMOUNT" "$MARKET_BUY_MAX_PRICE" "$TIME_IN_FORCE_FOK" \
         --rpc-url "$ZONE_RPC_URL" --private-key "$private_key" --gas-limit "$market_buy_gas")"
     zone_path_fees=$((zone_path_fees + $(zone_path_fee_paid "$market_buy_tx" "$account")))
     echo "  market buy tx: $market_buy_tx (gas $market_buy_gas)"
@@ -954,17 +965,17 @@ main() {
     print_order_status "market buy" "$account" "$auth" "$market_buy_tx"
 
     maker_bid_gas="$(buffered_gas_limit "$ORDER_GAS_FALLBACK" "$ZONE_RPC_URL" "$maker_account" \
-        "$DARKPOOL" "place(address,address,uint128,uint128,bool)" "$ALPHAUSD" "$PATHUSD" "$MARKET_ORDER_AMOUNT" "$MARKET_BID_PRICE" true)"
+        "$DARKPOOL" "place(address,address,uint128,uint128,bool,uint8)" "$ALPHAUSD" "$PATHUSD" "$MARKET_ORDER_AMOUNT" "$MARKET_BID_PRICE" true "$TIME_IN_FORCE_GTC")"
     maker_bid_tx="$(send_checked "maker bid for market sell" \
-        cast send "$DARKPOOL" "place(address,address,uint128,uint128,bool)" "$ALPHAUSD" "$PATHUSD" "$MARKET_ORDER_AMOUNT" "$MARKET_BID_PRICE" true \
+        cast send "$DARKPOOL" "place(address,address,uint128,uint128,bool,uint8)" "$ALPHAUSD" "$PATHUSD" "$MARKET_ORDER_AMOUNT" "$MARKET_BID_PRICE" true "$TIME_IN_FORCE_GTC" \
         --rpc-url "$ZONE_RPC_URL" --private-key "$maker_key" --gas-limit "$maker_bid_gas")"
     echo "  maker bid tx: $maker_bid_tx (gas $maker_bid_gas)"
     print_specific_order_status "maker bid for market sell" "$maker_bid_tx" "$maker_auth" "buy" "$MARKET_ORDER_AMOUNT" "$MARKET_BID_PRICE"
 
     market_sell_gas="$(buffered_gas_limit "$ORDER_GAS_FALLBACK" "$ZONE_RPC_URL" "$account" \
-        "$DARKPOOL" "marketSell(address,address,uint128,uint128)" "$ALPHAUSD" "$PATHUSD" "$MARKET_ORDER_AMOUNT" "$MARKET_SELL_MIN_QUOTE_OUT")"
+        "$DARKPOOL" "marketSell(address,address,uint128,uint128,uint8)" "$ALPHAUSD" "$PATHUSD" "$MARKET_ORDER_AMOUNT" "$MARKET_SELL_MIN_PRICE" "$TIME_IN_FORCE_FOK")"
     market_sell_tx="$(send_checked "market sell" \
-        cast send "$DARKPOOL" "marketSell(address,address,uint128,uint128)" "$ALPHAUSD" "$PATHUSD" "$MARKET_ORDER_AMOUNT" "$MARKET_SELL_MIN_QUOTE_OUT" \
+        cast send "$DARKPOOL" "marketSell(address,address,uint128,uint128,uint8)" "$ALPHAUSD" "$PATHUSD" "$MARKET_ORDER_AMOUNT" "$MARKET_SELL_MIN_PRICE" "$TIME_IN_FORCE_FOK" \
         --rpc-url "$ZONE_RPC_URL" --private-key "$private_key" --gas-limit "$market_sell_gas")"
     zone_path_fees=$((zone_path_fees + $(zone_path_fee_paid "$market_sell_tx" "$account")))
     echo "  market sell tx: $market_sell_tx (gas $market_sell_gas)"
@@ -975,9 +986,9 @@ main() {
     local sell_tx buy_tx
     local sell_gas buy_gas
     sell_gas="$(buffered_gas_limit "$ORDER_GAS_FALLBACK" "$ZONE_RPC_URL" "$account" \
-        "$DARKPOOL" "place(address,address,uint128,uint128,bool)" "$ALPHAUSD" "$PATHUSD" "$ORDER_AMOUNT" "$SELL_PRICE" false)"
+        "$DARKPOOL" "place(address,address,uint128,uint128,bool,uint8)" "$ALPHAUSD" "$PATHUSD" "$ORDER_AMOUNT" "$SELL_PRICE" false "$TIME_IN_FORCE_GTC")"
     sell_tx="$(send_checked "sell order" \
-        cast send "$DARKPOOL" "place(address,address,uint128,uint128,bool)" "$ALPHAUSD" "$PATHUSD" "$ORDER_AMOUNT" "$SELL_PRICE" false \
+        cast send "$DARKPOOL" "place(address,address,uint128,uint128,bool,uint8)" "$ALPHAUSD" "$PATHUSD" "$ORDER_AMOUNT" "$SELL_PRICE" false "$TIME_IN_FORCE_GTC" \
         --rpc-url "$ZONE_RPC_URL" --private-key "$private_key" --gas-limit "$sell_gas")"
     zone_path_fees=$((zone_path_fees + $(zone_path_fee_paid "$sell_tx" "$account")))
     echo "  sell tx: $sell_tx (gas $sell_gas)"
@@ -985,9 +996,9 @@ main() {
     print_order_status "sell order" "$account" "$auth" "$sell_tx"
 
     buy_gas="$(buffered_gas_limit "$ORDER_GAS_FALLBACK" "$ZONE_RPC_URL" "$account" \
-        "$DARKPOOL" "place(address,address,uint128,uint128,bool)" "$ALPHAUSD" "$PATHUSD" "$ORDER_AMOUNT" "$BUY_PRICE" true)"
+        "$DARKPOOL" "place(address,address,uint128,uint128,bool,uint8)" "$ALPHAUSD" "$PATHUSD" "$ORDER_AMOUNT" "$BUY_PRICE" true "$TIME_IN_FORCE_GTC")"
     buy_tx="$(send_checked "buy order" \
-        cast send "$DARKPOOL" "place(address,address,uint128,uint128,bool)" "$ALPHAUSD" "$PATHUSD" "$ORDER_AMOUNT" "$BUY_PRICE" true \
+        cast send "$DARKPOOL" "place(address,address,uint128,uint128,bool,uint8)" "$ALPHAUSD" "$PATHUSD" "$ORDER_AMOUNT" "$BUY_PRICE" true "$TIME_IN_FORCE_GTC" \
         --rpc-url "$ZONE_RPC_URL" --private-key "$private_key" --gas-limit "$buy_gas")"
     zone_path_fees=$((zone_path_fees + $(zone_path_fee_paid "$buy_tx" "$account")))
     echo "  buy tx:  $buy_tx (gas $buy_gas)"
@@ -1053,8 +1064,20 @@ main() {
 
     log "Final public zone status"
     local expected_path_final expected_alpha_final
-    expected_path_final=$((target_path - MARKET_BUY_MAX_QUOTE_IN - ORDER_AMOUNT * BUY_PRICE - WITHDRAW_PATHUSD_AMOUNT - zone_path_fees))
-    expected_alpha_final=$((target_alpha - MARKET_ORDER_AMOUNT - ORDER_AMOUNT - WITHDRAW_ALPHAUSD_AMOUNT))
+    local market_buy_quote market_sell_quote limit_buy_quote limit_buy_external_debit
+    market_buy_quote=$(((MARKET_ORDER_AMOUNT * MARKET_BUY_MAX_PRICE + PRICE_SCALE - 1) / PRICE_SCALE))
+    market_sell_quote=$(((MARKET_ORDER_AMOUNT * MARKET_BID_PRICE) / PRICE_SCALE))
+    limit_buy_quote=$(((ORDER_AMOUNT * BUY_PRICE + PRICE_SCALE - 1) / PRICE_SCALE))
+    if (( market_sell_quote >= limit_buy_quote )); then
+        limit_buy_external_debit=0
+    else
+        limit_buy_external_debit=$((limit_buy_quote - market_sell_quote))
+    fi
+    expected_path_final=$((target_path - market_buy_quote - limit_buy_external_debit - WITHDRAW_PATHUSD_AMOUNT - zone_path_fees))
+    # The equal-sized FOK sell consumes the base acquired by the preceding FOK
+    # buy from internal darkpool balance. Only the later GTC sell needs another
+    # external base transfer.
+    expected_alpha_final=$((target_alpha - ORDER_AMOUNT - WITHDRAW_ALPHAUSD_AMOUNT))
     assert_public_balance "$PATHUSD" "$account" "$expected_path_final" "pathUSD"
     assert_public_balance "$ALPHAUSD" "$account" "$expected_alpha_final" "alphaUSD"
 
@@ -1063,6 +1086,23 @@ main() {
     info="$(private_rpc "$auth" '{"jsonrpc":"2.0","method":"zone_getAuthorizationTokenInfo","params":[],"id":1}')"
     require_json_rpc_result "zone_getAuthorizationTokenInfo" "$info"
     echo "$info" | jq .
+
+    local activity
+    activity="$(private_zone_call "$auth" "zone_getMyActivity" '[{"limit":50}]')"
+    require_json_rpc_result "zone_getMyActivity" "$activity"
+    if ! echo "$activity" | jq -e '.result.items | type == "array" and length > 0' >/dev/null; then
+        fail "zone_getMyActivity returned no unified activity items"
+    fi
+    if ! echo "$activity" | jq -e '.result.indexedThrough.zoneBlock != null and .result.indexedThrough.tempoBlock != null' >/dev/null; then
+        fail "zone_getMyActivity omitted indexedThrough chain tips"
+    fi
+    if ! echo "$activity" | jq -e \
+        '[.result.items[] | select(.payload.type == "order" and .payload.details.orderType == "market" and .payload.details.timeInForce == "fok")] | length >= 2' >/dev/null; then
+        fail "zone_getMyActivity omitted FOK market-order summaries"
+    fi
+    echo "  unified activity items: $(echo "$activity" | jq -r '.result.items | length')"
+    echo "  indexed through: zone=$(echo "$activity" | jq -r '.result.indexedThrough.zoneBlock') tempo=$(echo "$activity" | jq -r '.result.indexedThrough.tempoBlock')"
+
     assert_private_balance "$auth" "$account" "$PATHUSD" "$expected_path_final" "pathUSD"
     assert_private_balance "$auth" "$account" "$ALPHAUSD" "$expected_alpha_final" "alphaUSD"
 

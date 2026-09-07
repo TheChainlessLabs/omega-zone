@@ -148,7 +148,18 @@ mod tests {
 
     #[test]
     fn template_parses() {
-        genesis_template().unwrap();
+        let genesis = genesis_template().unwrap();
+        let config = serde_json::to_value(&genesis.config).unwrap();
+
+        for hardfork in [
+            "t0Time", "t1Time", "t1aTime", "t1bTime", "t1cTime", "t2Time", "t3Time", "t4Time",
+        ] {
+            assert_eq!(
+                config.get(hardfork),
+                Some(&serde_json::json!(0)),
+                "zone genesis must activate {hardfork} for current Tempo Wallet signatures"
+            );
+        }
     }
 
     #[test]

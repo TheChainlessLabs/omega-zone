@@ -6,7 +6,7 @@ use alloy::{
 };
 use alloy_signer_local::{MnemonicBuilder, PrivateKeySigner, coins_bip39::English};
 use alloy_sol_types::{SolEvent, sol};
-use tempo_chainspec::spec::TEMPO_T0_BASE_FEE;
+use tempo_chainspec::spec::TEMPO_T1_BASE_FEE;
 use tempo_precompiles::{PATH_USD_ADDRESS, tip403_registry::ALLOW_ALL_POLICY_ID};
 use zone_l1::EnabledToken;
 use zone_precompiles::DARKPOOL_ADDRESS;
@@ -48,10 +48,12 @@ sol! {
             bool isBid;
             uint128 price;
             uint128 quantity;
+            uint8 orderKind;
+            uint8 timeInForce;
         }
 
         function MIN_ORDER_AMOUNT() external pure returns (uint128);
-        function place(address base, address quote, uint128 amount, uint128 price, bool isBid)
+        function place(address base, address quote, uint128 amount, uint128 price, bool isBid, uint8 timeInForce)
             external returns (uint128 orderId);
         function deposit(address token, uint128 amount) external;
         function cancel(uint128 orderId) external;
@@ -64,10 +66,10 @@ sol! {
         function bestAsk(address base, address quote) external view returns (uint128 price, uint128 quantity);
         function balanceOf(address user, address token) external view returns (uint128);
         function availableBalanceOf(address user, address token) external view returns (uint128);
-        function marketBuy(address base, address quote, uint128 amount, uint128 maxQuoteIn)
-            external returns (uint128 quoteSpent);
-        function marketSell(address base, address quote, uint128 amount, uint128 minQuoteOut)
-            external returns (uint128 quoteReceived);
+        function marketBuy(address base, address quote, uint128 amount, uint128 maxPrice, uint8 timeInForce)
+            external returns (uint128 orderId, uint128 filledAmount, uint128 quoteSpent);
+        function marketSell(address base, address quote, uint128 amount, uint128 minPrice, uint8 timeInForce)
+            external returns (uint128 orderId, uint128 filledAmount, uint128 quoteReceived);
 
         event OrderSubmitted(
             uint128 indexed orderId,
@@ -75,8 +77,10 @@ sol! {
             address base,
             address quote,
             uint128 amount,
-            uint128 price,
-            bool isBid
+            uint128 priceLimit,
+            bool isBid,
+            uint8 orderKind,
+            uint8 timeInForce
         );
         event OrderPlaced(
             uint128 indexed orderId,
@@ -88,23 +92,18 @@ sol! {
             bool isBid
         );
         event OrderFilled(
-            uint128 indexed orderId,
+            uint128 indexed makerOrderId,
             address indexed maker,
             address indexed taker,
-            uint128 amountFilled,
-            uint128 price
-        );
-        event OrderMatched(
-            uint128 indexed makerOrderId,
-            uint128 indexed takerOrderId,
-            address indexed maker,
-            address taker,
+            uint128 takerOrderId,
             uint128 amountFilled,
             uint128 price
         );
         event OrderCancelled(
             uint128 indexed orderId,
-            address indexed maker
+            address indexed maker,
+            uint128 cancelledAmount,
+            uint8 reason
         );
     }
 }
@@ -156,6 +155,49 @@ async fn test_darkpool_available_on_zone() -> eyre::Result<()> {
         !code.is_empty(),
         "Darkpool account must have marker bytecode so precompile storage writes persist"
     );
+    assert!(
+        darkpool
+            .place(
+                ALPHA_USD_ADDRESS,
+                PATH_USD_ADDRESS,
+                1_000_000,
+                zone_precompiles::PRICE_SCALE,
+                true,
+                1,
+            )
+            .call()
+            .await
+            .is_err(),
+        "limit orders must reject IOC"
+    );
+    assert!(
+        darkpool
+            .marketBuy(
+                ALPHA_USD_ADDRESS,
+                PATH_USD_ADDRESS,
+                1_000_000,
+                zone_precompiles::PRICE_SCALE,
+                0,
+            )
+            .call()
+            .await
+            .is_err(),
+        "market buys must reject GTC"
+    );
+    assert!(
+        darkpool
+            .marketSell(
+                ALPHA_USD_ADDRESS,
+                PATH_USD_ADDRESS,
+                1_000_000,
+                zone_precompiles::PRICE_SCALE,
+                3,
+            )
+            .call()
+            .await
+            .is_err(),
+        "market sells must reject unknown time-in-force values"
+    );
 
     Ok(())
 }
@@ -189,7 +231,7 @@ async fn test_darkpool_place_pulls_zone_wallet_balance() -> eyre::Result<()> {
     );
 
     let amount: u128 = 1_000_000;
-    let price: u128 = 1;
+    let price: u128 = zone_precompiles::PRICE_SCALE;
     let initial_balance: u128 = 10_000_000;
 
     fixture.inject_enabled_tokens(zone.deposit_queue(), vec![alpha_usd_enabled_token()]);
@@ -206,8 +248,8 @@ async fn test_darkpool_place_pulls_zone_wallet_balance() -> eyre::Result<()> {
     .await?;
 
     let bid_pending = darkpool
-        .place(ALPHA_USD_ADDRESS, PATH_USD_ADDRESS, amount, price, true)
-        .gas_price(TEMPO_T0_BASE_FEE as u128)
+        .place(ALPHA_USD_ADDRESS, PATH_USD_ADDRESS, amount, price, true, 0)
+        .gas_price(TEMPO_T1_BASE_FEE as u128)
         .gas(4_000_000)
         .send()
         .await?;
@@ -241,7 +283,7 @@ async fn test_darkpool_place_pulls_zone_wallet_balance() -> eyre::Result<()> {
             .from(dev_address)
             .call()
             .await?,
-        amount * price,
+        amount * price / zone_precompiles::PRICE_SCALE,
         "pulled quote should be credited to the caller's internal balance"
     );
     assert_eq!(
@@ -278,8 +320,8 @@ async fn test_darkpool_place_reuses_internal_available_balance() -> eyre::Result
     let darkpool = TestDarkpoolOrderbook::new(DARKPOOL_ADDRESS, &provider);
 
     let amount: u128 = 1_000_000;
-    let price: u128 = 1;
-    let escrow = amount * price;
+    let price: u128 = zone_precompiles::PRICE_SCALE;
+    let escrow = amount * price / zone_precompiles::PRICE_SCALE;
 
     fixture.inject_enabled_tokens(zone.deposit_queue(), vec![alpha_usd_enabled_token()]);
     fixture.inject_deposits(
@@ -296,8 +338,8 @@ async fn test_darkpool_place_reuses_internal_available_balance() -> eyre::Result
 
     let deposit_pending = darkpool
         .deposit(PATH_USD_ADDRESS, escrow)
-        .gas_price(TEMPO_T0_BASE_FEE as u128)
-        .gas(500_000)
+        .gas_price(TEMPO_T1_BASE_FEE as u128)
+        .gas(1_000_000)
         .send()
         .await?;
     fixture.inject_empty_block(zone.deposit_queue());
@@ -314,8 +356,8 @@ async fn test_darkpool_place_reuses_internal_available_balance() -> eyre::Result
     );
 
     let bid_pending = darkpool
-        .place(ALPHA_USD_ADDRESS, PATH_USD_ADDRESS, amount, price, true)
-        .gas_price(TEMPO_T0_BASE_FEE as u128)
+        .place(ALPHA_USD_ADDRESS, PATH_USD_ADDRESS, amount, price, true, 0)
+        .gas_price(TEMPO_T1_BASE_FEE as u128)
         .gas(4_000_000)
         .send()
         .await?;
@@ -365,8 +407,8 @@ async fn test_darkpool_resting_bid_escrow_is_not_withdrawable() -> eyre::Result<
     let darkpool = TestDarkpoolOrderbook::new(DARKPOOL_ADDRESS, &provider);
 
     let amount: u128 = 1_000_000;
-    let price: u128 = 1;
-    let escrow = amount * price;
+    let price: u128 = zone_precompiles::PRICE_SCALE;
+    let escrow = amount * price / zone_precompiles::PRICE_SCALE;
 
     fixture.inject_enabled_tokens(
         zone.deposit_queue(),
@@ -390,8 +432,8 @@ async fn test_darkpool_resting_bid_escrow_is_not_withdrawable() -> eyre::Result<
     .await?;
 
     let bid_pending = darkpool
-        .place(ALPHA_USD_ADDRESS, PATH_USD_ADDRESS, amount, price, true)
-        .gas_price(TEMPO_T0_BASE_FEE as u128)
+        .place(ALPHA_USD_ADDRESS, PATH_USD_ADDRESS, amount, price, true, 0)
+        .gas_price(TEMPO_T1_BASE_FEE as u128)
         .gas(4_000_000)
         .send()
         .await?;
@@ -420,7 +462,7 @@ async fn test_darkpool_resting_bid_escrow_is_not_withdrawable() -> eyre::Result<
 
     let withdraw_result = darkpool
         .withdraw(PATH_USD_ADDRESS, escrow)
-        .gas_price(TEMPO_T0_BASE_FEE as u128)
+        .gas_price(TEMPO_T1_BASE_FEE as u128)
         .gas(500_000)
         .send()
         .await;
@@ -445,7 +487,7 @@ async fn test_darkpool_resting_bid_escrow_is_not_withdrawable() -> eyre::Result<
 
     let cancel_pending = darkpool
         .cancel(1)
-        .gas_price(TEMPO_T0_BASE_FEE as u128)
+        .gas_price(TEMPO_T1_BASE_FEE as u128)
         .gas(500_000)
         .send()
         .await?;
@@ -473,7 +515,7 @@ async fn test_darkpool_resting_bid_escrow_is_not_withdrawable() -> eyre::Result<
 
     let withdraw_pending = darkpool
         .withdraw(PATH_USD_ADDRESS, escrow)
-        .gas_price(TEMPO_T0_BASE_FEE as u128)
+        .gas_price(TEMPO_T1_BASE_FEE as u128)
         .gas(500_000)
         .send()
         .await?;
@@ -513,7 +555,7 @@ async fn test_darkpool_self_crossing_limit_orders_fill() -> eyre::Result<()> {
     let darkpool = TestDarkpoolOrderbook::new(DARKPOOL_ADDRESS, &provider);
 
     let amount: u128 = 1_000_000;
-    let price: u128 = 1;
+    let price: u128 = zone_precompiles::PRICE_SCALE;
 
     fixture.inject_enabled_tokens(
         zone.deposit_queue(),
@@ -547,8 +589,8 @@ async fn test_darkpool_self_crossing_limit_orders_fill() -> eyre::Result<()> {
     .await?;
 
     let bid_pending = darkpool
-        .place(ALPHA_USD_ADDRESS, PATH_USD_ADDRESS, amount, price, true)
-        .gas_price(TEMPO_T0_BASE_FEE as u128)
+        .place(ALPHA_USD_ADDRESS, PATH_USD_ADDRESS, amount, price, true, 0)
+        .gas_price(TEMPO_T1_BASE_FEE as u128)
         .gas(4_000_000)
         .send()
         .await?;
@@ -581,8 +623,8 @@ async fn test_darkpool_self_crossing_limit_orders_fill() -> eyre::Result<()> {
     assert_eq!(best_bid.quantity, amount, "full bid should be resting");
 
     let ask_pending = darkpool
-        .place(ALPHA_USD_ADDRESS, PATH_USD_ADDRESS, amount, price, false)
-        .gas_price(TEMPO_T0_BASE_FEE as u128)
+        .place(ALPHA_USD_ADDRESS, PATH_USD_ADDRESS, amount, price, false, 0)
+        .gas_price(TEMPO_T1_BASE_FEE as u128)
         .gas(4_000_000)
         .send()
         .await?;
@@ -594,20 +636,20 @@ async fn test_darkpool_self_crossing_limit_orders_fill() -> eyre::Result<()> {
         .iter()
         .find_map(|log| TestDarkpoolOrderbook::OrderSubmitted::decode_log(&log.inner).ok())
         .expect("fully filled ask should still emit OrderSubmitted");
-    let ask_matched = ask_receipt
+    let ask_fill = ask_receipt
         .logs()
         .iter()
-        .find_map(|log| TestDarkpoolOrderbook::OrderMatched::decode_log(&log.inner).ok())
-        .expect("self-crossing ask should emit OrderMatched");
+        .find_map(|log| TestDarkpoolOrderbook::OrderFilled::decode_log(&log.inner).ok())
+        .expect("self-crossing ask should emit OrderFilled");
     assert_eq!(
         ask_submitted.orderId, 2,
         "fully filled ask gets a stable id"
     );
     assert_eq!(ask_submitted.amount, amount, "submitted ask amount");
     assert!(!ask_submitted.isBid, "second submission should be an ask");
-    assert_eq!(ask_matched.makerOrderId, 1, "resting maker order id");
-    assert_eq!(ask_matched.takerOrderId, 2, "incoming taker order id");
-    assert_eq!(ask_matched.amountFilled, amount, "full ask amount filled");
+    assert_eq!(ask_fill.makerOrderId, 1, "resting maker order id");
+    assert_eq!(ask_fill.takerOrderId, 2, "incoming taker order id");
+    assert_eq!(ask_fill.amountFilled, amount, "full ask amount filled");
 
     let best_bid = darkpool
         .bestBid(ALPHA_USD_ADDRESS, PATH_USD_ADDRESS)
@@ -670,7 +712,7 @@ async fn test_darkpool_self_crossing_market_orders_fill() -> eyre::Result<()> {
     let darkpool = TestDarkpoolOrderbook::new(DARKPOOL_ADDRESS, &provider);
 
     let amount: u128 = 1_000_000;
-    let price: u128 = 1;
+    let price: u128 = zone_precompiles::PRICE_SCALE;
     let path_balance: u128 = 10_000_000;
     let alpha_balance: u128 = 2_000_000;
 
@@ -698,8 +740,8 @@ async fn test_darkpool_self_crossing_market_orders_fill() -> eyre::Result<()> {
     .await?;
 
     let ask_pending = darkpool
-        .place(ALPHA_USD_ADDRESS, PATH_USD_ADDRESS, amount, price, false)
-        .gas_price(TEMPO_T0_BASE_FEE as u128)
+        .place(ALPHA_USD_ADDRESS, PATH_USD_ADDRESS, amount, price, false, 0)
+        .gas_price(TEMPO_T1_BASE_FEE as u128)
         .gas(4_000_000)
         .send()
         .await?;
@@ -710,8 +752,8 @@ async fn test_darkpool_self_crossing_market_orders_fill() -> eyre::Result<()> {
     );
 
     let buy_pending = darkpool
-        .marketBuy(ALPHA_USD_ADDRESS, PATH_USD_ADDRESS, amount, amount * price)
-        .gas_price(TEMPO_T0_BASE_FEE as u128)
+        .marketBuy(ALPHA_USD_ADDRESS, PATH_USD_ADDRESS, amount, price, 2)
+        .gas_price(TEMPO_T1_BASE_FEE as u128)
         .gas(4_000_000)
         .send()
         .await?;
@@ -726,7 +768,8 @@ async fn test_darkpool_self_crossing_market_orders_fill() -> eyre::Result<()> {
         .iter()
         .find_map(|log| TestDarkpoolOrderbook::OrderFilled::decode_log(&log.inner).ok())
         .expect("self market buy should emit OrderFilled");
-    assert_eq!(buy_fill.orderId, 1);
+    assert_eq!(buy_fill.makerOrderId, 1);
+    assert_eq!(buy_fill.takerOrderId, 2);
     assert_eq!(buy_fill.maker, dev_address);
     assert_eq!(buy_fill.taker, dev_address);
     assert_eq!(buy_fill.amountFilled, amount);
@@ -741,8 +784,8 @@ async fn test_darkpool_self_crossing_market_orders_fill() -> eyre::Result<()> {
     );
 
     let bid_pending = darkpool
-        .place(ALPHA_USD_ADDRESS, PATH_USD_ADDRESS, amount, price, true)
-        .gas_price(TEMPO_T0_BASE_FEE as u128)
+        .place(ALPHA_USD_ADDRESS, PATH_USD_ADDRESS, amount, price, true, 0)
+        .gas_price(TEMPO_T1_BASE_FEE as u128)
         .gas(4_000_000)
         .send()
         .await?;
@@ -753,8 +796,8 @@ async fn test_darkpool_self_crossing_market_orders_fill() -> eyre::Result<()> {
     );
 
     let sell_pending = darkpool
-        .marketSell(ALPHA_USD_ADDRESS, PATH_USD_ADDRESS, amount, amount * price)
-        .gas_price(TEMPO_T0_BASE_FEE as u128)
+        .marketSell(ALPHA_USD_ADDRESS, PATH_USD_ADDRESS, amount, price, 2)
+        .gas_price(TEMPO_T1_BASE_FEE as u128)
         .gas(4_000_000)
         .send()
         .await?;
@@ -769,7 +812,8 @@ async fn test_darkpool_self_crossing_market_orders_fill() -> eyre::Result<()> {
         .iter()
         .find_map(|log| TestDarkpoolOrderbook::OrderFilled::decode_log(&log.inner).ok())
         .expect("self market sell should emit OrderFilled");
-    assert_eq!(sell_fill.orderId, 2);
+    assert_eq!(sell_fill.makerOrderId, 3);
+    assert_eq!(sell_fill.takerOrderId, 4);
     assert_eq!(sell_fill.maker, dev_address);
     assert_eq!(sell_fill.taker, dev_address);
     assert_eq!(sell_fill.amountFilled, amount);
@@ -805,6 +849,620 @@ async fn test_darkpool_self_crossing_market_orders_fill() -> eyre::Result<()> {
     Ok(())
 }
 
+/// IOC market buys keep immediate fills, cancel their remainder (including a
+/// zero-fill order), and leave unused max-price escrow available internally.
+/// A failed FOK must restore both liquidity and the next order id.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_darkpool_ioc_buy_and_fok_rollback() -> eyre::Result<()> {
+    reth_tracing::init_test_tracing();
+
+    let (zone, mut fixture) = start_local_zone_with_fixture(20).await?;
+    zone.policy_cache()
+        .write()
+        .set_token_policy(ALPHA_USD_ADDRESS, 0, ALLOW_ALL_POLICY_ID);
+
+    let maker_signer = signer_at(0)?;
+    let taker_signer = signer_at(1)?;
+    let maker = maker_signer.address();
+    let taker = taker_signer.address();
+    let maker_provider = ProviderBuilder::new()
+        .wallet(maker_signer)
+        .connect_http(zone.http_url().clone());
+    let taker_provider = ProviderBuilder::new()
+        .wallet(taker_signer)
+        .connect_http(zone.http_url().clone());
+    let maker_darkpool = TestDarkpoolOrderbook::new(DARKPOOL_ADDRESS, &maker_provider);
+    let taker_darkpool = TestDarkpoolOrderbook::new(DARKPOOL_ADDRESS, &taker_provider);
+
+    let level_amount: u128 = 500_000;
+    let requested_amount: u128 = level_amount * 2;
+    let price = zone_precompiles::PRICE_SCALE;
+    fixture.inject_enabled_tokens(zone.deposit_queue(), vec![alpha_usd_enabled_token()]);
+    fixture.inject_deposits(
+        zone.deposit_queue(),
+        vec![
+            fixture.make_deposit(PATH_USD_ADDRESS, maker, maker, requested_amount * 3),
+            fixture.make_deposit(ALPHA_USD_ADDRESS, maker, maker, level_amount * 3),
+            fixture.make_deposit(PATH_USD_ADDRESS, taker, taker, requested_amount * 3),
+            fixture.make_deposit(ALPHA_USD_ADDRESS, taker, taker, requested_amount),
+        ],
+    );
+    zone.wait_for_balance(
+        PATH_USD_ADDRESS,
+        maker,
+        U256::from(requested_amount * 3),
+        DEFAULT_TIMEOUT,
+    )
+    .await?;
+    zone.wait_for_balance(
+        ALPHA_USD_ADDRESS,
+        maker,
+        U256::from(level_amount * 3),
+        DEFAULT_TIMEOUT,
+    )
+    .await?;
+    zone.wait_for_balance(
+        PATH_USD_ADDRESS,
+        taker,
+        U256::from(requested_amount * 3),
+        DEFAULT_TIMEOUT,
+    )
+    .await?;
+    zone.wait_for_balance(
+        ALPHA_USD_ADDRESS,
+        taker,
+        U256::from(requested_amount),
+        DEFAULT_TIMEOUT,
+    )
+    .await?;
+
+    // The fixture finalizes withdrawal batches every eighth block. Keep those
+    // system-only blocks empty so this test's user transactions do not reduce
+    // the gas available to the outbox view simulation.
+    macro_rules! keep_outbox_boundary_empty {
+        () => {{
+            let block = zone.provider().get_block_number().await?;
+            if (block + 1).is_multiple_of(8) {
+                fixture.inject_empty_block(zone.deposit_queue());
+                zone.wait_for_tempo_block_number(block + 1, DEFAULT_TIMEOUT)
+                    .await?;
+            }
+        }};
+    }
+
+    keep_outbox_boundary_empty!();
+    let ask = maker_darkpool
+        .place(
+            ALPHA_USD_ADDRESS,
+            PATH_USD_ADDRESS,
+            level_amount,
+            price,
+            false,
+            0,
+        )
+        .gas_price(TEMPO_T1_BASE_FEE as u128)
+        .gas(4_000_000)
+        .send()
+        .await?;
+    fixture.inject_empty_block(zone.deposit_queue());
+    assert!(ask.get_receipt().await?.status(), "maker ask should rest");
+
+    keep_outbox_boundary_empty!();
+    let partial = taker_darkpool
+        .marketBuy(
+            ALPHA_USD_ADDRESS,
+            PATH_USD_ADDRESS,
+            requested_amount,
+            price,
+            1,
+        )
+        .gas_price(TEMPO_T1_BASE_FEE as u128)
+        .gas(5_000_000)
+        .send()
+        .await?;
+    fixture.inject_empty_block(zone.deposit_queue());
+    let partial_receipt = partial.get_receipt().await?;
+    assert!(partial_receipt.status(), "partial IOC should succeed");
+    let partial_submission = partial_receipt
+        .logs()
+        .iter()
+        .find_map(|log| TestDarkpoolOrderbook::OrderSubmitted::decode_log(&log.inner).ok())
+        .expect("partial IOC should emit OrderSubmitted");
+    let partial_fill = partial_receipt
+        .logs()
+        .iter()
+        .find_map(|log| TestDarkpoolOrderbook::OrderFilled::decode_log(&log.inner).ok())
+        .expect("partial IOC should emit OrderFilled");
+    let partial_cancel = partial_receipt
+        .logs()
+        .iter()
+        .find_map(|log| TestDarkpoolOrderbook::OrderCancelled::decode_log(&log.inner).ok())
+        .expect("partial IOC should cancel its remainder");
+    assert_eq!(partial_submission.orderId, 2);
+    assert_eq!(partial_submission.orderKind, 1);
+    assert_eq!(partial_submission.timeInForce, 1);
+    assert_eq!(partial_fill.makerOrderId, 1);
+    assert_eq!(partial_fill.takerOrderId, 2);
+    assert_eq!(partial_fill.amountFilled, level_amount);
+    assert_eq!(partial_cancel.orderId, 2);
+    assert_eq!(partial_cancel.cancelledAmount, level_amount);
+    assert_eq!(partial_cancel.reason, 1);
+    assert_eq!(
+        taker_darkpool
+            .availableBalanceOf(taker, PATH_USD_ADDRESS)
+            .from(taker)
+            .call()
+            .await?,
+        level_amount,
+        "unused max-price escrow should remain available internally"
+    );
+
+    keep_outbox_boundary_empty!();
+    let zero = taker_darkpool
+        .marketBuy(ALPHA_USD_ADDRESS, PATH_USD_ADDRESS, level_amount, price, 1)
+        .gas_price(TEMPO_T1_BASE_FEE as u128)
+        .gas(4_000_000)
+        .send()
+        .await?;
+    fixture.inject_empty_block(zone.deposit_queue());
+    let zero_receipt = zero.get_receipt().await?;
+    assert!(zero_receipt.status(), "zero-fill IOC should succeed");
+    assert!(
+        zero_receipt
+            .logs()
+            .iter()
+            .all(|log| { TestDarkpoolOrderbook::OrderFilled::decode_log(&log.inner).is_err() }),
+        "zero-fill IOC must not emit a fill"
+    );
+    let zero_cancel = zero_receipt
+        .logs()
+        .iter()
+        .find_map(|log| TestDarkpoolOrderbook::OrderCancelled::decode_log(&log.inner).ok())
+        .expect("zero-fill IOC should cancel the full request");
+    assert_eq!(zero_cancel.orderId, 3);
+    assert_eq!(zero_cancel.cancelledAmount, level_amount);
+    assert_eq!(zero_cancel.reason, 1);
+
+    keep_outbox_boundary_empty!();
+    let rollback_ask = maker_darkpool
+        .place(
+            ALPHA_USD_ADDRESS,
+            PATH_USD_ADDRESS,
+            level_amount,
+            price,
+            false,
+            0,
+        )
+        .gas_price(TEMPO_T1_BASE_FEE as u128)
+        .gas(4_000_000)
+        .send()
+        .await?;
+    fixture.inject_empty_block(zone.deposit_queue());
+    assert!(
+        rollback_ask.get_receipt().await?.status(),
+        "rollback-test ask should rest"
+    );
+
+    keep_outbox_boundary_empty!();
+    let failed_fok = taker_darkpool
+        .marketBuy(
+            ALPHA_USD_ADDRESS,
+            PATH_USD_ADDRESS,
+            requested_amount,
+            price,
+            2,
+        )
+        .gas_price(TEMPO_T1_BASE_FEE as u128)
+        .gas(5_000_000)
+        .send()
+        .await;
+    if let Ok(pending) = failed_fok {
+        fixture.inject_empty_block(zone.deposit_queue());
+        let receipt = pending.get_receipt().await?;
+        assert!(!receipt.status(), "underfilled FOK must revert");
+        assert!(
+            receipt.logs().iter().all(|log| {
+                TestDarkpoolOrderbook::OrderSubmitted::decode_log(&log.inner).is_err()
+                    && TestDarkpoolOrderbook::OrderFilled::decode_log(&log.inner).is_err()
+                    && TestDarkpoolOrderbook::OrderCancelled::decode_log(&log.inner).is_err()
+                    && TestDarkpoolOrderbook::OrderPlaced::decode_log(&log.inner).is_err()
+            }),
+            "reverted FOK must not retain darkpool logs"
+        );
+    }
+    assert_eq!(
+        maker_darkpool
+            .bestAsk(ALPHA_USD_ADDRESS, PATH_USD_ADDRESS)
+            .call()
+            .await?
+            .quantity,
+        level_amount,
+        "failed FOK must not consume maker liquidity"
+    );
+
+    keep_outbox_boundary_empty!();
+    let next_ask = maker_darkpool
+        .place(
+            ALPHA_USD_ADDRESS,
+            PATH_USD_ADDRESS,
+            level_amount,
+            price,
+            false,
+            0,
+        )
+        .gas_price(TEMPO_T1_BASE_FEE as u128)
+        .gas(4_000_000)
+        .send()
+        .await?;
+    fixture.inject_empty_block(zone.deposit_queue());
+    let next_receipt = next_ask.get_receipt().await?;
+    assert!(next_receipt.status(), "next ask should succeed");
+    let next_submission = next_receipt
+        .logs()
+        .iter()
+        .find_map(|log| TestDarkpoolOrderbook::OrderSubmitted::decode_log(&log.inner).ok())
+        .expect("next ask should emit OrderSubmitted");
+    assert_eq!(
+        next_submission.orderId, 5,
+        "failed FOK must roll back its allocated order id"
+    );
+
+    let bid_price = price - 1;
+    keep_outbox_boundary_empty!();
+    let bid = maker_darkpool
+        .place(
+            ALPHA_USD_ADDRESS,
+            PATH_USD_ADDRESS,
+            level_amount,
+            bid_price,
+            true,
+            0,
+        )
+        .gas_price(TEMPO_T1_BASE_FEE as u128)
+        .gas(4_000_000)
+        .send()
+        .await?;
+    fixture.inject_empty_block(zone.deposit_queue());
+    assert!(bid.get_receipt().await?.status(), "maker bid should rest");
+
+    keep_outbox_boundary_empty!();
+    let partial_sell = taker_darkpool
+        .marketSell(
+            ALPHA_USD_ADDRESS,
+            PATH_USD_ADDRESS,
+            requested_amount,
+            bid_price,
+            1,
+        )
+        .gas_price(TEMPO_T1_BASE_FEE as u128)
+        .gas(5_000_000)
+        .send()
+        .await?;
+    fixture.inject_empty_block(zone.deposit_queue());
+    let partial_sell_receipt = partial_sell.get_receipt().await?;
+    assert!(
+        partial_sell_receipt.status(),
+        "partial sell IOC should succeed"
+    );
+    let sell_fill = partial_sell_receipt
+        .logs()
+        .iter()
+        .find_map(|log| TestDarkpoolOrderbook::OrderFilled::decode_log(&log.inner).ok())
+        .expect("partial sell IOC should emit OrderFilled");
+    let sell_cancel = partial_sell_receipt
+        .logs()
+        .iter()
+        .find_map(|log| TestDarkpoolOrderbook::OrderCancelled::decode_log(&log.inner).ok())
+        .expect("partial sell IOC should cancel its remainder");
+    assert_eq!(sell_fill.makerOrderId, 6);
+    assert_eq!(sell_fill.takerOrderId, 7);
+    assert_eq!(sell_fill.amountFilled, level_amount);
+    assert_eq!(sell_cancel.orderId, 7);
+    assert_eq!(sell_cancel.cancelledAmount, level_amount);
+    assert_eq!(sell_cancel.reason, 1);
+
+    keep_outbox_boundary_empty!();
+    let zero_sell = taker_darkpool
+        .marketSell(ALPHA_USD_ADDRESS, PATH_USD_ADDRESS, level_amount, 0, 1)
+        .gas_price(TEMPO_T1_BASE_FEE as u128)
+        .gas(4_000_000)
+        .send()
+        .await?;
+    fixture.inject_empty_block(zone.deposit_queue());
+    let zero_sell_receipt = zero_sell.get_receipt().await?;
+    assert!(
+        zero_sell_receipt.status(),
+        "zero-fill sell IOC should succeed"
+    );
+    assert!(
+        zero_sell_receipt
+            .logs()
+            .iter()
+            .all(|log| { TestDarkpoolOrderbook::OrderFilled::decode_log(&log.inner).is_err() }),
+        "zero-fill sell IOC must not emit a fill"
+    );
+    let zero_sell_cancel = zero_sell_receipt
+        .logs()
+        .iter()
+        .find_map(|log| TestDarkpoolOrderbook::OrderCancelled::decode_log(&log.inner).ok())
+        .expect("zero-fill sell IOC should cancel the full request");
+    assert_eq!(zero_sell_cancel.orderId, 8);
+    assert_eq!(zero_sell_cancel.cancelledAmount, level_amount);
+    assert_eq!(zero_sell_cancel.reason, 1);
+
+    Ok(())
+}
+
+/// Fractional-price market orders must consume every eligible level in price
+/// priority without creating or destroying base or quote inventory.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_darkpool_market_orders_cross_fractional_price_levels() -> eyre::Result<()> {
+    reth_tracing::init_test_tracing();
+
+    let (zone, mut fixture) = start_local_zone_with_fixture(20).await?;
+    zone.policy_cache()
+        .write()
+        .set_token_policy(ALPHA_USD_ADDRESS, 0, ALLOW_ALL_POLICY_ID);
+
+    let maker_signer = signer_at(0)?;
+    let taker_signer = signer_at(1)?;
+    let maker = maker_signer.address();
+    let taker = taker_signer.address();
+    let level_amount: u128 = 1_000_000;
+    let total_amount = level_amount * 2;
+    let lower_price: u128 = 999_900;
+    let higher_price: u128 = 1_000_100;
+    let total_quote = level_amount * lower_price / zone_precompiles::PRICE_SCALE
+        + level_amount * higher_price / zone_precompiles::PRICE_SCALE;
+    let max_quote_in = (total_amount * higher_price).div_ceil(zone_precompiles::PRICE_SCALE);
+    let path_deposit: u128 = 10_000_000;
+
+    fixture.inject_enabled_tokens(zone.deposit_queue(), vec![alpha_usd_enabled_token()]);
+    fixture.inject_deposits(
+        zone.deposit_queue(),
+        vec![
+            fixture.make_deposit(PATH_USD_ADDRESS, maker, maker, path_deposit),
+            fixture.make_deposit(PATH_USD_ADDRESS, taker, taker, path_deposit),
+            fixture.make_deposit(ALPHA_USD_ADDRESS, maker, maker, total_amount),
+        ],
+    );
+    for account in [maker, taker] {
+        zone.wait_for_balance(
+            PATH_USD_ADDRESS,
+            account,
+            U256::from(path_deposit),
+            DEFAULT_TIMEOUT,
+        )
+        .await?;
+    }
+    zone.wait_for_balance(
+        ALPHA_USD_ADDRESS,
+        maker,
+        U256::from(total_amount),
+        DEFAULT_TIMEOUT,
+    )
+    .await?;
+
+    let maker_provider = ProviderBuilder::new()
+        .wallet(maker_signer)
+        .connect_http(zone.http_url().clone());
+    let taker_provider = ProviderBuilder::new()
+        .wallet(taker_signer)
+        .connect_http(zone.http_url().clone());
+    let maker_darkpool = TestDarkpoolOrderbook::new(DARKPOOL_ADDRESS, &maker_provider);
+    let taker_darkpool = TestDarkpoolOrderbook::new(DARKPOOL_ADDRESS, &taker_provider);
+
+    for price in [higher_price, lower_price] {
+        let pending = maker_darkpool
+            .place(
+                ALPHA_USD_ADDRESS,
+                PATH_USD_ADDRESS,
+                level_amount,
+                price,
+                false,
+                0,
+            )
+            .gas_price(TEMPO_T1_BASE_FEE as u128)
+            .gas(4_000_000)
+            .send()
+            .await?;
+        fixture.inject_empty_block(zone.deposit_queue());
+        assert!(
+            pending.get_receipt().await?.status(),
+            "maker ask should rest"
+        );
+    }
+
+    let buy_pending = taker_darkpool
+        .marketBuy(
+            ALPHA_USD_ADDRESS,
+            PATH_USD_ADDRESS,
+            total_amount,
+            higher_price,
+            2,
+        )
+        .gas_price(TEMPO_T1_BASE_FEE as u128)
+        .gas(6_000_000)
+        .send()
+        .await?;
+    fixture.inject_empty_block(zone.deposit_queue());
+    let buy_receipt = buy_pending.get_receipt().await?;
+    assert!(buy_receipt.status(), "market buy should consume both asks");
+    let buy_fills = buy_receipt
+        .logs()
+        .iter()
+        .filter_map(|log| TestDarkpoolOrderbook::OrderFilled::decode_log(&log.inner).ok())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        buy_fills.len(),
+        2,
+        "market buy should span two price levels"
+    );
+    assert_eq!(
+        buy_fills[0].price, lower_price,
+        "cheapest ask should fill first"
+    );
+    assert_eq!(buy_fills[1].price, higher_price);
+    assert!(
+        buy_fills
+            .iter()
+            .all(|fill| fill.amountFilled == level_amount)
+    );
+    assert_eq!(
+        maker_darkpool
+            .availableBalanceOf(maker, PATH_USD_ADDRESS)
+            .from(maker)
+            .call()
+            .await?,
+        total_quote,
+        "maker should receive exactly the sum of fixed-point fill amounts"
+    );
+    assert_eq!(
+        taker_darkpool
+            .availableBalanceOf(taker, ALPHA_USD_ADDRESS)
+            .from(taker)
+            .call()
+            .await?,
+        total_amount,
+        "market buyer should receive every purchased base unit"
+    );
+    assert_eq!(
+        taker_darkpool
+            .availableBalanceOf(taker, PATH_USD_ADDRESS)
+            .from(taker)
+            .call()
+            .await?,
+        max_quote_in - total_quote,
+        "price improvement must remain available to the market buyer"
+    );
+
+    for price in [lower_price, higher_price] {
+        let pending = maker_darkpool
+            .place(
+                ALPHA_USD_ADDRESS,
+                PATH_USD_ADDRESS,
+                level_amount,
+                price,
+                true,
+                0,
+            )
+            .gas_price(TEMPO_T1_BASE_FEE as u128)
+            .gas(4_000_000)
+            .send()
+            .await?;
+        fixture.inject_empty_block(zone.deposit_queue());
+        assert!(
+            pending.get_receipt().await?.status(),
+            "maker bid should rest"
+        );
+    }
+
+    // The local fixture finalizes withdrawal batches every eighth block; keep
+    // that unrelated system-only boundary separate from the market-order test.
+    let block_before_sell = zone.provider().get_block_number().await?;
+    if (block_before_sell + 1).is_multiple_of(8) {
+        fixture.inject_empty_block(zone.deposit_queue());
+        zone.wait_for_tempo_block_number(block_before_sell + 1, DEFAULT_TIMEOUT)
+            .await?;
+    }
+
+    let sell_pending = taker_darkpool
+        .marketSell(
+            ALPHA_USD_ADDRESS,
+            PATH_USD_ADDRESS,
+            total_amount,
+            lower_price,
+            2,
+        )
+        .gas_price(TEMPO_T1_BASE_FEE as u128)
+        .gas(6_000_000)
+        .send()
+        .await?;
+    fixture.inject_empty_block(zone.deposit_queue());
+    let sell_receipt = sell_pending.get_receipt().await?;
+    assert!(
+        sell_receipt.status(),
+        "market sell should consume both bids"
+    );
+    let sell_fills = sell_receipt
+        .logs()
+        .iter()
+        .filter_map(|log| TestDarkpoolOrderbook::OrderFilled::decode_log(&log.inner).ok())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        sell_fills.len(),
+        2,
+        "market sell should span two price levels"
+    );
+    assert_eq!(
+        sell_fills[0].price, higher_price,
+        "highest bid should fill first"
+    );
+    assert_eq!(sell_fills[1].price, lower_price);
+    assert!(
+        sell_fills
+            .iter()
+            .all(|fill| fill.amountFilled == level_amount)
+    );
+
+    assert_eq!(
+        maker_darkpool
+            .availableBalanceOf(maker, ALPHA_USD_ADDRESS)
+            .from(maker)
+            .call()
+            .await?,
+        total_amount,
+        "the original maker must recover exactly its initial base inventory"
+    );
+    assert_eq!(
+        taker_darkpool
+            .availableBalanceOf(taker, ALPHA_USD_ADDRESS)
+            .from(taker)
+            .call()
+            .await?,
+        0,
+        "the taker must not retain or create base after the round trip"
+    );
+    assert_eq!(
+        maker_darkpool
+            .availableBalanceOf(maker, PATH_USD_ADDRESS)
+            .from(maker)
+            .call()
+            .await?,
+        0,
+        "maker quote proceeds must back and settle its replacement bids exactly"
+    );
+    assert_eq!(
+        taker_darkpool
+            .availableBalanceOf(taker, PATH_USD_ADDRESS)
+            .from(taker)
+            .call()
+            .await?,
+        max_quote_in,
+        "the taker must recover both fills plus its unspent buy reserve"
+    );
+    assert_eq!(
+        taker_darkpool
+            .bestBid(ALPHA_USD_ADDRESS, PATH_USD_ADDRESS)
+            .call()
+            .await?
+            .quantity,
+        0,
+        "market sell should fully consume both bid levels"
+    );
+    assert_eq!(
+        taker_darkpool
+            .bestAsk(ALPHA_USD_ADDRESS, PATH_USD_ADDRESS)
+            .call()
+            .await?
+            .quantity,
+        0,
+        "market buy should fully consume both ask levels"
+    );
+
+    Ok(())
+}
+
 /// Limit-order matching must preserve price-time priority across multiple
 /// makers and multiple taker submissions.
 #[tokio::test(flavor = "multi_thread")]
@@ -829,7 +1487,7 @@ async fn test_darkpool_multi_maker_multi_taker_fill_ordering() -> eyre::Result<(
     let path_deposit: u128 = 10_000_000;
     let maker_one_amount: u128 = 300_000;
     let maker_two_amount: u128 = 400_000;
-    let price: u128 = 2;
+    let price: u128 = 2 * zone_precompiles::PRICE_SCALE;
 
     fixture.inject_enabled_tokens(zone.deposit_queue(), vec![alpha_usd_enabled_token()]);
     fixture.inject_deposits(
@@ -887,8 +1545,9 @@ async fn test_darkpool_multi_maker_multi_taker_fill_ordering() -> eyre::Result<(
             maker_one_amount,
             price,
             false,
+            0,
         )
-        .gas_price(TEMPO_T0_BASE_FEE as u128)
+        .gas_price(TEMPO_T1_BASE_FEE as u128)
         .gas(4_000_000)
         .send()
         .await?;
@@ -903,8 +1562,9 @@ async fn test_darkpool_multi_maker_multi_taker_fill_ordering() -> eyre::Result<(
             maker_two_amount,
             price,
             false,
+            0,
         )
-        .gas_price(TEMPO_T0_BASE_FEE as u128)
+        .gas_price(TEMPO_T1_BASE_FEE as u128)
         .gas(4_000_000)
         .send()
         .await?;
@@ -920,8 +1580,9 @@ async fn test_darkpool_multi_maker_multi_taker_fill_ordering() -> eyre::Result<(
             taker_one_fill,
             price,
             true,
+            0,
         )
-        .gas_price(TEMPO_T0_BASE_FEE as u128)
+        .gas_price(TEMPO_T1_BASE_FEE as u128)
         .gas(4_000_000)
         .send()
         .await?;
@@ -932,30 +1593,30 @@ async fn test_darkpool_multi_maker_multi_taker_fill_ordering() -> eyre::Result<(
         "first taker bid should fill across both makers"
     );
 
-    let taker_one_matches = taker_one_receipt
+    let taker_one_fills = taker_one_receipt
         .logs()
         .iter()
-        .filter_map(|log| TestDarkpoolOrderbook::OrderMatched::decode_log(&log.inner).ok())
+        .filter_map(|log| TestDarkpoolOrderbook::OrderFilled::decode_log(&log.inner).ok())
         .collect::<Vec<_>>();
     assert_eq!(
-        taker_one_matches.len(),
+        taker_one_fills.len(),
         2,
         "first taker should consume maker one, then maker two"
     );
-    assert_eq!(taker_one_matches[0].makerOrderId, 1, "oldest ask first");
-    assert_eq!(taker_one_matches[0].takerOrderId, 3);
-    assert_eq!(taker_one_matches[0].maker, maker_one);
-    assert_eq!(taker_one_matches[0].taker, taker_one);
-    assert_eq!(taker_one_matches[0].amountFilled, maker_one_amount);
+    assert_eq!(taker_one_fills[0].makerOrderId, 1, "oldest ask first");
+    assert_eq!(taker_one_fills[0].takerOrderId, 3);
+    assert_eq!(taker_one_fills[0].maker, maker_one);
+    assert_eq!(taker_one_fills[0].taker, taker_one);
+    assert_eq!(taker_one_fills[0].amountFilled, maker_one_amount);
     assert_eq!(
-        taker_one_matches[1].makerOrderId, 2,
+        taker_one_fills[1].makerOrderId, 2,
         "second ask supplies the remainder"
     );
-    assert_eq!(taker_one_matches[1].takerOrderId, 3);
-    assert_eq!(taker_one_matches[1].maker, maker_two);
-    assert_eq!(taker_one_matches[1].taker, taker_one);
+    assert_eq!(taker_one_fills[1].takerOrderId, 3);
+    assert_eq!(taker_one_fills[1].maker, maker_two);
+    assert_eq!(taker_one_fills[1].taker, taker_one);
     assert_eq!(
-        taker_one_matches[1].amountFilled,
+        taker_one_fills[1].amountFilled,
         taker_one_fill - maker_one_amount
     );
 
@@ -974,8 +1635,9 @@ async fn test_darkpool_multi_maker_multi_taker_fill_ordering() -> eyre::Result<(
             remaining_maker_two,
             price,
             true,
+            0,
         )
-        .gas_price(TEMPO_T0_BASE_FEE as u128)
+        .gas_price(TEMPO_T1_BASE_FEE as u128)
         .gas(4_000_000)
         .send()
         .await?;
@@ -986,17 +1648,17 @@ async fn test_darkpool_multi_maker_multi_taker_fill_ordering() -> eyre::Result<(
         "second taker bid should consume maker two residual"
     );
 
-    let taker_two_matches = taker_two_receipt
+    let taker_two_fills = taker_two_receipt
         .logs()
         .iter()
-        .filter_map(|log| TestDarkpoolOrderbook::OrderMatched::decode_log(&log.inner).ok())
+        .filter_map(|log| TestDarkpoolOrderbook::OrderFilled::decode_log(&log.inner).ok())
         .collect::<Vec<_>>();
-    assert_eq!(taker_two_matches.len(), 1);
-    assert_eq!(taker_two_matches[0].makerOrderId, 2);
-    assert_eq!(taker_two_matches[0].takerOrderId, 4);
-    assert_eq!(taker_two_matches[0].maker, maker_two);
-    assert_eq!(taker_two_matches[0].taker, taker_two);
-    assert_eq!(taker_two_matches[0].amountFilled, remaining_maker_two);
+    assert_eq!(taker_two_fills.len(), 1);
+    assert_eq!(taker_two_fills[0].makerOrderId, 2);
+    assert_eq!(taker_two_fills[0].takerOrderId, 4);
+    assert_eq!(taker_two_fills[0].maker, maker_two);
+    assert_eq!(taker_two_fills[0].taker, taker_two);
+    assert_eq!(taker_two_fills[0].amountFilled, remaining_maker_two);
 
     let best_bid = taker_two_darkpool
         .bestBid(ALPHA_USD_ADDRESS, PATH_USD_ADDRESS)
@@ -1033,7 +1695,7 @@ async fn test_darkpool_partial_fill_then_cancel_reconstructs_from_events() -> ey
     let amount: u128 = 1_000_000;
     let first_fill: u128 = 300_000;
     let second_fill: u128 = 400_000;
-    let price: u128 = 2;
+    let price: u128 = 2 * zone_precompiles::PRICE_SCALE;
     let path_deposit: u128 = 10_000_000;
 
     fixture.inject_enabled_tokens(zone.deposit_queue(), vec![alpha_usd_enabled_token()]);
@@ -1077,8 +1739,8 @@ async fn test_darkpool_partial_fill_then_cancel_reconstructs_from_events() -> ey
     let taker_two_darkpool = TestDarkpoolOrderbook::new(DARKPOOL_ADDRESS, &taker_two_provider);
 
     let ask_pending = maker_darkpool
-        .place(ALPHA_USD_ADDRESS, PATH_USD_ADDRESS, amount, price, false)
-        .gas_price(TEMPO_T0_BASE_FEE as u128)
+        .place(ALPHA_USD_ADDRESS, PATH_USD_ADDRESS, amount, price, false, 0)
+        .gas_price(TEMPO_T1_BASE_FEE as u128)
         .gas(4_000_000)
         .send()
         .await?;
@@ -1087,8 +1749,15 @@ async fn test_darkpool_partial_fill_then_cancel_reconstructs_from_events() -> ey
     assert!(ask_receipt.status(), "maker ask should rest");
 
     let first_bid_pending = taker_one_darkpool
-        .place(ALPHA_USD_ADDRESS, PATH_USD_ADDRESS, first_fill, price, true)
-        .gas_price(TEMPO_T0_BASE_FEE as u128)
+        .place(
+            ALPHA_USD_ADDRESS,
+            PATH_USD_ADDRESS,
+            first_fill,
+            price,
+            true,
+            0,
+        )
+        .gas_price(TEMPO_T1_BASE_FEE as u128)
         .gas(4_000_000)
         .send()
         .await?;
@@ -1106,8 +1775,9 @@ async fn test_darkpool_partial_fill_then_cancel_reconstructs_from_events() -> ey
             second_fill,
             price,
             true,
+            0,
         )
-        .gas_price(TEMPO_T0_BASE_FEE as u128)
+        .gas_price(TEMPO_T1_BASE_FEE as u128)
         .gas(4_000_000)
         .send()
         .await?;
@@ -1141,7 +1811,7 @@ async fn test_darkpool_partial_fill_then_cancel_reconstructs_from_events() -> ey
         order.remaining,
         U128::from(amount - first_fill - second_fill)
     );
-    assert_eq!(order.price, U128::from(price));
+    assert_eq!(order.price_limit, U128::from(price));
     assert_eq!(order.cancel_tx_hash, None);
 
     let live_order = maker_darkpool.getOrder(1).from(maker).call().await?;
@@ -1153,7 +1823,7 @@ async fn test_darkpool_partial_fill_then_cancel_reconstructs_from_events() -> ey
 
     let cancel_pending = maker_darkpool
         .cancel(1)
-        .gas_price(TEMPO_T0_BASE_FEE as u128)
+        .gas_price(TEMPO_T1_BASE_FEE as u128)
         .gas(500_000)
         .send()
         .await?;

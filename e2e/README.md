@@ -64,19 +64,21 @@ Useful overrides:
 PATHUSD_AMOUNT=10000000 \
 ALPHAUSD_AMOUNT=10000000 \
 ORDER_AMOUNT=1000000 \
-SELL_PRICE=2 \
-BUY_PRICE=1 \
+SELL_PRICE=2000000 \
+BUY_PRICE=1000000 \
 MARKET_ORDER_AMOUNT=1000000 \
 MARKET_ASK_PRICE=2 \
 MARKET_BID_PRICE=3 \
-MARKET_BUY_MAX_QUOTE_IN=2000000 \
-MARKET_SELL_MIN_QUOTE_OUT=3000000 \
+MARKET_BUY_MAX_PRICE=2000000 \
+MARKET_SELL_MIN_PRICE=3000000 \
 MAKER_PATHUSD_AMOUNT=5000000 \
 MAKER_ALPHAUSD_AMOUNT=1000000 \
 ./e2e/account-flow.sh
 ```
 
 Amounts are token sub-units. The defaults assume 6-decimal test tokens.
+Darkpool prices are also six-decimal fixed-point per-unit values. Market
+protection overrides are worst execution prices, not total quote budgets.
 
 The script estimates gas and adds headroom before each write. If estimation
 fails, these fallbacks are used and can be overridden:

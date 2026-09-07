@@ -38,7 +38,7 @@ pub mod ztip20;
 
 pub use aes_gcm::{AES_GCM_DECRYPT_ADDRESS, AesGcmDecrypt};
 pub use chaum_pedersen::{CHAUM_PEDERSEN_VERIFY_ADDRESS, ChaumPedersenVerify};
-pub use orderbook::{DARKPOOL_ADDRESS, DarkpoolOrderbook};
+pub use orderbook::{DARKPOOL_ADDRESS, DarkpoolOrderbook, PRICE_DECIMALS, PRICE_SCALE};
 pub use refprice::{GuardrailRejection, ReferencePrice, ReferencePriceGuard};
 pub use tempo_state::{L1StorageReader, TempoState};
 pub use tip20_factory::{ZONE_TIP20_FACTORY_ADDRESS, ZoneTokenFactory};

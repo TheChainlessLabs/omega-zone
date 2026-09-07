@@ -90,8 +90,9 @@ The app should check the approval receipt and confirm `allowance(owner, portal)
 
 ## Private RPC Authorization
 
-The private zone RPC requires an `X-Authorization-Token` header. Build the token
-by asking Tempo Wallet to `personal_sign` a zone-session digest.
+The private zone RPC requires an `X-Authorization-Token` header. Omega uses the
+version-1 EIP-712 token and asks Tempo Wallet to sign `ZoneRPCAuth` typed data
+with `eth_signTypedData_v4`.
 
 The signed digest fields are:
 
@@ -112,12 +113,28 @@ The token sent to the RPC is:
 <signature bytes><fields bytes>
 ```
 
-Minimal provider request:
+Minimal provider request (the domain chain ID is the Zone chain ID):
 
 ```ts
 const signature = await provider.request({
-  method: "personal_sign",
-  params: [digestHex, address],
+  method: "eth_signTypedData_v4",
+  params: [address, JSON.stringify({
+    domain: { name: "TempoZoneRPC", version: "1", chainId },
+    types: {
+      EIP712Domain: [
+        { name: "name", type: "string" },
+        { name: "version", type: "string" },
+        { name: "chainId", type: "uint256" },
+      ],
+      ZoneRPCAuth: [
+        { name: "zoneId", type: "uint32" },
+        { name: "issuedAt", type: "uint64" },
+        { name: "expiresAt", type: "uint64" },
+      ],
+    },
+    primaryType: "ZoneRPCAuth",
+    message: { zoneId, issuedAt, expiresAt },
+  })],
 });
 ```
 
@@ -187,10 +204,10 @@ Current darkpool selectors:
 const darkpoolScopes = [
   { address: DARKPOOL, selector: toFunctionSelector("deposit(address,uint128)") },
   { address: DARKPOOL, selector: toFunctionSelector("withdraw(address,uint128)") },
-  { address: DARKPOOL, selector: toFunctionSelector("place(address,uint128,uint128,bool)") },
+  { address: DARKPOOL, selector: toFunctionSelector("place(address,address,uint128,uint128,bool,uint8)") },
   { address: DARKPOOL, selector: toFunctionSelector("cancel(uint128)") },
-  { address: DARKPOOL, selector: toFunctionSelector("marketBuy(address,uint128,uint128)") },
-  { address: DARKPOOL, selector: toFunctionSelector("marketSell(address,uint128,uint128)") },
+  { address: DARKPOOL, selector: toFunctionSelector("marketBuy(address,address,uint128,uint128,uint8)") },
+  { address: DARKPOOL, selector: toFunctionSelector("marketSell(address,address,uint128,uint128,uint8)") },
 ];
 ```
 
@@ -214,6 +231,15 @@ await provider.request({
   ],
 });
 ```
+
+For request-specific validation and balance checks, derive the token exposure
+from the encoded action. A market buy reserves
+`ceil(amount * maxPrice / 1_000_000)` quote units, a market sell exposes
+`amount` base units, a limit bid reserves `ceil(amount * price / 1_000_000)`,
+and a limit ask exposes `amount` base units. `maxPrice` is the reviewed per-unit
+protection price; it is not a total quote budget. The reusable 24-hour key may
+still advertise `UINT128_MAX`, but scopes remain restricted to the selected
+TIP-20 approvals, darkpool selectors, and outbox selector.
 
 After authorization, read the local access key from the provider store. The
 current frontend expects an entry with:
@@ -286,7 +312,7 @@ matches the account that signed the `X-Authorization-Token`.
 
 | Error | Meaning | Fix |
 |---|---|---|
-| `Unauthorized` / HTTP 401 or 403 | Missing, expired, or wrong auth token | Ask Tempo Wallet for a fresh `personal_sign` session token. |
+| `Unauthorized` / HTTP 401 or 403 | Missing, expired, or wrong auth token | Ask Tempo Wallet for a fresh EIP-712 `ZoneRPCAuth` signature. |
 | `Transaction rejected` | Raw transaction sender does not match the auth-token account | Sign the transaction with the same root/access account for the connected wallet. |
 | `does not hold caller signing keys` | App called `eth_sendTransaction` or `eth_signTransaction` on the private RPC | Locally sign and submit `eth_sendRawTransaction`. |
 | `Account mismatch` | `eth_call` / `eth_estimateGas` used the wrong `from` | Set `from` to the connected account or omit it where allowed. |
@@ -298,7 +324,7 @@ matches the account that signed the `X-Authorization-Token`.
 
 1. Connect Tempo Wallet.
 2. Register and switch to the zone chain.
-3. Ask Tempo Wallet to `personal_sign` a private RPC session token.
+3. Ask Tempo Wallet to sign the EIP-712 `ZoneRPCAuth` private RPC session token.
 4. For darkpool writes, call `wallet_authorizeAccessKey` with darkpool scopes.
 5. Encode the darkpool call.
 6. Estimate gas against the zone public client and add a buffer.

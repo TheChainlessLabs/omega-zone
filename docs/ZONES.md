@@ -356,23 +356,19 @@ The private zone RPC never owns user signing keys. Wallet flows must follow the 
 
 ##### Authorization token
 
-The token is a hex blob of `<signature><version:1><zoneId:4><chainId:8><issuedAt:8><expiresAt:8>` (29 fixed bytes plus a variable-length signature suffix). All multi-byte integers are big-endian. The signing message is `keccak256("TempoZoneRPC"-padded-to-32 || fields)`.
+The version-1 token is a hex blob of `<signature><version:1><zoneId:4><chainId:8><issuedAt:8><expiresAt:8>` (29 fixed bytes plus a variable-length signature suffix). All multi-byte integers are big-endian. Its signature is over EIP-712 typed data with domain `{ name: "TempoZoneRPC", version: "1", chainId }` and primary type `ZoneRPCAuth(uint32 zoneId,uint64 issuedAt,uint64 expiresAt)`.
 
-Sign with one of:
-
-- A secp256k1 signature over the raw 32-byte digest, **or**
-- An EIP-191 `personal_sign` of the same digest (`keccak256("\x19Ethereum Signed Message:\n32" || digest)`), **or**
-- A P-256 / WebAuthn / keychain signature for accounts that authorise via `AccountKeychain`.
-
-The server accepts both the raw and the EIP-191-prefixed recovery paths, so `personal_sign` from injected wallets and `eth_signMessage` from server-side signers both work. Submit the token in the `X-Authorization-Token` HTTP header (case-insensitive) on every call. Token TTL is capped server-side at `private-rpc.max-auth-token-validity-secs` (default 30 days).
-
-The protocol prefix string "TempoZoneRPC" is the authoritative scheme name; treat any "Ethereum Sign" phrasing in older docs as describing the optional EIP-191 wrapping, not a separate format.
+Use `eth_signTypedData_v4` for interactive wallet integrations. The server also
+retains version-0 raw/EIP-191 verification for legacy clients. Submit the token
+in the `X-Authorization-Token` HTTP header (case-insensitive) on every call.
+Token TTL is capped server-side at `private-rpc.max-auth-token-validity-secs`
+(default 30 days).
 
 ##### Submitting transactions
 
 ```
 1. Wallet authorises the session
-   └─> wallet personal_signs the token digest → frontend caches the token
+   └─> wallet signs EIP-712 ZoneRPCAuth typed data → frontend caches the token
 
 2. Frontend builds a transaction off the zone:
    └─> nonce       → eth_getTransactionCount via the private RPC
@@ -428,7 +424,7 @@ The zone is a stand-alone EVM chain. Wallets discover it via `wallet_addEthereum
 
 The frontend in this repo demonstrates each step:
 
-- `frontend/lib/zone-auth.ts` — builds the authorization token digest, calls `personal_sign`, caches the token in `sessionStorage`, retries once on a token-expiry error.
+- `frontend/lib/zone-auth.ts` — builds the EIP-712 authorization typed data, calls `eth_signTypedData_v4`, caches the token in `sessionStorage`, and retries once on a token-expiry error.
 - `frontend/lib/config.ts` — wagmi `defineChain` for the zone and the Tempo L1 chain.
 - `frontend/components/darkpool-dashboard.tsx` — `signAndSubmitWithAccessKey` builds a Tempo-typed transaction, signs it with the access-key keypair, then POSTs `eth_sendRawTransaction` to the private RPC via `zonePrivateRpc`.
 

@@ -135,7 +135,15 @@
     "pragueTime": 0,
     "shanghaiTime": 0,
     "terminalTotalDifficulty": 0,
-    "terminalTotalDifficultyPassed": true
+    "terminalTotalDifficultyPassed": true,
+    "t0Time": 0,
+    "t1Time": 0,
+    "t1aTime": 0,
+    "t1bTime": 0,
+    "t1cTime": 0,
+    "t2Time": 0,
+    "t3Time": 0,
+    "t4Time": 0
   },
   "difficulty": "0x0",
   "extraData": "0x74656d706f2d7a6f6e652d67656e65736973",

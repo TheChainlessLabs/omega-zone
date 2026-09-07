@@ -309,8 +309,8 @@ pub struct ZoneArgs {
     )]
     pub proof_tee_format: TeeAttestationFormat,
 
-    /// Static reference price (raw integer, same units as the orderbook
-    /// precompile) for the configured darkpool market. When unset, the
+    /// Static reference price (six-decimal fixed-point integer, same units as
+    /// the orderbook precompile) for the configured darkpool market. When unset, the
     /// reference-price provider stays disabled and `zone_getReferencePrice`
     /// returns `enabled: false`. Setting this opts into the static provider.
     #[arg(long = "ref-price.static-price", env = "REF_PRICE_STATIC_PRICE")]
@@ -432,7 +432,7 @@ mod tests {
 
     #[test]
     fn ref_price_provider_propagates_custom_source_tag() {
-        let provider = build_ref_price_provider(Some(1), "static:demo-pin", 0, 0)
+        let provider = build_ref_price_provider(Some(1_000_000), "static:demo-pin", 0, 0)
             .expect("provider must be present when price is set");
         match provider.kind {
             ReferencePriceProviderKind::Static { source, .. } => {

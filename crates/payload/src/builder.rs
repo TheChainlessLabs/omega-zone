@@ -399,8 +399,14 @@ where
         if has_prior_withdrawals
             || block_number.is_multiple_of(self.withdrawal_batch_interval_blocks)
         {
-            let pending_withdrawals =
-                read_pending_withdrawals_from_outbox(&mut builder, block_gas_limit, block_number)?;
+            // The block builder has already committed pool transactions at this
+            // point. Passing the full block limit makes the read-only system
+            // call fail validation whenever any user transaction consumed gas.
+            let pending_withdrawals = read_pending_withdrawals_from_outbox(
+                &mut builder,
+                remaining_block_gas(block_gas_limit, cumulative_gas_used),
+                block_number,
+            )?;
             let encrypted_senders = pending_withdrawals
                 .iter()
                 .map(|request| {
@@ -541,6 +547,10 @@ where
         .into_payload()
         .ok_or_else(|| PayloadBuilderError::MissingPayload)
     }
+}
+
+fn remaining_block_gas(block_gas_limit: u64, cumulative_gas_used: u64) -> u64 {
+    block_gas_limit.saturating_sub(cumulative_gas_used)
 }
 
 /// Build the `finalizeWithdrawalBatch(count)` system transaction.
@@ -734,6 +744,15 @@ mod tests {
             super::ZonePayloadFactory::new(0).withdrawal_batch_interval_blocks,
             1
         );
+    }
+
+    #[test]
+    fn outbox_view_gas_is_capped_to_the_remaining_block_budget() {
+        assert_eq!(
+            super::remaining_block_gas(30_000_000, 1_673_121),
+            28_326_879
+        );
+        assert_eq!(super::remaining_block_gas(30_000_000, 31_000_000), 0);
     }
 
     /// Verify that `build_advance_tempo_tx` constructs valid calldata for mixed

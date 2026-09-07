@@ -18,7 +18,7 @@ use alloy_primitives::{Address, B256, Bloom, Bytes, U64, U128, U256};
 use alloy_provider::{DynProvider, Provider, ProviderBuilder};
 use alloy_rpc_types_eth::{
     Block, BlockId, BlockNumberOrTag, BlockTransactions, FeeHistory, Filter, FilterChanges,
-    FilterId, TransactionRequest,
+    FilterId, Log, TransactionRequest,
     state::{EvmOverrides, StateOverride},
 };
 use alloy_sol_types::{SolCall, SolEvent, SolEventInterface};
@@ -47,7 +47,7 @@ use tokio::{
     sync::Mutex,
     time::{MissedTickBehavior, interval},
 };
-use zone_precompiles::DARKPOOL_ADDRESS;
+use zone_precompiles::{DARKPOOL_ADDRESS, PRICE_DECIMALS, PRICE_SCALE};
 
 use crate::abi::{
     DarkpoolReader, TEMPO_STATE_ADDRESS, ZONE_INBOX_ADDRESS, ZONE_OUTBOX_ADDRESS,
@@ -58,17 +58,18 @@ use tempo_zone_contracts::DepositType;
 use zone_precompiles::refprice::{ReferencePrice, ReferencePriceGuard};
 use zone_rpc::{
     auth::AuthContext,
-    darkpool::{self as zone_darkpool, FillRole, HistoryQuery, Page, TransferQuery},
+    darkpool::{self as zone_darkpool, ActivityQuery, FillRole, HistoryQuery, Page, TransferQuery},
     refprice as zone_refprice,
     types::{
-        AuthorizationTokenInfoResponse, BatchAggregateVolume, BatchListResponse, BatchStatus,
-        BatchSummary, BoxEyreFut, BoxFut, DepositKind, DepositState, DepositStatusEntry,
-        DepositStatusResponse, HistoryAvailability, JsonRpcError, LIST_BATCHES_DEFAULT_LIMIT,
-        LIST_BATCHES_MAX_LIMIT, ListBatchesParams, MarketAction, MarketConfigResponse, MarketEntry,
-        MarketToken, MidpointHistoryResponse, MidpointSample, OrderLevel,
-        REFERENCE_PRICE_DISCLAIMER, REFERENCE_PRICE_UNIT, ReferencePriceResponse,
-        TopOfBookResponse, WithdrawalState, WithdrawalStatusQuery, WithdrawalStatusResponse,
-        ZoneInfoResponse, internal, raw_null, raw_zero, to_raw,
+        ActivityEntry, ActivityIndexedThrough, ActivityKind, ActivityPage, ActivitySource,
+        ActivitySourceChain, AuthorizationTokenInfoResponse, BatchAggregateVolume,
+        BatchListResponse, BatchStatus, BatchSummary, BoxEyreFut, BoxFut, DepositKind,
+        DepositState, DepositStatusEntry, DepositStatusResponse, HistoryAvailability, JsonRpcError,
+        LIST_BATCHES_DEFAULT_LIMIT, LIST_BATCHES_MAX_LIMIT, ListBatchesParams, MarketAction,
+        MarketConfigResponse, MarketEntry, MarketTimeInForce, MarketToken, MidpointHistoryResponse,
+        MidpointSample, OrderLevel, REFERENCE_PRICE_DISCLAIMER, REFERENCE_PRICE_UNIT,
+        ReferencePriceResponse, TopOfBookResponse, WithdrawalState, WithdrawalStatusQuery,
+        WithdrawalStatusResponse, ZoneInfoResponse, internal, raw_null, raw_zero, to_raw,
     },
 };
 
@@ -315,13 +316,16 @@ impl<Api: EthApiTypes + 'static> ZoneRpc<Api> {
                 base,
                 quote,
                 min_order_amount: U128::from(min_order_amount),
-                price_unit: "raw integer; quote = baseAmount * price".to_string(),
+                price_decimals: PRICE_DECIMALS,
+                price_unit: REFERENCE_PRICE_UNIT.to_string(),
                 allowed_actions: vec![
                     MarketAction::MarketBuy,
                     MarketAction::MarketSell,
                     MarketAction::LimitBid,
                     MarketAction::LimitAsk,
                 ],
+                market_time_in_force: vec![MarketTimeInForce::Ioc, MarketTimeInForce::Fok],
+                limit_time_in_force: vec![MarketTimeInForce::Gtc],
             });
         }
         Ok(MarketConfigResponse {
@@ -1180,6 +1184,46 @@ impl<Api: EthApiTypes + 'static> ZoneRpc<Api> {
 
         Ok(None)
     }
+
+    async fn activity_block_timestamp(
+        &self,
+        chain: ActivitySourceChain,
+        block_number: u64,
+    ) -> Result<u64, JsonRpcError> {
+        let block = match chain {
+            ActivitySourceChain::Zone => {
+                self.zone_provider
+                    .get_block_by_number(block_number.into())
+                    .await
+            }
+            ActivitySourceChain::Tempo => {
+                self.l1_provider
+                    .get_block_by_number(block_number.into())
+                    .await
+            }
+        }
+        .map_err(internal)?;
+        block
+            .map(|block| block.header.timestamp())
+            .ok_or_else(|| JsonRpcError::internal("activity source block not found"))
+    }
+
+    async fn activity_l1_tx_timestamp(&self, tx_hash: B256) -> Result<Option<u64>, JsonRpcError> {
+        let Some(receipt) = self
+            .l1_provider
+            .get_transaction_receipt(tx_hash)
+            .await
+            .map_err(internal)?
+        else {
+            return Ok(None);
+        };
+        let Some(block_number) = receipt.block_number else {
+            return Ok(None);
+        };
+        self.activity_block_timestamp(ActivitySourceChain::Tempo, block_number)
+            .await
+            .map(Some)
+    }
 }
 
 impl<Api> zone_rpc::ZoneRpcApi for ZoneRpc<Api>
@@ -1490,9 +1534,13 @@ where
 
     fn get_logs(&self, mut filter: Filter, auth: AuthContext) -> BoxFut<'_> {
         Box::pin(async move {
-            let zone_tokens = self.zone_tokens().await?;
-            zone_rpc::filter::scope_filter_addresses(&mut filter, &zone_tokens)?;
-            zone_rpc::filter::scope_filter_for_caller(&mut filter, &auth.caller)?;
+            let darkpool_filter =
+                zone_darkpool::scope_darkpool_event_filter(&mut filter, &auth.caller)?;
+            if !darkpool_filter {
+                let zone_tokens = self.zone_tokens().await?;
+                zone_rpc::filter::scope_filter_addresses(&mut filter, &zone_tokens)?;
+                zone_rpc::filter::scope_filter_for_caller(&mut filter, &auth.caller)?;
+            }
             let logs = EthFilterApiServer::logs(&self.eth.filter, filter)
                 .await
                 .map_err(internal)?;
@@ -1503,9 +1551,13 @@ where
 
     fn new_filter(&self, mut filter: Filter, auth: AuthContext) -> BoxFut<'_> {
         Box::pin(async move {
-            let zone_tokens = self.zone_tokens().await?;
-            zone_rpc::filter::scope_filter_addresses(&mut filter, &zone_tokens)?;
-            zone_rpc::filter::scope_filter_for_caller(&mut filter, &auth.caller)?;
+            let darkpool_filter =
+                zone_darkpool::scope_darkpool_event_filter(&mut filter, &auth.caller)?;
+            if !darkpool_filter {
+                let zone_tokens = self.zone_tokens().await?;
+                zone_rpc::filter::scope_filter_addresses(&mut filter, &zone_tokens)?;
+                zone_rpc::filter::scope_filter_for_caller(&mut filter, &auth.caller)?;
+            }
             let id = EthFilterApiServer::new_filter(&self.eth.filter, filter)
                 .await
                 .map_err(internal)?;
@@ -1636,9 +1688,13 @@ where
             let provider = self.eth.api.provider().clone();
             let caller = auth.caller;
 
-            let zone_tokens = self.zone_tokens().await?;
-            zone_rpc::filter::scope_filter_addresses(&mut filter, &zone_tokens)?;
-            zone_rpc::filter::scope_filter_for_caller(&mut filter, &caller)?;
+            let fill_subscription =
+                zone_darkpool::scope_maker_fill_subscription(&mut filter, &caller)?;
+            if !fill_subscription {
+                let zone_tokens = self.zone_tokens().await?;
+                zone_rpc::filter::scope_filter_addresses(&mut filter, &zone_tokens)?;
+                zone_rpc::filter::scope_filter_for_caller(&mut filter, &caller)?;
+            }
 
             let stream = provider
                 .canonical_state_stream()
@@ -1663,10 +1719,13 @@ where
             // Logs arrive in block order grouped by tx, which is what `LogOrderingRedactor` needs.
             let mut log_redactor = zone_rpc::filter::LogOrderingRedactor::default();
             let stream = stream.filter_map(move |log| {
-                std::future::ready(
+                let visible = if fill_subscription {
+                    log.inner.address == DARKPOOL_ADDRESS
+                        && zone_darkpool::caller_is_party(&log, &caller)
+                } else {
                     zone_rpc::filter::is_log_visible(&log, &caller)
-                        .then(|| to_raw(&log_redactor.redact(log))),
-                )
+                };
+                std::future::ready(visible.then(|| to_raw(&log_redactor.redact(log))))
             });
             let stream: zone_rpc::WsSubscriptionStream = Box::pin(stream);
             Ok(stream)
@@ -2196,20 +2255,46 @@ where
             let pair_filter = zone_darkpool::parse_pair_filter(query.pair.as_deref())?;
 
             let owner_topic = zone_darkpool::topic_for_address(&owner);
-            let topics = vec![
+            let lifecycle_topics = vec![
                 zone_darkpool::OrderSubmitted::SIGNATURE_HASH,
                 zone_darkpool::OrderPlaced::SIGNATURE_HASH,
-                zone_darkpool::OrderFilled::SIGNATURE_HASH,
                 zone_darkpool::OrderCancelled::SIGNATURE_HASH,
             ];
-            let filter = zone_darkpool::build_darkpool_filter(&topics, Some(owner_topic), cursor);
-            let logs = EthFilterApiServer::logs(&self.eth.filter, filter)
-                .await
-                .map_err(internal)?;
+            let lifecycle_filter = zone_darkpool::build_darkpool_history_filter(
+                &lifecycle_topics,
+                Some(owner_topic),
+                cursor,
+            );
+            let maker_fill_filter = zone_darkpool::build_darkpool_history_filter(
+                &[zone_darkpool::OrderFilled::SIGNATURE_HASH],
+                Some(owner_topic),
+                cursor,
+            );
+            let mut taker_fill_filter = zone_darkpool::build_darkpool_history_filter(
+                &[zone_darkpool::OrderFilled::SIGNATURE_HASH],
+                None,
+                cursor,
+            );
+            taker_fill_filter.topics[3] = alloy_rpc_types_eth::FilterSet::from(owner_topic);
+
+            let (lifecycle_logs, maker_fill_logs, taker_fill_logs) = tokio::try_join!(
+                EthFilterApiServer::logs(&self.eth.filter, lifecycle_filter),
+                EthFilterApiServer::logs(&self.eth.filter, maker_fill_filter),
+                EthFilterApiServer::logs(&self.eth.filter, taker_fill_filter),
+            )
+            .map_err(internal)?;
+
+            let mut logs = lifecycle_logs;
+            logs.extend(maker_fill_logs);
+            logs.extend(taker_fill_logs);
+            logs.sort_by_key(|log| (log.block_number.unwrap_or(0), log.log_index.unwrap_or(0)));
+            logs.dedup_by(|a, b| {
+                a.transaction_hash == b.transaction_hash && a.log_index == b.log_index
+            });
 
             let mut orders = zone_darkpool::reconstruct_orders(
                 logs.iter()
-                    .filter(|log| zone_darkpool::caller_is_maker(log, &owner)),
+                    .filter(|log| zone_darkpool::caller_is_party(log, &owner)),
             );
 
             if let Some(pair) = pair_filter {
@@ -2248,19 +2333,18 @@ where
             let owner_topic = zone_darkpool::topic_for_address(&owner);
             let topics = vec![zone_darkpool::OrderFilled::SIGNATURE_HASH];
 
-            // OrderSubmitted carries the only pair metadata. Scan from
-            // genesis because a fill at `cursor` can reference an older
-            // resting order. Foreign submissions are used only for pair
-            // metadata; their order ids are never returned.
+            // Caller-owned submissions carry every piece of metadata needed
+            // for both maker- and taker-side fills.
             let submitted_filter = zone_darkpool::build_darkpool_filter(
                 &[zone_darkpool::OrderSubmitted::SIGNATURE_HASH],
-                None,
+                Some(owner_topic),
                 None,
             );
 
             let maker_filter =
-                zone_darkpool::build_darkpool_filter(&topics, Some(owner_topic), cursor);
-            let mut taker_filter = zone_darkpool::build_darkpool_filter(&topics, None, cursor);
+                zone_darkpool::build_darkpool_history_filter(&topics, Some(owner_topic), cursor);
+            let mut taker_filter =
+                zone_darkpool::build_darkpool_history_filter(&topics, None, cursor);
             taker_filter.topics[3] = alloy_rpc_types_eth::FilterSet::from(owner_topic);
 
             let submitted_logs = EthFilterApiServer::logs(&self.eth.filter, submitted_filter)
@@ -2293,6 +2377,9 @@ where
 
             if let Some(pair) = pair_filter {
                 fills.retain(|f| f.base_token == pair.0 && f.quote_token == pair.1);
+            }
+            if let Some(cursor) = cursor {
+                fills.retain(|fill| cursor.includes_older(fill.block_number, fill.log_index));
             }
             fills.sort_by(|a, b| {
                 b.block_number
@@ -2330,13 +2417,13 @@ where
                 zone_rpc::filter::MINT_TOPIC,
                 zone_rpc::filter::BURN_TOPIC,
             ];
-            let from_filter = zone_darkpool::build_tip20_filter(
+            let from_filter = zone_darkpool::build_tip20_history_filter(
                 &transfer_topics,
                 Some(owner_topic),
                 cursor,
                 true,
             );
-            let to_filter = zone_darkpool::build_tip20_filter(
+            let to_filter = zone_darkpool::build_tip20_history_filter(
                 &transfer_topics,
                 Some(owner_topic),
                 cursor,
@@ -2357,6 +2444,11 @@ where
                 .filter_map(|log| zone_darkpool::transfer_entry_from_log(&log, &owner))
                 .collect();
 
+            if let Some(cursor) = cursor {
+                transfers.retain(|transfer| {
+                    cursor.includes_older(transfer.block_number, transfer.log_index)
+                });
+            }
             transfers.sort_by(|a, b| {
                 b.block_number
                     .cmp(&a.block_number)
@@ -2374,16 +2466,609 @@ where
         })
     }
 
+    fn zone_get_my_activity(&self, query: ActivityQuery, auth: AuthContext) -> BoxFut<'_> {
+        Box::pin(async move {
+            let owner = auth.caller;
+            let limit = zone_darkpool::clamp_limit(query.limit);
+            let cursor = query
+                .cursor
+                .as_deref()
+                .map(ActivitySortKey::decode)
+                .transpose()?;
+            let owner_topic = zone_darkpool::topic_for_address(&owner);
+
+            let lifecycle_filter = zone_darkpool::build_darkpool_history_filter(
+                &[
+                    zone_darkpool::OrderSubmitted::SIGNATURE_HASH,
+                    zone_darkpool::OrderPlaced::SIGNATURE_HASH,
+                    zone_darkpool::OrderCancelled::SIGNATURE_HASH,
+                ],
+                Some(owner_topic),
+                None,
+            );
+            let maker_fill_filter = zone_darkpool::build_darkpool_history_filter(
+                &[zone_darkpool::OrderFilled::SIGNATURE_HASH],
+                Some(owner_topic),
+                None,
+            );
+            let mut taker_fill_filter = zone_darkpool::build_darkpool_history_filter(
+                &[zone_darkpool::OrderFilled::SIGNATURE_HASH],
+                None,
+                None,
+            );
+            taker_fill_filter.topics[3] = alloy_rpc_types_eth::FilterSet::from(owner_topic);
+
+            let transfer_topics = [
+                zone_rpc::filter::TRANSFER_TOPIC,
+                zone_rpc::filter::TRANSFER_WITH_MEMO_TOPIC,
+                zone_rpc::filter::MINT_TOPIC,
+                zone_rpc::filter::BURN_TOPIC,
+            ];
+            let from_filter = zone_darkpool::build_tip20_history_filter(
+                &transfer_topics,
+                Some(owner_topic),
+                None,
+                true,
+            );
+            let to_filter = zone_darkpool::build_tip20_history_filter(
+                &transfer_topics,
+                Some(owner_topic),
+                None,
+                false,
+            );
+            let withdrawal_filter = Filter::new()
+                .address(ZONE_OUTBOX_ADDRESS)
+                .from_block(0)
+                .event_signature(ZoneOutbox::WithdrawalRequested::SIGNATURE_HASH)
+                .topic2(owner_topic);
+            let portal_deposit_sender_filter = Filter::new()
+                .address(self.config.zone_portal)
+                .from_block(0)
+                .event_signature(vec![
+                    ZonePortal::DepositMade::SIGNATURE_HASH,
+                    ZonePortal::EncryptedDepositMade::SIGNATURE_HASH,
+                ])
+                .topic2(owner_topic);
+            let inbox_deposit_sender_filter = Filter::new()
+                .address(ZONE_INBOX_ADDRESS)
+                .from_block(0)
+                .event_signature(vec![
+                    ZoneInbox::DepositProcessed::SIGNATURE_HASH,
+                    ZoneInbox::DepositFailed::SIGNATURE_HASH,
+                    ZoneInbox::EncryptedDepositProcessed::SIGNATURE_HASH,
+                    ZoneInbox::EncryptedDepositFailed::SIGNATURE_HASH,
+                    ZoneInbox::DepositRejected::SIGNATURE_HASH,
+                ])
+                .topic2(owner_topic);
+            let inbox_deposit_recipient_filter = Filter::new()
+                .address(ZONE_INBOX_ADDRESS)
+                .from_block(0)
+                .event_signature(vec![
+                    ZoneInbox::DepositProcessed::SIGNATURE_HASH,
+                    ZoneInbox::DepositFailed::SIGNATURE_HASH,
+                    ZoneInbox::EncryptedDepositProcessed::SIGNATURE_HASH,
+                ])
+                .topic3(owner_topic);
+
+            let (lifecycle_logs, maker_fill_logs, taker_fill_logs, from_logs, to_logs) =
+                tokio::try_join!(
+                    EthFilterApiServer::logs(&self.eth.filter, lifecycle_filter),
+                    EthFilterApiServer::logs(&self.eth.filter, maker_fill_filter),
+                    EthFilterApiServer::logs(&self.eth.filter, taker_fill_filter),
+                    EthFilterApiServer::logs(&self.eth.filter, from_filter),
+                    EthFilterApiServer::logs(&self.eth.filter, to_filter),
+                )
+                .map_err(internal)?;
+            let (
+                withdrawal_logs,
+                deposit_sender_logs,
+                deposit_recipient_logs,
+                portal_deposit_logs,
+                zone_tip,
+                tempo_tip,
+            ) = tokio::try_join!(
+                self.zone_provider.get_logs(&withdrawal_filter),
+                self.zone_provider.get_logs(&inbox_deposit_sender_filter),
+                self.zone_provider.get_logs(&inbox_deposit_recipient_filter),
+                self.l1_provider.get_logs(&portal_deposit_sender_filter),
+                self.zone_provider.get_block_number(),
+                self.l1_provider.get_block_number(),
+            )
+            .map_err(internal)?;
+
+            let mut order_logs = lifecycle_logs.clone();
+            order_logs.extend(maker_fill_logs.iter().cloned());
+            order_logs.extend(taker_fill_logs.iter().cloned());
+            order_logs.sort_by_key(activity_log_key);
+            order_logs.dedup_by(|a, b| {
+                a.transaction_hash == b.transaction_hash && a.log_index == b.log_index
+            });
+
+            let mut timestamp_cache = HashMap::<(u8, u64), u64>::new();
+            let mut entries = Vec::<ActivityEntry>::new();
+            let orders = zone_darkpool::reconstruct_orders(
+                order_logs
+                    .iter()
+                    .filter(|log| zone_darkpool::caller_is_party(log, &owner)),
+            );
+
+            for order in orders {
+                let order_id: u128 = order.order_id.to();
+                let Some(created_log) = lifecycle_logs.iter().find(|log| {
+                    log.topic0().copied() == Some(zone_darkpool::OrderSubmitted::SIGNATURE_HASH)
+                        && activity_log_references_order(log, order_id)
+                }) else {
+                    continue;
+                };
+                let latest_log = order_logs
+                    .iter()
+                    .filter(|log| activity_log_references_order(log, order_id))
+                    .max_by_key(|log| activity_log_key(log))
+                    .unwrap_or(created_log);
+                let Some(source) = activity_source(created_log, ActivitySourceChain::Zone) else {
+                    continue;
+                };
+                let created_block = source.block_number.to();
+                let occurred_at =
+                    if let Some(timestamp) = timestamp_cache.get(&(1, created_block)).copied() {
+                        timestamp
+                    } else {
+                        let timestamp = self
+                            .activity_block_timestamp(ActivitySourceChain::Zone, created_block)
+                            .await?;
+                        timestamp_cache.insert((1, created_block), timestamp);
+                        timestamp
+                    };
+                let updated_block = latest_log.block_number.unwrap_or(created_block);
+                let updated_at =
+                    if let Some(timestamp) = timestamp_cache.get(&(1, updated_block)).copied() {
+                        timestamp
+                    } else {
+                        let timestamp = self
+                            .activity_block_timestamp(ActivitySourceChain::Zone, updated_block)
+                            .await?;
+                        timestamp_cache.insert((1, updated_block), timestamp);
+                        timestamp
+                    };
+                let side = match order.side {
+                    zone_darkpool::Side::Bid => "buy",
+                    zone_darkpool::Side::Ask => "sell",
+                };
+                entries.push(ActivityEntry {
+                    id: format!("order:{order_id}"),
+                    kind: ActivityKind::Order,
+                    occurred_at: U64::from(occurred_at),
+                    updated_at: U64::from(updated_at),
+                    source,
+                    payload: serde_json::json!({
+                        "type": "order",
+                        "details": {
+                            "orderId": order.order_id,
+                            "side": side,
+                            "orderType": order.order_kind,
+                            "timeInForce": order.time_in_force,
+                            "status": order.status,
+                            "baseToken": order.base_token,
+                            "quoteToken": order.quote_token,
+                            "amount": order.amount,
+                            "remaining": order.remaining,
+                            "filled": order.filled,
+                            "cancelled": order.cancelled,
+                            "cancelReason": order.cancel_reason,
+                            "price": order.price_limit,
+                            "priceLimit": order.price_limit,
+                        }
+                    }),
+                });
+            }
+
+            let pair_index = zone_darkpool::build_pair_index(lifecycle_logs.iter(), &owner);
+            let fill_rows = maker_fill_logs
+                .iter()
+                .filter(|log| zone_darkpool::caller_is_maker(log, &owner))
+                .filter_map(|log| {
+                    zone_darkpool::fill_entry_from_log(log, FillRole::Maker, &pair_index)
+                        .map(|entry| (log, entry))
+                })
+                .chain(
+                    taker_fill_logs
+                        .iter()
+                        .filter(|log| zone_darkpool::caller_is_taker(log, &owner))
+                        .filter_map(|log| {
+                            zone_darkpool::fill_entry_from_log(log, FillRole::Taker, &pair_index)
+                                .map(|entry| (log, entry))
+                        }),
+                );
+            for (log, fill) in fill_rows {
+                let Some(source) = activity_source(log, ActivitySourceChain::Zone) else {
+                    continue;
+                };
+                let block_number = source.block_number.to();
+                let occurred_at =
+                    if let Some(timestamp) = timestamp_cache.get(&(1, block_number)).copied() {
+                        timestamp
+                    } else {
+                        let timestamp = self
+                            .activity_block_timestamp(ActivitySourceChain::Zone, block_number)
+                            .await?;
+                        timestamp_cache.insert((1, block_number), timestamp);
+                        timestamp
+                    };
+                let side = match fill.side {
+                    zone_darkpool::Side::Bid => "buy",
+                    zone_darkpool::Side::Ask => "sell",
+                };
+                let role = match fill.role {
+                    FillRole::Maker => "maker",
+                    FillRole::Taker => "taker",
+                };
+                entries.push(ActivityEntry {
+                    id: format!("fill:{}:{}:{role}", source.tx_hash, source.log_index),
+                    kind: ActivityKind::Fill,
+                    occurred_at: U64::from(occurred_at),
+                    updated_at: U64::from(occurred_at),
+                    source,
+                    payload: serde_json::json!({
+                        "type": "fill",
+                        "details": {
+                            "orderId": fill.order_id,
+                            "role": fill.role,
+                            "side": side,
+                            "orderType": fill.order_kind,
+                            "timeInForce": fill.time_in_force,
+                            "baseToken": fill.base_token,
+                            "quoteToken": fill.quote_token,
+                            "amountFilled": fill.amount_filled,
+                            "price": fill.price,
+                        }
+                    }),
+                });
+            }
+
+            let mut transfer_logs = from_logs;
+            transfer_logs.extend(to_logs);
+            transfer_logs.sort_by_key(activity_log_key);
+            transfer_logs.dedup_by(|a, b| {
+                a.transaction_hash == b.transaction_hash && a.log_index == b.log_index
+            });
+            for log in transfer_logs
+                .iter()
+                .filter(|log| zone_rpc::filter::is_log_visible(log, &owner))
+            {
+                let Some(transfer) = zone_darkpool::transfer_entry_from_log(log, &owner) else {
+                    continue;
+                };
+                let Some(source) = activity_source(log, ActivitySourceChain::Zone) else {
+                    continue;
+                };
+                let block_number = source.block_number.to();
+                let occurred_at =
+                    if let Some(timestamp) = timestamp_cache.get(&(1, block_number)).copied() {
+                        timestamp
+                    } else {
+                        let timestamp = self
+                            .activity_block_timestamp(ActivitySourceChain::Zone, block_number)
+                            .await?;
+                        timestamp_cache.insert((1, block_number), timestamp);
+                        timestamp
+                    };
+                entries.push(ActivityEntry {
+                    id: format!("transfer:{}:{}", source.tx_hash, source.log_index),
+                    kind: ActivityKind::Transfer,
+                    occurred_at: U64::from(occurred_at),
+                    updated_at: U64::from(occurred_at),
+                    source,
+                    payload: serde_json::json!({
+                        "type": "transfer",
+                        "details": {
+                            "token": transfer.token,
+                            "counterparty": transfer.counterparty,
+                            "amount": transfer.amount,
+                            "direction": transfer.direction,
+                        }
+                    }),
+                });
+            }
+
+            let mut terminal_logs = deposit_sender_logs;
+            terminal_logs.extend(deposit_recipient_logs);
+            terminal_logs.sort_by_key(activity_log_key);
+            terminal_logs.dedup_by(|a, b| {
+                a.transaction_hash == b.transaction_hash && a.log_index == b.log_index
+            });
+            let mut terminal_by_hash = HashMap::<B256, ActivityDepositTerminal>::new();
+            for log in terminal_logs {
+                let event = ZoneInbox::ZoneInboxEvents::decode_log(&log.inner)
+                    .map_err(internal)?
+                    .data;
+                let (deposit_hash, state, recipient, memo) = match event {
+                    ZoneInbox::ZoneInboxEvents::DepositProcessed(event) => (
+                        event.depositHash,
+                        DepositState::Processed,
+                        Some(event.to),
+                        Some(event.memo),
+                    ),
+                    ZoneInbox::ZoneInboxEvents::EncryptedDepositProcessed(event) => (
+                        event.depositHash,
+                        DepositState::Processed,
+                        Some(event.to),
+                        Some(event.memo),
+                    ),
+                    ZoneInbox::ZoneInboxEvents::DepositFailed(event) => (
+                        event.depositHash,
+                        DepositState::Failed,
+                        Some(event.to),
+                        None,
+                    ),
+                    ZoneInbox::ZoneInboxEvents::EncryptedDepositFailed(event) => {
+                        (event.depositHash, DepositState::Failed, None, None)
+                    }
+                    ZoneInbox::ZoneInboxEvents::DepositRejected(event) => {
+                        (event.depositHash, DepositState::Failed, None, None)
+                    }
+                    _ => continue,
+                };
+                terminal_by_hash.insert(
+                    deposit_hash,
+                    ActivityDepositTerminal {
+                        state,
+                        recipient,
+                        memo,
+                        log,
+                    },
+                );
+            }
+
+            let mut all_portal_deposit_logs = portal_deposit_logs;
+            let known_hashes = all_portal_deposit_logs
+                .iter()
+                .filter_map(|log| log.topics().get(1).copied())
+                .collect::<HashSet<_>>();
+            for deposit_hash in terminal_by_hash
+                .keys()
+                .filter(|hash| !known_hashes.contains(*hash))
+            {
+                let filter = Filter::new()
+                    .address(self.config.zone_portal)
+                    .from_block(0)
+                    .event_signature(vec![
+                        ZonePortal::DepositMade::SIGNATURE_HASH,
+                        ZonePortal::EncryptedDepositMade::SIGNATURE_HASH,
+                    ])
+                    .topic1(*deposit_hash);
+                all_portal_deposit_logs
+                    .extend(self.l1_provider.get_logs(&filter).await.map_err(internal)?);
+            }
+            all_portal_deposit_logs.sort_by_key(activity_log_key);
+            all_portal_deposit_logs.dedup_by(|a, b| {
+                a.transaction_hash == b.transaction_hash && a.log_index == b.log_index
+            });
+
+            for log in all_portal_deposit_logs {
+                let event = ZonePortal::ZonePortalEvents::decode_log(&log.inner)
+                    .map_err(internal)?
+                    .data;
+                let (
+                    deposit_hash,
+                    kind,
+                    sender,
+                    portal_recipient,
+                    bounceback_recipient,
+                    token,
+                    amount,
+                    portal_memo,
+                ) = match event {
+                    ZonePortal::ZonePortalEvents::DepositMade(event) => (
+                        event.newCurrentDepositQueueHash,
+                        DepositKind::Regular,
+                        event.sender,
+                        Some(event.to),
+                        event.bouncebackRecipient,
+                        event.token,
+                        event.netAmount,
+                        Some(event.memo),
+                    ),
+                    ZonePortal::ZonePortalEvents::EncryptedDepositMade(event) => (
+                        event.newCurrentDepositQueueHash,
+                        DepositKind::Encrypted,
+                        event.sender,
+                        None,
+                        event.bouncebackRecipient,
+                        event.token,
+                        event.netAmount,
+                        None,
+                    ),
+                    _ => continue,
+                };
+                let terminal = terminal_by_hash.get(&deposit_hash);
+                let recipient = terminal
+                    .and_then(|terminal| terminal.recipient)
+                    .or(portal_recipient);
+                if sender != owner && bounceback_recipient != owner && recipient != Some(owner) {
+                    continue;
+                }
+                let Some(source) = activity_source(&log, ActivitySourceChain::Tempo) else {
+                    continue;
+                };
+                let tempo_block = source.block_number.to();
+                let occurred_at =
+                    if let Some(timestamp) = timestamp_cache.get(&(0, tempo_block)).copied() {
+                        timestamp
+                    } else {
+                        let timestamp = self
+                            .activity_block_timestamp(ActivitySourceChain::Tempo, tempo_block)
+                            .await?;
+                        timestamp_cache.insert((0, tempo_block), timestamp);
+                        timestamp
+                    };
+                let (status, memo, zone_tx_hash, updated_at) = match terminal {
+                    Some(terminal) => {
+                        let zone_tx_hash = terminal.log.transaction_hash;
+                        let terminal_block = terminal.log.block_number.unwrap_or(0);
+                        let updated_at = if let Some(timestamp) =
+                            timestamp_cache.get(&(1, terminal_block)).copied()
+                        {
+                            timestamp
+                        } else {
+                            let timestamp = self
+                                .activity_block_timestamp(ActivitySourceChain::Zone, terminal_block)
+                                .await?;
+                            timestamp_cache.insert((1, terminal_block), timestamp);
+                            timestamp
+                        };
+                        (
+                            terminal.state,
+                            terminal.memo.or(portal_memo),
+                            zone_tx_hash,
+                            updated_at,
+                        )
+                    }
+                    None => (DepositState::Pending, portal_memo, None, occurred_at),
+                };
+                entries.push(ActivityEntry {
+                    id: format!("deposit:{deposit_hash}"),
+                    kind: ActivityKind::Deposit,
+                    occurred_at: U64::from(occurred_at),
+                    updated_at: U64::from(updated_at),
+                    source: source.clone(),
+                    payload: serde_json::json!({
+                        "type": "deposit",
+                        "details": {
+                            "depositHash": deposit_hash,
+                            "kind": kind,
+                            "token": token,
+                            "sender": sender,
+                            "recipient": recipient,
+                            "amount": amount,
+                            "memo": memo,
+                            "status": status,
+                            "l1TxHash": source.tx_hash,
+                            "zoneTxHash": zone_tx_hash,
+                        }
+                    }),
+                });
+            }
+
+            for log in withdrawal_logs {
+                let decoded =
+                    ZoneOutbox::WithdrawalRequested::decode_log(&log.inner).map_err(internal)?;
+                if decoded.sender != owner {
+                    continue;
+                }
+                let Some(source) = activity_source(&log, ActivitySourceChain::Zone) else {
+                    continue;
+                };
+                let occurred_at = if let Some(timestamp) =
+                    timestamp_cache.get(&(1, source.block_number.to())).copied()
+                {
+                    timestamp
+                } else {
+                    let timestamp = self
+                        .activity_block_timestamp(
+                            ActivitySourceChain::Zone,
+                            source.block_number.to(),
+                        )
+                        .await?;
+                    timestamp_cache.insert((1, source.block_number.to()), timestamp);
+                    timestamp
+                };
+                let raw = <Self as zone_rpc::ZoneRpcApi>::zone_get_withdrawal_status(
+                    self,
+                    WithdrawalStatusQuery::WithdrawalIndex(decoded.withdrawalIndex),
+                    auth.clone(),
+                )
+                .await?;
+                let status: WithdrawalStatusResponse =
+                    serde_json::from_str(raw.get()).map_err(internal)?;
+                let latest_l1_tx = status
+                    .l1_process_withdrawal_tx_hash
+                    .or(status.l1_submit_batch_tx_hash);
+                let updated_at = match latest_l1_tx {
+                    Some(tx_hash) => self
+                        .activity_l1_tx_timestamp(tx_hash)
+                        .await?
+                        .unwrap_or(occurred_at),
+                    None => occurred_at,
+                };
+                entries.push(ActivityEntry {
+                    id: format!("withdrawal:{}", decoded.withdrawalIndex),
+                    kind: ActivityKind::Withdrawal,
+                    occurred_at: U64::from(occurred_at),
+                    updated_at: U64::from(updated_at),
+                    source,
+                    payload: serde_json::json!({
+                        "type": "withdrawal",
+                        "details": {
+                            "withdrawalIndex": status.withdrawal_index,
+                            "token": status.token,
+                            "to": status.to,
+                            "amount": status.amount,
+                            "fee": decoded.fee,
+                            "memo": status.memo,
+                            "fallbackRecipient": status.fallback_recipient,
+                            "status": status.status,
+                            "zoneTxHash": status.zone_tx_hash,
+                            "l1SubmitBatchTxHash": status.l1_submit_batch_tx_hash,
+                            "l1ProcessWithdrawalTxHash": status.l1_process_withdrawal_tx_hash,
+                            "error": status.error,
+                        }
+                    }),
+                });
+            }
+
+            entries.sort_by(|a, b| {
+                ActivitySortKey::from_entry(b).cmp(&ActivitySortKey::from_entry(a))
+            });
+            entries.dedup_by(|a, b| a.id == b.id);
+            if let Some(cursor) = cursor {
+                entries.retain(|entry| ActivitySortKey::from_entry(entry) < cursor);
+            }
+            let next_cursor = if entries.len() > limit as usize {
+                Some(ActivitySortKey::from_entry(&entries[limit as usize - 1]).encode())
+            } else {
+                None
+            };
+            entries.truncate(limit as usize);
+
+            to_raw(&ActivityPage {
+                items: entries,
+                next_cursor,
+                indexed_through: ActivityIndexedThrough {
+                    zone_block: U64::from(zone_tip),
+                    tempo_block: U64::from(tempo_tip),
+                },
+            })
+        })
+    }
+
     fn zone_get_order(&self, order_id: u128, auth: AuthContext) -> BoxFut<'_> {
         Box::pin(async move {
             let owner = auth.caller;
             let filter = zone_darkpool::build_order_filter(order_id, &owner);
-            let logs = EthFilterApiServer::logs(&self.eth.filter, filter)
-                .await
-                .map_err(internal)?;
+            let mut taker_fill_filter = zone_darkpool::build_darkpool_history_filter(
+                &[zone_darkpool::OrderFilled::SIGNATURE_HASH],
+                None,
+                None,
+            );
+            taker_fill_filter.topics[3] =
+                alloy_rpc_types_eth::FilterSet::from(zone_darkpool::topic_for_address(&owner));
+            let (mut logs, taker_fills) = tokio::try_join!(
+                EthFilterApiServer::logs(&self.eth.filter, filter),
+                EthFilterApiServer::logs(&self.eth.filter, taker_fill_filter),
+            )
+            .map_err(internal)?;
+            logs.extend(
+                taker_fills
+                    .into_iter()
+                    .filter(|log| zone_darkpool::fill_references_order(log, order_id)),
+            );
+            logs.sort_by_key(|log| (log.block_number.unwrap_or(0), log.log_index.unwrap_or(0)));
+            logs.dedup_by(|a, b| {
+                a.transaction_hash == b.transaction_hash && a.log_index == b.log_index
+            });
             let mut orders = zone_darkpool::reconstruct_orders(
                 logs.iter()
-                    .filter(|log| zone_darkpool::caller_is_maker(log, &owner)),
+                    .filter(|log| zone_darkpool::caller_is_party(log, &owner)),
             );
             match orders.pop() {
                 Some(order) if order.order_id == alloy_primitives::U128::from(order_id) => {
@@ -2393,6 +3078,111 @@ where
             }
         })
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ActivitySortKey {
+    occurred_at: u64,
+    chain_rank: u8,
+    block_number: u64,
+    tx_index: u64,
+    log_index: u64,
+    id: String,
+}
+
+#[derive(Debug, Clone)]
+struct ActivityDepositTerminal {
+    state: DepositState,
+    recipient: Option<Address>,
+    memo: Option<B256>,
+    log: Log,
+}
+
+impl ActivitySortKey {
+    fn from_entry(entry: &ActivityEntry) -> Self {
+        Self {
+            occurred_at: entry.occurred_at.to(),
+            chain_rank: match entry.source.chain {
+                ActivitySourceChain::Zone => 1,
+                ActivitySourceChain::Tempo => 0,
+            },
+            block_number: entry.source.block_number.to(),
+            tx_index: entry.source.tx_index.to(),
+            log_index: entry.source.log_index.to(),
+            id: entry.id.clone(),
+        }
+    }
+
+    fn encode(&self) -> String {
+        format!(
+            "{}:{}:{}:{}:{}:{}",
+            self.occurred_at,
+            self.chain_rank,
+            self.block_number,
+            self.tx_index,
+            self.log_index,
+            self.id
+        )
+    }
+
+    fn decode(value: &str) -> Result<Self, JsonRpcError> {
+        let mut parts = value.splitn(6, ':');
+        let mut next_u64 = || {
+            parts
+                .next()
+                .and_then(|part| part.parse::<u64>().ok())
+                .ok_or_else(|| JsonRpcError::invalid_params("invalid activity cursor"))
+        };
+        let occurred_at = next_u64()?;
+        let chain_rank = next_u64()?;
+        let block_number = next_u64()?;
+        let tx_index = next_u64()?;
+        let log_index = next_u64()?;
+        let id = parts
+            .next()
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| JsonRpcError::invalid_params("invalid activity cursor"))?
+            .to_string();
+        if chain_rank > 1 {
+            return Err(JsonRpcError::invalid_params("invalid activity cursor"));
+        }
+        Ok(Self {
+            occurred_at,
+            chain_rank: chain_rank as u8,
+            block_number,
+            tx_index,
+            log_index,
+            id,
+        })
+    }
+}
+
+fn activity_source(log: &Log, chain: ActivitySourceChain) -> Option<ActivitySource> {
+    Some(ActivitySource {
+        chain,
+        block_number: U64::from(log.block_number?),
+        tx_hash: log.transaction_hash?,
+        tx_index: U64::from(log.transaction_index.unwrap_or(0)),
+        log_index: U64::from(log.log_index.unwrap_or(0)),
+    })
+}
+
+fn activity_log_key(log: &Log) -> (u64, u64, u64) {
+    (
+        log.block_number.unwrap_or(0),
+        log.transaction_index.unwrap_or(0),
+        log.log_index.unwrap_or(0),
+    )
+}
+
+fn activity_log_references_order(log: &Log, order_id: u128) -> bool {
+    let Some(topic0) = log.topic0().copied() else {
+        return false;
+    };
+    if topic0 == zone_darkpool::OrderFilled::SIGNATURE_HASH {
+        return zone_darkpool::fill_references_order(log, order_id);
+    }
+    log.topics().get(1).copied() == Some(zone_darkpool::order_id_topic(order_id))
 }
 
 /// Zone-side data extracted from a `WithdrawalRequested` event plus its
@@ -2697,12 +3487,13 @@ fn aggregate_batch_events(
         } else if topic0 == zone_darkpool::OrderFilled::SIGNATURE_HASH {
             fill_count = fill_count.saturating_add(1);
             if let Ok(decoded) = zone_darkpool::OrderFilled::decode_log(&log.inner)
-                && let Some(&(base, quote)) = pair_by_order_id.get(&decoded.orderId)
+                && let Some(&(base, quote)) = pair_by_order_id.get(&decoded.makerOrderId)
             {
                 pair_set.insert((base, quote));
                 let base_amount = U256::from(decoded.amountFilled);
-                // `quote = baseAmount * price` per the darkpool price model.
-                let quote_amount = base_amount.saturating_mul(U256::from(decoded.price));
+                // Prices are six-decimal fixed-point quote-per-base amounts.
+                let quote_amount =
+                    base_amount.saturating_mul(U256::from(decoded.price)) / U256::from(PRICE_SCALE);
                 volume_by_token
                     .entry(base)
                     .and_modify(|v| *v = v.saturating_add(base_amount))
@@ -3012,6 +3803,7 @@ fn build_reference_price_response(
             age_secs: None,
             max_deviation_bps: None,
             max_staleness_secs: None,
+            price_decimals: PRICE_DECIMALS,
             price_unit: REFERENCE_PRICE_UNIT.to_string(),
             disclaimer: REFERENCE_PRICE_DISCLAIMER.to_string(),
             reason: Some("reference-price provider not configured".to_string()),
@@ -3050,6 +3842,7 @@ fn build_reference_price_response(
         age_secs: Some(U64::from(age)),
         max_deviation_bps: Some(provider.max_deviation_bps),
         max_staleness_secs: Some(provider.max_staleness_secs),
+        price_decimals: PRICE_DECIMALS,
         price_unit: REFERENCE_PRICE_UNIT.to_string(),
         disclaimer: REFERENCE_PRICE_DISCLAIMER.to_string(),
         reason: None,
@@ -3084,6 +3877,76 @@ fn l1_read_rpc_url(l1_rpc_url: &str) -> eyre::Result<url::Url> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn activity_entry(
+        id: &str,
+        chain: ActivitySourceChain,
+        occurred_at: u64,
+        block_number: u64,
+        tx_index: u64,
+        log_index: u64,
+    ) -> ActivityEntry {
+        ActivityEntry {
+            id: id.to_string(),
+            kind: ActivityKind::Order,
+            occurred_at: U64::from(occurred_at),
+            updated_at: U64::from(occurred_at),
+            source: ActivitySource {
+                chain,
+                block_number: U64::from(block_number),
+                tx_hash: B256::with_last_byte(log_index as u8),
+                tx_index: U64::from(tx_index),
+                log_index: U64::from(log_index),
+            },
+            payload: serde_json::json!({"type": "order", "details": {}}),
+        }
+    }
+
+    #[test]
+    fn activity_cursor_roundtrips_ids_containing_colons() {
+        let key = ActivitySortKey::from_entry(&activity_entry(
+            "fill:0xabc:7:taker",
+            ActivitySourceChain::Zone,
+            1_700_000_000,
+            42,
+            3,
+            7,
+        ));
+        assert_eq!(ActivitySortKey::decode(&key.encode()).unwrap(), key);
+        assert!(ActivitySortKey::decode("garbage").is_err());
+    }
+
+    #[test]
+    fn activity_sort_key_is_stable_across_zone_and_tempo() {
+        let tempo = ActivitySortKey::from_entry(&activity_entry(
+            "deposit:1",
+            ActivitySourceChain::Tempo,
+            1_700_000_000,
+            100,
+            1,
+            2,
+        ));
+        let zone = ActivitySortKey::from_entry(&activity_entry(
+            "order:1",
+            ActivitySourceChain::Zone,
+            1_700_000_000,
+            10,
+            0,
+            0,
+        ));
+        assert!(zone > tempo, "Zone deterministically wins equal timestamps");
+        assert!(
+            ActivitySortKey::from_entry(&activity_entry(
+                "order:2",
+                ActivitySourceChain::Zone,
+                1_700_000_001,
+                1,
+                0,
+                0,
+            )) > zone,
+            "timestamps remain the primary newest-first key"
+        );
+    }
 
     #[test]
     fn l1_read_rpc_url_uses_http_for_request_response_reads() {
@@ -3590,14 +4453,17 @@ mod tests {
         amount: u128,
         price: u128,
     ) -> alloy_rpc_types_eth::Log {
+        let scaled_price = price.saturating_mul(PRICE_SCALE);
         let event = zone_darkpool::OrderSubmitted {
             orderId: order_id,
             maker: Address::repeat_byte(0xaa),
             base: test_market::BASE,
             quote: test_market::QUOTE,
             amount,
-            price,
+            priceLimit: scaled_price,
             isBid: true,
+            orderKind: zone_darkpool::ORDER_KIND_LIMIT,
+            timeInForce: zone_darkpool::TIME_IN_FORCE_GTC,
         };
         wrap_log(DARKPOOL_ADDRESS, event.encode_log_data(), block)
     }
@@ -3608,12 +4474,14 @@ mod tests {
         amount: u128,
         price: u128,
     ) -> alloy_rpc_types_eth::Log {
+        let scaled_price = price.saturating_mul(PRICE_SCALE);
         let event = zone_darkpool::OrderFilled {
-            orderId: order_id,
+            makerOrderId: order_id,
             maker: Address::repeat_byte(0xaa),
             taker: Address::repeat_byte(0xbb),
+            takerOrderId: order_id.saturating_add(1_000_000),
             amountFilled: amount,
-            price,
+            price: scaled_price,
         };
         wrap_log(DARKPOOL_ADDRESS, event.encode_log_data(), block)
     }
@@ -4112,10 +4980,8 @@ mod tests {
         assert!(response.age_secs.is_none());
         assert!(response.max_deviation_bps.is_none());
         assert!(response.max_staleness_secs.is_none());
-        assert_eq!(
-            response.price_unit,
-            "raw integer; quote = baseAmount * price"
-        );
+        assert_eq!(response.price_decimals, PRICE_DECIMALS);
+        assert_eq!(response.price_unit, REFERENCE_PRICE_UNIT);
         assert_eq!(
             response.disclaimer,
             "alpha infrastructure; not a production oracle"
@@ -4180,6 +5046,7 @@ mod tests {
             "ageSecs",
             "maxDeviationBps",
             "maxStalenessSecs",
+            "priceDecimals",
             "priceUnit",
             "disclaimer",
         ] {

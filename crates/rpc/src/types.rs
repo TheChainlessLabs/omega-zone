@@ -259,6 +259,71 @@ pub enum DepositState {
     Failed,
 }
 
+/// Chain that emitted the canonical source event for an activity row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ActivitySourceChain {
+    /// The private Zone L2.
+    Zone,
+    /// The Tempo settlement chain.
+    Tempo,
+}
+
+/// Kind discriminator for a unified activity row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ActivityKind {
+    Order,
+    Fill,
+    Transfer,
+    Deposit,
+    Withdrawal,
+}
+
+/// Canonical event coordinates attached to an activity row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivitySource {
+    pub chain: ActivitySourceChain,
+    pub block_number: U64,
+    pub tx_hash: B256,
+    pub tx_index: U64,
+    pub log_index: U64,
+}
+
+/// One item returned by `zone_getMyActivity`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivityEntry {
+    pub id: String,
+    pub kind: ActivityKind,
+    /// Unix timestamp of the activity's first canonical event.
+    pub occurred_at: U64,
+    /// Unix timestamp of the latest lifecycle event folded into this row.
+    pub updated_at: U64,
+    pub source: ActivitySource,
+    /// Tagged `{ type, details }` payload consumed by the frontend.
+    pub payload: Value,
+}
+
+/// Latest chain tips included by the activity indexer read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivityIndexedThrough {
+    pub zone_block: U64,
+    pub tempo_block: U64,
+}
+
+/// Stable, newest-first unified activity page.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivityPage {
+    pub items: Vec<ActivityEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    pub indexed_through: ActivityIndexedThrough,
+}
+
 /// On-chain market token metadata returned by `zone_getMarketConfig`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -285,6 +350,18 @@ pub enum MarketAction {
     LimitAsk,
 }
 
+/// Time-in-force capability advertised by the market registry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MarketTimeInForce {
+    /// Good til cancelled.
+    Gtc,
+    /// Immediate or cancel.
+    Ioc,
+    /// Fill or kill.
+    Fok,
+}
+
 /// Per-pair market entry returned by `zone_getMarketConfig`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -297,10 +374,16 @@ pub struct MarketEntry {
     pub quote: MarketToken,
     /// Minimum order quantity in base-token units.
     pub min_order_amount: U128,
+    /// Number of fractional decimals in each fixed-point order price.
+    pub price_decimals: u8,
     /// Human-readable description of the price representation.
     pub price_unit: String,
     /// Order actions the darkpool supports for this pair.
     pub allowed_actions: Vec<MarketAction>,
+    /// Time-in-force values accepted by market orders.
+    pub market_time_in_force: Vec<MarketTimeInForce>,
+    /// Time-in-force values accepted by limit orders.
+    pub limit_time_in_force: Vec<MarketTimeInForce>,
 }
 
 /// Response payload for `zone_getMarketConfig`.
@@ -327,7 +410,7 @@ pub struct MarketPair {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OrderLevel {
-    /// Price in raw integer units.
+    /// Price as a six-decimal fixed-point quote-per-base integer.
     pub price: U128,
     /// Aggregate resting quantity at this price level.
     pub quantity: U128,
@@ -371,7 +454,7 @@ pub struct HistoryAvailability {
 pub struct MidpointSample {
     /// Bucket end timestamp.
     pub timestamp: U64,
-    /// Midpoint price for the bucket in raw integer units.
+    /// Midpoint price for the bucket as a six-decimal fixed-point integer.
     pub midpoint: U128,
 }
 
@@ -384,7 +467,7 @@ pub struct MidpointSample {
 /// snapshot is within the configured staleness window.
 ///
 /// This is alpha infrastructure — not a production oracle. Units match the
-/// darkpool orderbook precompile (raw integer price; `quote = baseAmount * price`).
+/// darkpool orderbook precompile (`quote = floor(baseAmount * price / 1_000_000)`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReferencePriceResponse {
@@ -396,7 +479,7 @@ pub struct ReferencePriceResponse {
     pub base: Address,
     /// Quote token address.
     pub quote: Address,
-    /// Snapshot price (raw integer). Present iff `enabled`.
+    /// Snapshot price as a six-decimal fixed-point integer. Present iff enabled.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub price: Option<U128>,
     /// Origin tag (e.g. `"static:alpha"`). Present iff `enabled`.
@@ -424,6 +507,8 @@ pub struct ReferencePriceResponse {
     /// Present iff `enabled`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_staleness_secs: Option<u64>,
+    /// Number of fractional decimals in the fixed-point reference price.
+    pub price_decimals: u8,
     /// Description of the price representation.
     pub price_unit: String,
     /// Alpha caveat surfaced verbatim to clients.
@@ -435,7 +520,8 @@ pub struct ReferencePriceResponse {
 
 /// Stable identifier for the price-unit and disclaimer strings the public
 /// reference-price methods are required to surface.
-pub const REFERENCE_PRICE_UNIT: &str = "raw integer; quote = baseAmount * price";
+pub const REFERENCE_PRICE_UNIT: &str =
+    "fixed-point integer (6 decimals); quote = floor(baseAmount * price / 1000000)";
 pub const REFERENCE_PRICE_DISCLAIMER: &str = "alpha infrastructure; not a production oracle";
 
 /// Response payload for `zone_getMidpointHistory`.
@@ -692,6 +778,7 @@ pub fn classify_method(method: &str) -> Option<MethodTier> {
         | "zone_getMyOrders"
         | "zone_getMyFills"
         | "zone_getMyTransfers"
+        | "zone_getMyActivity"
         | "zone_getOrder" => Some(MethodTier::Public),
 
         // Fetch-then-check: public but redacted based on caller identity
@@ -797,13 +884,16 @@ mod tests {
                 decimals: 6,
             },
             min_order_amount: U128::from(100u128),
-            price_unit: "raw integer; quote = baseAmount * price".to_string(),
+            price_decimals: 6,
+            price_unit: REFERENCE_PRICE_UNIT.to_string(),
             allowed_actions: vec![
                 MarketAction::MarketBuy,
                 MarketAction::MarketSell,
                 MarketAction::LimitBid,
                 MarketAction::LimitAsk,
             ],
+            market_time_in_force: vec![MarketTimeInForce::Ioc, MarketTimeInForce::Fok],
+            limit_time_in_force: vec![MarketTimeInForce::Gtc],
         }
     }
 
@@ -823,6 +913,7 @@ mod tests {
             "0x0b00000000000000000000000000000000000001"
         );
         assert_eq!(market["pair"], "OALPHA/PATH.USD");
+        assert_eq!(market["priceDecimals"], 6);
         assert_eq!(
             market["base"]["address"],
             "0x20c000000000000000000000518ddadd37ed1d28"
@@ -831,6 +922,8 @@ mod tests {
             market["allowedActions"],
             json!(["marketBuy", "marketSell", "limitBid", "limitAsk"])
         );
+        assert_eq!(market["marketTimeInForce"], json!(["ioc", "fok"]));
+        assert_eq!(market["limitTimeInForce"], json!(["gtc"]));
     }
 
     #[test]

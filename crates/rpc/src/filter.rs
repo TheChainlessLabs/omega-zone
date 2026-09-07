@@ -80,7 +80,10 @@ pub fn is_caller_eligible(log: &Log, caller: &Address) -> bool {
 /// 1. Its topic0 is one of the [`WHITELISTED_TOPICS`].
 /// 2. The `caller` is eligible per [`is_caller_eligible`].
 pub fn is_log_visible(log: &Log, caller: &Address) -> bool {
-    log.topic0().is_some_and(|t| WHITELISTED_TOPICS.contains(t)) && is_caller_eligible(log, caller)
+    (log.topic0().is_some_and(|t| WHITELISTED_TOPICS.contains(t))
+        && is_caller_eligible(log, caller))
+        || (log.address() == crate::darkpool::DARKPOOL_ADDRESS
+            && crate::darkpool::caller_is_party(log, caller))
 }
 
 /// Renumbers ordering fields on a sequence of logs so that

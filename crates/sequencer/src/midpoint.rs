@@ -63,7 +63,7 @@ pub fn interval_seconds(interval: &str) -> Option<u64> {
 pub struct RawSample {
     /// Wall-clock seconds since UNIX epoch.
     pub timestamp: u64,
-    /// Midpoint price in raw integer units.
+    /// Midpoint price as a six-decimal fixed-point integer.
     pub midpoint: u128,
 }
 

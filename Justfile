@@ -1084,8 +1084,8 @@ alpha-deposit oalpha_amount="10000000" pathusd_amount="10000000" to="":
 # (covered by `alpha-approve-portal`) and a sufficient zone balance. See the
 # "Approvals: portal yes, darkpool no" section in docs/ALPHA.md.
 [group('alpha')]
-[doc('Places one resting bid (price=bid_price) and one resting ask (price=ask_price) for OALPHA/pathUSD on the alpha darkpool. Signs with MAKER_KEY env var. Maker must already hold OALPHA + pathUSD on the zone. No darkpool approve is needed — see docs/ALPHA.md.')]
-alpha-seed-liquidity amount="1000000" bid_price="1" ask_price="2" rpc=zone_rpc:
+[doc('Places one resting bid and ask for OALPHA/pathUSD using six-decimal fixed-point prices. Signs with MAKER_KEY env var. Maker must already hold OALPHA + pathUSD on the zone. No darkpool approve is needed — see docs/ALPHA.md.')]
+alpha-seed-liquidity amount="1000000" bid_price="1000000" ask_price="2000000" rpc=zone_rpc:
     #!/bin/bash
     set -euo pipefail
     MK="${MAKER_KEY:?Set MAKER_KEY env var (maker private key for the resting orders)}"
@@ -1094,16 +1094,17 @@ alpha-seed-liquidity amount="1000000" bid_price="1" ask_price="2" rpc=zone_rpc:
         exit 1
     fi
     MAKER_ADDR=$(cast wallet address "$MK")
+    BID_ESCROW=$(( ({{amount}} * {{bid_price}} + 999999) / 1000000 ))
     echo "Seeding OALPHA / pathUSD darkpool liquidity from maker $MAKER_ADDR..."
-    echo "  bid: {{amount}} OALPHA @ {{bid_price}}  (escrows {{amount}}*{{bid_price}} pathUSD)"
-    BID_TX=$(cast send "{{alpha_darkpool}}" "place(address,address,uint128,uint128,bool)" \
-        "{{alpha_oalpha}}" "{{alpha_pathusd}}" "{{amount}}" "{{bid_price}}" true \
-        --rpc-url "{{rpc}}" --private-key "$MK" --gas-limit 500000 --json | jq -r '.transactionHash')
+    echo "  bid: {{amount}} OALPHA @ {{bid_price}} fixed-point  (escrows $BID_ESCROW pathUSD units)"
+    BID_TX=$(cast send "{{alpha_darkpool}}" "place(address,address,uint128,uint128,bool,uint8)" \
+        "{{alpha_oalpha}}" "{{alpha_pathusd}}" "{{amount}}" "{{bid_price}}" true 0 \
+        --rpc-url "{{rpc}}" --private-key "$MK" --gas-limit 4000000 --json | jq -r '.transactionHash')
     echo "  bid tx: $BID_TX"
     echo "  ask: {{amount}} OALPHA @ {{ask_price}}  (escrows {{amount}} OALPHA)"
-    ASK_TX=$(cast send "{{alpha_darkpool}}" "place(address,address,uint128,uint128,bool)" \
-        "{{alpha_oalpha}}" "{{alpha_pathusd}}" "{{amount}}" "{{ask_price}}" false \
-        --rpc-url "{{rpc}}" --private-key "$MK" --gas-limit 500000 --json | jq -r '.transactionHash')
+    ASK_TX=$(cast send "{{alpha_darkpool}}" "place(address,address,uint128,uint128,bool,uint8)" \
+        "{{alpha_oalpha}}" "{{alpha_pathusd}}" "{{amount}}" "{{ask_price}}" false 0 \
+        --rpc-url "{{rpc}}" --private-key "$MK" --gas-limit 4000000 --json | jq -r '.transactionHash')
     echo "  ask tx: $ASK_TX"
 
 [group('alpha')]
@@ -1152,7 +1153,7 @@ alpha-state rpc=zone_rpc:
 
 [group('alpha')]
 [doc('One-shot private-alpha bring-up: enables OALPHA if needed, prefunds + deposits for USER and MAKER, seeds resting bid/ask around price 1, prints final state. Requires USER_KEY, MAKER_KEY, SEQUENCER_KEY, L1_RPC_URL env vars.')]
-alpha-setup oalpha_amount="10000000" pathusd_amount="10000000" seed_amount="1000000" bid_price="1" ask_price="2" rpc=zone_rpc:
+alpha-setup oalpha_amount="10000000" pathusd_amount="10000000" seed_amount="1000000" bid_price="1000000" ask_price="2000000" rpc=zone_rpc:
     #!/bin/bash
     set -euo pipefail
     USER_KEY_VAL="${USER_KEY:?Set USER_KEY env var (frontend tester private key)}"
