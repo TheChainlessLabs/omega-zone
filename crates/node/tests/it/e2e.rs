@@ -11,7 +11,6 @@ use alloy_eips::NumHash;
 use alloy_provider::{DynProvider, Provider};
 use alloy_rpc_types_eth::TransactionRequest;
 use alloy_sol_types::SolCall;
-use tempo_chainspec::spec::TEMPO_T0_BASE_FEE;
 use tempo_precompiles::PATH_USD_ADDRESS;
 use tempo_zone_contracts::{
     TEMPO_STATE_ADDRESS, TempoState, Withdrawal, ZONE_INBOX_ADDRESS, ZONE_OUTBOX_ADDRESS,
@@ -84,8 +83,8 @@ async fn test_contract_creation_transaction_is_rejected() -> eyre::Result<()> {
 
     let mut request = TransactionRequest::default().input(Bytes::from_static(&[0x00]).into());
     request.to = Some(TxKind::Create);
-    request.gas = Some(100_000);
-    request.gas_price = Some(TEMPO_T0_BASE_FEE as u128);
+    request.gas = Some(1_000_000);
+    request.gas_price = Some(provider.get_gas_price().await?);
 
     let err = provider
         .send_transaction(request)
@@ -548,8 +547,6 @@ async fn submit_withdrawal(
             Bytes::new(),
             Bytes::new(),
         )
-        .gas_price(TEMPO_T0_BASE_FEE as u128)
-        .gas(WITHDRAWAL_TX_GAS)
         .send()
         .await?;
     fixture.inject_empty_block(zone.deposit_queue());
@@ -995,7 +992,6 @@ async fn test_withdrawal_request_rejects_over_max_callback_gas() -> eyre::Result
             Bytes::from_static(b"callback"),
             Bytes::new(),
         )
-        .gas_price(TEMPO_T0_BASE_FEE as u128)
         .gas(WITHDRAWAL_TX_GAS)
         .send()
         .await?;
