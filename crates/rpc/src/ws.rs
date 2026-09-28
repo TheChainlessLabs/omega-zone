@@ -22,7 +22,11 @@ use axum::{
 use futures::{SinkExt, stream::StreamExt};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, value::RawValue};
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 use tokio::{
     sync::{mpsc, watch},
     task::JoinHandle,
@@ -31,7 +35,9 @@ use tracing::warn;
 
 use crate::{
     auth::{self, AuthContext, AuthError},
-    server::{MAX_BATCH_SIZE, RpcState, authenticate_token, dispatch_request},
+    server::{
+        MAX_BATCH_SIZE, RpcState, authenticate_token, dispatch_request, validate_keychain_key_info,
+    },
     subscription::WsSubscriptionStream,
     types::{JsonRpcError, JsonRpcRequest, JsonRpcResponse, to_raw},
 };
@@ -57,6 +63,7 @@ struct ActiveSubscription {
     task: JoinHandle<()>,
 }
 
+/// Subscription stream accepted by RPC dispatch but not yet spawned.
 struct PendingSubscription {
     id: FilterId,
     stream: WsSubscriptionStream,
@@ -163,6 +170,7 @@ fn subscription_notification_raw(subscription_id: &FilterId, result: &RawValue) 
     .expect("subscription notification serialization is infallible")
 }
 
+/// Forward subscription stream items into the session outbound queue.
 fn spawn_subscription(
     subscription_id: FilterId,
     mut subscription: WsSubscriptionStream,
@@ -292,32 +300,10 @@ async fn handle_subscribe(
             }
         }
         SubscriptionKind::NewPendingTransactions => {
-            let full = match params.unwrap_or(SubscriptionParams::None) {
-                SubscriptionParams::None | SubscriptionParams::Bool(false) => false,
-                SubscriptionParams::Bool(true) => true,
-                SubscriptionParams::Logs(_) | SubscriptionParams::TransactionReceipts(_) => {
-                    return WsDispatchResult::response_only(JsonRpcResponse::error(
-                        req.id.clone(),
-                        JsonRpcError::invalid_params(
-                            "eth_subscribe(newPendingTransactions) expects an optional boolean",
-                        ),
-                    ));
-                }
-            };
-
-            match state
-                .api
-                .ws_subscribe_pending_transactions(full, auth.clone())
-                .await
-            {
-                Ok(subscription) => subscription,
-                Err(err) => {
-                    return WsDispatchResult::response_only(JsonRpcResponse::error(
-                        req.id.clone(),
-                        err,
-                    ));
-                }
-            }
+            return WsDispatchResult::response_only(JsonRpcResponse::error(
+                req.id.clone(),
+                JsonRpcError::method_disabled(),
+            ));
         }
         SubscriptionKind::Syncing => {
             return WsDispatchResult::response_only(JsonRpcResponse::error(
@@ -469,6 +455,31 @@ fn activate_pending_subscriptions(
     }
 }
 
+/// Time remaining until the given unix-second deadline, using the full system
+/// clock precision (not truncated to whole seconds) so the session closes as
+/// close as possible to the exact `expires_at` boundary.
+fn duration_until_unix_timestamp(timestamp: u64) -> Duration {
+    let deadline = UNIX_EPOCH + Duration::from_secs(timestamp);
+    deadline
+        .duration_since(SystemTime::now())
+        .unwrap_or_default()
+}
+
+/// Re-check keychain auth for long-lived WebSocket sessions.
+async fn keychain_auth_still_valid(auth: &AuthContext, state: &RpcState) -> bool {
+    let Some(key_id) = auth.keychain_key_id else {
+        return true;
+    };
+
+    match state.api.get_keychain_key(auth.caller, key_id).await {
+        Ok(key_info) => validate_keychain_key_info(&key_info).is_ok(),
+        Err(err) => {
+            warn!(target: "zone::rpc", err = %err, "ws keychain revalidation failed");
+            false
+        }
+    }
+}
+
 /// WebSocket upgrade handler — authenticates via header or `?token=` query param.
 pub(crate) async fn handle_ws_upgrade(
     State(state): State<Arc<RpcState>>,
@@ -510,6 +521,9 @@ async fn handle_ws_session(
     let (mut ws_sender, mut ws_receiver) = socket.split();
     let (notifications, mut outbound) = mpsc::channel::<String>(MAX_WS_OUTBOUND_QUEUE);
     let (close_session, mut close_session_rx) = watch::channel(false);
+    let token_expiry = tokio::time::sleep(duration_until_unix_timestamp(auth.expires_at));
+    tokio::pin!(token_expiry);
+    let mut keychain_recheck = tokio::time::interval(Duration::from_secs(1));
     let writer = tokio::spawn(async move {
         while let Some(message) = outbound.recv().await {
             if ws_sender.send(Message::Text(message.into())).await.is_err() {
@@ -522,7 +536,23 @@ async fn handle_ws_session(
 
     loop {
         let msg = tokio::select! {
+            biased;
+            _ = &mut token_expiry => break,
             _ = close_session_rx.changed() => break,
+            _ = keychain_recheck.tick(), if auth.keychain_key_id.is_some() => {
+                // Revalidation may be slow; allow token expiry / forced close to
+                // interrupt it so those deadlines are not delayed by a hung RPC.
+                let still_valid = tokio::select! {
+                    biased;
+                    _ = &mut token_expiry => false,
+                    _ = close_session_rx.changed() => false,
+                    valid = keychain_auth_still_valid(&auth, &state) => valid,
+                };
+                if !still_valid {
+                    break;
+                }
+                continue;
+            }
             msg = ws_receiver.next() => match msg {
                 Some(msg) => msg,
                 None => break,

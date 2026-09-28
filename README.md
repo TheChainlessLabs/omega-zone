@@ -37,6 +37,29 @@ You can get started today by [deploying a Zone](#getting-started) on Tempo testn
 
 Prerequisites: [Rust](https://rustup.rs/), [Foundry](https://book.getfoundry.sh/getting-started/installation), [`just`](https://github.com/casey/just#packages), [`jq`](https://jqlang.github.io/jq/download/)
 
+### Local Development with Anvil
+
+Use Foundry 1.8 or newer, or a nightly build from July 11, 2026 or later,
+then run Anvil in Tempo mode:
+
+```bash
+anvil --network tempo --block-time 1
+```
+
+Provision and run a fresh zone against its WebSocket endpoint:
+
+```bash
+cargo run --release --bin tempo-zone -- dev \
+  --l1.rpc-url ws://127.0.0.1:8545
+```
+
+The default Anvil dev key is used automatically. The zone HTTP RPC listens on
+`http://127.0.0.1:9545`; generated metadata and node data are written under
+`/tmp/tempo-zone-dev`.
+
+Older Anvil builds only add Tempo fields to Ethereum headers at the RPC layer.
+The dev command rejects those builds because Zones require canonical Tempo block
+hashes and parent links.
 
 ### Deploying a Zone
 
@@ -46,7 +69,7 @@ export L1_RPC_URL="wss://rpc.moderato.tempo.xyz"
 just deploy-zone my-zone
 ```
 
-The `deploy-zone` command generates a sequencer keypair, funds it on L1, deploys the portal via `ZoneFactory`, generates genesis, and starts the node.
+The `deploy-zone` command generates admin and sequencer keypairs, funds them on L1, deploys the portal via `ZoneFactory`, generates genesis, and starts the node.
 
 ```bash
 # Start/restart a zone after initial deployment
@@ -57,6 +80,7 @@ just zone-up my-zone
 
 ```bash
 export L1_PORTAL_ADDRESS=$(jq -r '.portal' generated/my-zone/zone.json)
+export PRIVATE_KEY=$(jq -r '.sequencerKey' generated/my-zone/zone.json)
 just max-approve-portal
 
 # deposit into the zone
@@ -115,6 +139,8 @@ The Omega alpha path uses this repo as the backend target for a Tempo Zone with:
 
 Relevant docs:
 
+- [docs/ZONE_DARKPOOL_INTERACTION.md](docs/ZONE_DARKPOOL_INTERACTION.md) — practical zone and darkpool command guide
+- [docs/TEMPO_WALLET_INTERACTION.md](docs/TEMPO_WALLET_INTERACTION.md) — direct Tempo Wallet integration guide
 - [docs/ALPHA.md](docs/ALPHA.md) — private-alpha OALPHA / PATH.USD setup
 - [docs/TEE_PROOF.md](docs/TEE_PROOF.md) — proof provider and live-verifier blockers
 - [docs/RUNBOOK_FIRST_BATCH.md](docs/RUNBOOK_FIRST_BATCH.md) — settlement preflight and first-batch runbook

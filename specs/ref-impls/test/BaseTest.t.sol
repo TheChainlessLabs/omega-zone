@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.13;
 
-import { BLOCKHASH_HISTORY } from "../src/zone/BlockHashHistory.sol";
-import { ZONE_TX_CONTEXT } from "../src/zone/IZone.sol";
-import { MockEIP2935 } from "./zone/mocks/MockEIP2935.sol";
-import { MockZoneTxContext } from "./zone/mocks/MockZoneTxContext.sol";
+import { ZONE_TX_CONTEXT } from "../src/interfaces/IZone.sol";
+import { EIP2935 } from "../src/libraries/BlockHashHistory.sol";
+import { MockZoneTxContext } from "./mocks/MockZoneTxContext.sol";
 import { Test, console } from "forge-std/Test.sol";
 import { StdPrecompiles } from "tempo-std/StdPrecompiles.sol";
 import { IAccountKeychain } from "tempo-std/interfaces/IAccountKeychain.sol";
@@ -30,8 +29,12 @@ contract BaseTest is Test {
     address internal constant _FEE_AMM = StdPrecompiles.TIP_FEE_MANAGER_ADDRESS;
     address internal constant _NONCE = StdPrecompiles.NONCE_ADDRESS;
     address internal constant _VALIDATOR_CONFIG = StdPrecompiles.VALIDATOR_CONFIG_ADDRESS;
-    address internal constant _BLOCKHASH_HISTORY = BLOCKHASH_HISTORY;
+    address internal constant _BLOCKHASH_HISTORY = EIP2935;
     address internal constant _ZONE_TX_CONTEXT = ZONE_TX_CONTEXT;
+
+    // EIP-2935 serve window: hashes for the most recent 8191 blocks are available
+    // (block.number - 8191 ..= block.number - 1); reads outside that range return zero.
+    uint256 internal constant BLOCKHASH_HISTORY_WINDOW = 8191;
 
     // Role constants
     bytes32 internal constant _ISSUER_ROLE = keccak256("ISSUER_ROLE");
@@ -41,7 +44,8 @@ contract BaseTest is Test {
     bytes32 internal constant _RECEIVE_WITH_MEMO_ROLE = keccak256("RECEIVE_WITH_MEMO_ROLE");
 
     // Common test addresses
-    address public admin = address(this);
+    address public admin = address(0x500);
+    address public sequencer = address(this);
     address public alice = address(0x200);
     address public bob = address(0x300);
     address public charlie = address(0x400);
@@ -89,11 +93,6 @@ contract BaseTest is Test {
             revert MissingPrecompile("ValidatorConfig", _VALIDATOR_CONFIG);
         }
 
-        // Install EIP-2935 mock when absent so zone tests can still run
-        if (_BLOCKHASH_HISTORY.code.length == 0) {
-            MockEIP2935 mock2935 = new MockEIP2935();
-            vm.etch(_BLOCKHASH_HISTORY, address(mock2935).code);
-        }
         if (_BLOCKHASH_HISTORY.code.length == 0) {
             revert MissingPrecompile("BlockHashHistory", _BLOCKHASH_HISTORY);
         }
@@ -106,18 +105,9 @@ contract BaseTest is Test {
             revert MissingPrecompile("ZoneTxContext", _ZONE_TX_CONTEXT);
         }
 
-        // Set ValidatorConfig owner to admin via direct storage write
+        // Set ValidatorConfig owner to sequencer via direct storage write
         // owner is at slot 0 in ValidatorConfig
-        vm.store(_VALIDATOR_CONFIG, bytes32(uint256(0)), bytes32(uint256(uint160(admin))));
-
-        // Grant DEFAULT_ADMIN_ROLE to admin for pathUSD via direct storage write
-        bytes32 adminRoleSlot = keccak256(
-            abi.encode(
-                bytes32(0), // DEFAULT_ADMIN_ROLE
-                keccak256(abi.encode(admin, uint256(0)))
-            )
-        );
-        vm.store(_PATH_USD, adminRoleSlot, bytes32(uint256(1)));
+        vm.store(_VALIDATOR_CONFIG, bytes32(uint256(0)), bytes32(uint256(uint160(sequencer))));
 
         // Grant DEFAULT_ADMIN_ROLE to pathUSDAdmin
         bytes32 tempoAdminRoleSlot = keccak256(
@@ -129,10 +119,14 @@ contract BaseTest is Test {
         vm.store(_PATH_USD, tempoAdminRoleSlot, bytes32(uint256(1)));
 
         token1 = ITIP20Token(
-            factory.createToken("TOKEN1", "T1", "USD", ITIP20(_PATH_USD), admin, bytes32("token1"))
+            factory.createToken(
+                "TOKEN1", "T1", "USD", ITIP20(_PATH_USD), sequencer, bytes32("token1")
+            )
         );
         token2 = ITIP20Token(
-            factory.createToken("TOKEN2", "T2", "USD", ITIP20(_PATH_USD), admin, bytes32("token2"))
+            factory.createToken(
+                "TOKEN2", "T2", "USD", ITIP20(_PATH_USD), sequencer, bytes32("token2")
+            )
         );
     }
 

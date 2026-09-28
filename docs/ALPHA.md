@@ -74,7 +74,8 @@ Two TIP-20 spenders show up in this flow — the **L1 portal** and the
 
 The only zone-side prerequisite for `alpha-seed-liquidity` is that the
 maker holds enough OALPHA + pathUSD on the zone to cover the escrow
-(`amount * bid_price` pathUSD for the bid, `amount` OALPHA for the ask).
+(`ceil(amount * bid_price / 1_000_000)` pathUSD units for the bid and
+`amount` OALPHA units for the ask).
 `alpha-setup` deposits both before seeding.
 
 > If a future change moves the alpha flow onto session keys / access
@@ -136,8 +137,9 @@ What it does:
    alpha portal for pathUSD and OALPHA, then deposits both into zone 35.
 4. MAKER `alpha-approve-portal` + `alpha-deposit` — same flow for the
    maker wallet.
-5. `alpha-seed-liquidity` — MAKER places a resting bid (price=1) and a
-   resting ask (price=2) for OALPHA against pathUSD on the alpha darkpool.
+5. `alpha-seed-liquidity` — MAKER places a resting bid at `1.000000`
+   (scaled price `1000000`) and a resting ask at `2.000000` (scaled price
+   `2000000`) for OALPHA against pathUSD on the alpha darkpool.
 6. `alpha-state` — prints USER/MAKER L1 and zone balances plus
    `bestBid(OALPHA)` / `bestAsk(OALPHA)` so the tester can confirm the UI
    has a market to trade against. Top-of-book is a temporary alpha
@@ -151,8 +153,8 @@ Defaults (override as positional args to `just alpha-setup`):
 | `oalpha_amount`   | `10000000`  | OALPHA deposited per wallet (10 OALPHA)     |
 | `pathusd_amount`  | `10000000`  | pathUSD deposited per wallet (10 PATH.USD)  |
 | `seed_amount`     | `1000000`   | Maker order quantity (1 OALPHA per side)    |
-| `bid_price`       | `1`         | Resting bid price                            |
-| `ask_price`       | `2`         | Resting ask price (must be > `bid_price`)   |
+| `bid_price`       | `1000000`   | Resting bid price (`1.000000` pathUSD)      |
+| `ask_price`       | `2000000`   | Resting ask price (`2.000000` pathUSD)      |
 
 ## Re-running individual steps
 
@@ -175,7 +177,7 @@ PRIVATE_KEY="$USER_KEY"  just alpha-deposit 5000000 5000000
 PRIVATE_KEY="$MAKER_KEY" just alpha-deposit 5000000 5000000
 
 # Add more resting liquidity (does not cancel existing orders)
-just alpha-seed-liquidity 500000 1 2
+just alpha-seed-liquidity 500000 1000000 2000000
 
 # Re-print the frontend state
 just alpha-state
@@ -188,8 +190,8 @@ After `just alpha-setup` completes you should see:
 - `pathusd ... enabled=true`
 - `oalpha  ... enabled=true`
 - Both USER and MAKER showing nonzero zone balances for both tokens
-- `best bid (price, quantity): 1 1000000` (or whichever bid_price/seed_amount you passed)
-- `best ask (price, quantity): 2 1000000`
+- `best bid (price, quantity): 1000000 1000000` (or whichever scaled bid price/order amount you passed)
+- `best ask (price, quantity): 2000000 1000000`
 
 If `bestBid` or `bestAsk` come back as `0 0`, `alpha-seed-liquidity`
 failed (most often: maker zone balances are below `seed_amount`, or
@@ -198,8 +200,9 @@ up the maker.
 
 ## Midpoint chart history (`zone_getMidpointHistory`)
 
-The private RPC backs the alpha frontend chart with an in-memory aggregate
-midpoint sampler. It reads the darkpool's aggregate top-of-book
+The private RPC backs frontend charts with per-market in-memory aggregate
+midpoint samplers. It discovers registered markets from the darkpool and reads
+each market's aggregate top-of-book
 (`bestBid` / `bestAsk`) on a fixed cadence and stores `(timestamp, midpoint)`
 samples — no account, order id, maker, taker, or fill-level data.
 
@@ -209,7 +212,7 @@ Response contract:
   private RPC has booted). The frontend can render the chart.
 - `samples` is empty when the book has never had two-sided liquidity since
   process start — the sampler skips writes when either side is missing.
-- `pair`, `base`, and `quote` echo the canonical alpha market.
+- `pair`, `base`, and `quote` identify the requested darkpool market.
 
 Supported `interval` labels (bucket size in parentheses):
 
@@ -232,8 +235,8 @@ current page when older buckets exist. Re-issue the call with that value as
 `cursor` to walk further back. Limits cap at `5000` samples per page; the
 default is `500`.
 
-Unsupported pairs (anything other than `OALPHA/PATH.USD`) still return the
-existing unsupported-pair `invalid_params` error.
+Pairs not registered in the darkpool return a market-not-found
+`invalid_params` error. The RPC does not maintain a separate pair allowlist.
 
 ## Public reference price (alpha guardrail, not an oracle)
 
@@ -254,15 +257,15 @@ fall back to a private orderbook midpoint and pretend it is an oracle.
 
 ### Units
 
-Prices are raw integer values matching the darkpool orderbook precompile.
-For a trade of `baseAmount` base tokens at `price`:
+Prices are six-decimal fixed-point integers matching the darkpool orderbook
+precompile. For a trade of `baseAmount` base tokens at `price`:
 
 ```text
-quoteAmount = baseAmount * price
+quoteAmount = floor(baseAmount * price / 1_000_000)
 ```
 
-(No additional decimals scaling — both base and quote are TIP-20 6-decimal
-tokens, and the precompile does not apply implicit decimal adjustments.)
+Both launch-market tokens have six token decimals, and a human-readable price
+of `1.0001` is represented on-chain as `1_000_100`. Bid reserves round up.
 
 ### Guardrail semantics
 
@@ -295,7 +298,7 @@ Example: pin the OALPHA/PATH.USD static reference at `1` with the default
 
 ```bash
 tempo-zone \
-  --ref-price.static-price 1 \
+  --ref-price.static-price 1000000 \
   --ref-price.source static:alpha \
   --ref-price.max-deviation-bps 1000 \
   ...
@@ -311,6 +314,6 @@ three flags are inert until a price is supplied.
 | `ERROR: 'alphausd' resolves to 0x20C0…0001`                | You passed the wrong alias — use `oalpha`.                                                                  |
 | `isTokenEnabled(OALPHA) = false` after `alpha-enable-oalpha` | `SEQUENCER_KEY` does not match the alpha portal's sequencer. Check `zone-info 35`.                          |
 | `alpha-deposit` reverts                                    | The signing wallet has no OALPHA on L1. Ask the alpha admin to `mint-tokens` to that address.               |
-| `alpha-seed-liquidity` reverts on the bid                  | Maker has not deposited enough pathUSD into the zone (bid escrows `amount * bid_price` pathUSD).            |
+| `alpha-seed-liquidity` reverts on the bid                  | Maker has not deposited enough pathUSD into the zone (bid escrows `ceil(amount * bid_price / 1000000)`).    |
 | `alpha-seed-liquidity` reverts on the ask                  | Maker has not deposited enough OALPHA into the zone (ask escrows `amount` OALPHA).                          |
 | `best bid` and `best ask` show `0 0`                       | No resting liquidity. Re-run `alpha-seed-liquidity` after confirming maker zone balances cover the escrow.  |

@@ -4,15 +4,19 @@ pragma solidity ^0.8.13;
 import {
     IZoneConfig,
     IZoneOutbox,
+    IZonePortal,
     IZoneToken,
     IZoneTxContext,
     LastBatch,
+    MAX_WITHDRAWAL_CALLBACK_GAS,
     PendingWithdrawal,
     Withdrawal,
+    ZONE_INBOX,
     ZONE_TX_CONTEXT
-} from "./IZone.sol";
+} from "../interfaces/IZone.sol";
 
-import { EMPTY_SENTINEL } from "./WithdrawalQueueLib.sol";
+import { Secp256k1Lib } from "../libraries/Secp256k1Lib.sol";
+import { EMPTY_SENTINEL } from "../libraries/WithdrawalQueueLib.sol";
 
 /// @title ZoneOutbox
 /// @notice Zone-side predeploy for requesting withdrawals back to Tempo
@@ -27,6 +31,10 @@ contract ZoneOutbox is IZoneOutbox {
     /// @notice Maximum size of callback data in bytes
     /// @dev Limits storage costs and hash computation overhead
     uint256 public constant MAX_CALLBACK_DATA_SIZE = 1024;
+
+    /// @notice Maximum gas a withdrawal callback may request
+    /// @dev The L1 processor adds overhead and an EIP-150 cushion around this value.
+    uint64 public constant MAX_WITHDRAWAL_GAS_LIMIT = MAX_WITHDRAWAL_CALLBACK_GAS;
 
     /// @notice Maximum gas fee rate ($1 per gas for 6-decimal stablecoins)
     /// @dev Ensures gasLimit (uint64) * gasFeeRate fits in uint128 without overflow.
@@ -43,14 +51,6 @@ contract ZoneOutbox is IZoneOutbox {
     /// @notice Length of `encryptedSender` when selective reveal is enabled
     /// @dev compressed ephemeral pubkey (33) || nonce (12) || ciphertext (52) || tag (16)
     uint256 public constant AUTHENTICATED_WITHDRAWAL_CIPHERTEXT_LENGTH = 113;
-
-    /// @notice secp256k1 field prime
-    uint256 internal constant SECP256K1_P =
-        0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F;
-
-    /// @notice (SECP256K1_P - 1) / 2 for Euler's criterion
-    uint256 internal constant SECP256K1_HALF_PM1 =
-        0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF7FFFFE17;
 
     /*//////////////////////////////////////////////////////////////
                                 STORAGE
@@ -91,6 +91,9 @@ contract ZoneOutbox is IZoneOutbox {
     /// @notice Block number for tracking per-block withdrawal count
     uint256 internal _currentBlockNumber;
 
+    /// @notice Timestamp of the latest withdrawal batch finalization.
+    uint64 public lastFinalizedTimestamp;
+
     /*//////////////////////////////////////////////////////////////
                                 ERRORS
     //////////////////////////////////////////////////////////////*/
@@ -104,8 +107,11 @@ contract ZoneOutbox is IZoneOutbox {
     error TooManyWithdrawalsThisBlock();
     error InvalidRevealTo();
     error InvalidCurrentTxHash();
+    error InvalidWithdrawalCount(uint256 actual, uint256 expected);
     error InvalidEncryptedSenderCount(uint256 actual, uint256 expected);
     error InvalidEncryptedSenderLength(uint256 actual, uint256 expected);
+    error GasLimitTooHigh();
+    error OnlyZoneInbox();
 
     /*//////////////////////////////////////////////////////////////
                               CONSTRUCTOR
@@ -140,12 +146,14 @@ contract ZoneOutbox is IZoneOutbox {
         emit MaxWithdrawalsPerBlockUpdated(_maxWithdrawalsPerBlock);
     }
 
-    /// @notice Calculate the fee for a withdrawal with the given gasLimit
-    /// @dev Fee = (WITHDRAWAL_BASE_GAS + gasLimit) * tempoGasRate. User must estimate total gas needed.
-    /// @param gasLimit Total gas limit (must cover processWithdrawal + any callback)
+    /// @notice Calculate the fee for a withdrawal with the given callback gas limit
+    /// @dev Reverts if `gasLimit` exceeds MAX_WITHDRAWAL_GAS_LIMIT.
+    ///      Fee = (WITHDRAWAL_BASE_GAS + gasLimit) * tempoGasRate.
+    /// @param gasLimit L1 callback gas limit (0 = no callback)
     /// @return fee The total fee in zone token units
     function calculateWithdrawalFee(uint64 gasLimit) public view returns (uint128 fee) {
-        fee = uint128(WITHDRAWAL_BASE_GAS + gasLimit) * tempoGasRate;
+        _validateGasLimit(gasLimit);
+        fee = _calculateWithdrawalFee(gasLimit);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -162,7 +170,7 @@ contract ZoneOutbox is IZoneOutbox {
     /// @param to The Tempo recipient address
     /// @param amount Amount to send to recipient (fee is additional)
     /// @param memo User-provided context (e.g., payment reference)
-    /// @param gasLimit Gas limit for IWithdrawalReceiver callback (0 = no callback)
+    /// @param gasLimit L1 callback gas limit (0 = no callback, capped by MAX_WITHDRAWAL_GAS_LIMIT)
     /// @param fallbackRecipient Zone address for bounce-back if callback fails
     /// @param data Calldata for IWithdrawalReceiver callback
     function requestWithdrawal(
@@ -189,7 +197,7 @@ contract ZoneOutbox is IZoneOutbox {
     /// @param to The Tempo recipient address
     /// @param amount Amount to send to recipient (fee is additional)
     /// @param memo User-provided context (e.g., payment reference)
-    /// @param gasLimit Gas limit for IWithdrawalReceiver callback (0 = no callback)
+    /// @param gasLimit L1 callback gas limit (0 = no callback, capped by MAX_WITHDRAWAL_GAS_LIMIT)
     /// @param fallbackRecipient Zone address for bounce-back if callback fails
     /// @param data Calldata for IWithdrawalReceiver callback
     /// @param revealTo Optional compressed secp256k1 pubkey for encrypted sender reveal
@@ -208,6 +216,18 @@ contract ZoneOutbox is IZoneOutbox {
         _requestWithdrawal(token, to, amount, memo, gasLimit, fallbackRecipient, data, revealTo);
     }
 
+    /// @notice Shared implementation for withdrawal requests with optional sender reveal
+    /// @dev Validates the callback gas cap before fee calculation and before storing
+    ///      the withdrawal, so over-cap requests cannot enter the L2 withdrawal queue.
+    ///      Transfers and burns `amount + fee` before appending the pending withdrawal.
+    /// @param token The TIP-20 token to withdraw
+    /// @param to The Tempo recipient address
+    /// @param amount Amount to send to recipient (fee is additional)
+    /// @param memo User-provided context (e.g., payment reference)
+    /// @param gasLimit L1 callback gas limit (0 = no callback)
+    /// @param fallbackRecipient Zone address for bounce-back if callback fails
+    /// @param data Calldata for IWithdrawalReceiver callback
+    /// @param revealTo Optional compressed secp256k1 pubkey for encrypted sender reveal
     function _requestWithdrawal(
         address token,
         address to,
@@ -224,6 +244,12 @@ contract ZoneOutbox is IZoneOutbox {
         if (fallbackRecipient == address(0)) {
             revert InvalidFallbackRecipient();
         }
+
+        if (!config.isEnabledToken(token)) {
+            revert IZonePortal.TokenNotEnabled();
+        }
+
+        _validateGasLimit(gasLimit);
 
         // Limit callback data size to prevent storage bloat and hash computation abuse
         if (data.length > MAX_CALLBACK_DATA_SIZE) {
@@ -246,7 +272,7 @@ contract ZoneOutbox is IZoneOutbox {
 
         // Calculate processing fee (locked in at request time)
         // Fee is paid in the same token being withdrawn
-        uint128 fee = calculateWithdrawalFee(gasLimit);
+        uint128 fee = _calculateWithdrawalFee(gasLimit);
         uint128 totalBurn = amount + fee;
         bytes32 txHash = IZoneTxContext(ZONE_TX_CONTEXT).currentTxHash();
         if (txHash == bytes32(0)) revert InvalidCurrentTxHash();
@@ -297,6 +323,49 @@ contract ZoneOutbox is IZoneOutbox {
         );
     }
 
+    /// @notice Enqueue a failed-deposit bounce-back withdrawal.
+    /// @dev Only the ZoneInbox may call this while processing the canonical deposit queue.
+    function enqueueDepositBounceBack(
+        address token,
+        uint128 amount,
+        address bouncebackRecipient
+    )
+        external
+    {
+        if (msg.sender != ZONE_INBOX) revert OnlyZoneInbox();
+
+        _pendingWithdrawals.push(
+            PendingWithdrawal({
+                token: token,
+                sender: address(0),
+                txHash: bytes32(0),
+                to: bouncebackRecipient,
+                amount: amount,
+                fee: 0,
+                memo: bytes32(0),
+                gasLimit: 0,
+                fallbackRecipient: address(0),
+                callbackData: "",
+                revealTo: ""
+            })
+        );
+
+        uint64 index = nextWithdrawalIndex++;
+        emit WithdrawalRequested(
+            index,
+            address(0),
+            token,
+            bouncebackRecipient,
+            amount,
+            0,
+            bytes32(0),
+            0,
+            address(0),
+            "",
+            ""
+        );
+    }
+
     /*//////////////////////////////////////////////////////////////
                               BATCH OPERATIONS
     //////////////////////////////////////////////////////////////*/
@@ -304,10 +373,11 @@ contract ZoneOutbox is IZoneOutbox {
     /// @notice Finalize the batch at end of block - build withdrawal hash and emit proof inputs
     /// @dev Only callable by sequencer at the end of a block.
     ///      The proof enforces that this is the last call in the block and that a batch
-    ///      ends with exactly one finalizeWithdrawalBatch call (use count = 0 if no withdrawals).
+    ///      ends with exactly one finalizeWithdrawalBatch call. `count` must equal the
+    ///      current pending withdrawal count (including 0 if no withdrawals).
     ///      Protocol and proof enforce this runs at the end of the final block in the batch.
     ///      Emits BatchFinalized for observability (proof reads from state).
-    /// @param count Max number of withdrawals to process (avoids unbounded loops)
+    /// @param count Number of pending withdrawals to process
     /// @param encryptedSenders One ciphertext per finalized withdrawal (empty for plaintext withdrawals)
     /// @return withdrawalQueueHash The hash chain (0 if no withdrawals)
     function finalizeWithdrawalBatch(
@@ -334,10 +404,7 @@ contract ZoneOutbox is IZoneOutbox {
 
         uint256 pending = _pendingWithdrawals.length - _pendingWithdrawalsHead;
 
-        // Clamp to actual pending count
-        if (count > pending) {
-            count = pending;
-        }
+        if (count != pending) revert InvalidWithdrawalCount(count, pending);
         if (encryptedSenders.length != count) {
             revert InvalidEncryptedSenderCount(encryptedSenders.length, count);
         }
@@ -395,6 +462,7 @@ contract ZoneOutbox is IZoneOutbox {
             withdrawalQueueHash: withdrawalQueueHash,
             withdrawalBatchIndex: currentWithdrawalBatchIndex
         });
+        lastFinalizedTimestamp = uint64(block.timestamp);
 
         // Emit event for observability (proof reads from state, not events)
         emit BatchFinalized(withdrawalQueueHash, currentWithdrawalBatchIndex);
@@ -408,9 +476,42 @@ contract ZoneOutbox is IZoneOutbox {
         return _pendingWithdrawals.length - _pendingWithdrawalsHead;
     }
 
+    /// @notice Pending withdrawals in FIFO order.
+    function getPendingWithdrawals() external view returns (PendingWithdrawal[] memory pending) {
+        if (_pendingWithdrawalsHead >= _pendingWithdrawals.length) {
+            return pending;
+        }
+
+        uint256 count = _pendingWithdrawals.length - _pendingWithdrawalsHead;
+        pending = new PendingWithdrawal[](count);
+        for (uint256 i = 0; i < count;) {
+            pending[i] = _pendingWithdrawals[_pendingWithdrawalsHead + i];
+            unchecked {
+                i++;
+            }
+        }
+    }
+
     /// @notice Last finalized batch parameters (for proof access via state root)
     function lastBatch() external view returns (LastBatch memory) {
         return _lastBatch;
+    }
+
+    /// @notice Revert if a withdrawal callback gas limit exceeds the protocol cap
+    /// @dev Applied by both fee estimation and request submission to keep the L2
+    ///      withdrawal queue free of callbacks that cannot fit in an L1 block.
+    /// @param gasLimit L1 callback gas limit requested by the user
+    function _validateGasLimit(uint64 gasLimit) internal pure {
+        if (gasLimit > MAX_WITHDRAWAL_GAS_LIMIT) revert GasLimitTooHigh();
+    }
+
+    /// @notice Calculate the withdrawal processing fee for a validated gas limit
+    /// @dev Caller must validate `gasLimit` with _validateGasLimit() first.
+    ///      Fee = (WITHDRAWAL_BASE_GAS + gasLimit) * tempoGasRate.
+    /// @param gasLimit L1 callback gas limit included in the fee
+    /// @return fee The total fee in zone token units
+    function _calculateWithdrawalFee(uint64 gasLimit) internal view returns (uint128) {
+        return uint128(WITHDRAWAL_BASE_GAS + gasLimit) * tempoGasRate;
     }
 
     function _validateRevealTo(bytes memory revealTo) internal view {
@@ -419,13 +520,13 @@ contract ZoneOutbox is IZoneOutbox {
         }
         if (revealTo.length != REVEAL_TO_KEY_LENGTH) revert InvalidRevealTo();
         bytes1 prefix = revealTo[0];
-        if (prefix != 0x02 && prefix != 0x03) revert InvalidRevealTo();
+        if (!Secp256k1Lib.isCompressedYParity(uint8(prefix))) revert InvalidRevealTo();
 
         bytes32 x;
         assembly {
             x := mload(add(revealTo, 33))
         }
-        if (!_isValidSecp256k1X(x)) revert InvalidRevealTo();
+        if (!Secp256k1Lib.isValidX(x)) revert InvalidRevealTo();
     }
 
     function _validateEncryptedSender(
@@ -440,25 +541,6 @@ contract ZoneOutbox is IZoneOutbox {
         if (encryptedSender.length != expectedLength) {
             revert InvalidEncryptedSenderLength(encryptedSender.length, expectedLength);
         }
-    }
-
-    /// @notice Validate that an X coordinate corresponds to a valid secp256k1 point
-    /// @dev Uses Euler's criterion via the MODEXP precompile (0x05):
-    ///      x^3 + 7 is a quadratic residue mod p iff (x^3 + 7)^((p-1)/2) == 1 (mod p)
-    function _isValidSecp256k1X(bytes32 x) internal view returns (bool) {
-        uint256 px = uint256(x);
-        if (px == 0 || px >= SECP256K1_P) return false;
-
-        uint256 rhs = addmod(mulmod(mulmod(px, px, SECP256K1_P), px, SECP256K1_P), 7, SECP256K1_P);
-
-        bytes memory input = abi.encodePacked(
-            uint256(32), uint256(32), uint256(32), rhs, SECP256K1_HALF_PM1, SECP256K1_P
-        );
-
-        (bool success, bytes memory result) = address(0x05).staticcall(input);
-        if (!success || result.length != 32) return false;
-
-        return uint256(bytes32(result)) == 1;
     }
 
 }

@@ -1,17 +1,37 @@
 //! Privacy policy enforcement helpers.
 //!
-//! Shared between the in-process ([`TempoZoneRpc`]) and proxy
-//! ([`ProxyZoneRpc`]) implementations of [`ZoneRpcApi`].
+//! Shared by [`ZoneRpcApi`] implementations.
+
+use std::future::Future;
 
 use alloy_consensus::transaction::SignerRecoverable;
 use alloy_eips::eip2718::Decodable2718;
 use alloy_network::TransactionBuilder;
+use alloy_primitives::{Address, Bytes, TxKind};
+use alloy_sol_types::SolCall;
 use tempo_alloy::rpc::TempoTransactionRequest;
 use tempo_primitives::TempoTxEnvelope;
+use tempo_zone_contracts::{ZONE_INBOX_ADDRESS, ZoneInbox};
+use zone_primitives::constants::CONTRACT_DEPLOYER_ALLOWLIST;
 
 use crate::{auth::AuthContext, types::JsonRpcError};
 
-const CONTRACT_CREATION_NOT_SUPPORTED: &str = "contract creation not supported on zones";
+/// Enforce all private RPC authorization rules for simulation-style requests.
+///
+/// The sequencer check is lazy: it is awaited only for calls that try to read
+/// another account's `ZoneInbox.refunds(token, owner)` entry.
+pub async fn enforce_authorized<F>(
+    request: &mut TempoTransactionRequest,
+    auth: &AuthContext,
+    is_sequencer: F,
+) -> Result<(), JsonRpcError>
+where
+    F: Future<Output = Result<bool, JsonRpcError>>,
+{
+    enforce_from(request, auth)?;
+    enforce_contract_creation(request, auth.caller)?;
+    enforce_zone_inbox_refund_call_privacy(request, auth, is_sequencer).await
+}
 
 /// Enforce that `from` matches the authenticated caller.
 ///
@@ -31,23 +51,101 @@ pub fn enforce_from(
     }
 }
 
-/// Reject create-style transaction requests.
+/// Apply the protocol contract-deployer allowlist to create-style transaction requests.
 ///
-/// Zones do not support contract creation, so plain Ethereum-style create
-/// requests (`to = null`) and Tempo AA calls targeting `TxKind::Create` are
-/// rejected with `-32602 Invalid params`.
+/// Plain Ethereum-style create requests (`to = null`) and Tempo AA calls to `TxKind::Create`
+/// are rejected with `-32602 Invalid params` unless the caller is a protocol-allowed deployer.
+pub fn enforce_contract_creation(
+    request: &TempoTransactionRequest,
+    caller: Address,
+) -> Result<(), JsonRpcError> {
+    enforce_contract_creation_with_allowlist(request, caller, CONTRACT_DEPLOYER_ALLOWLIST)
+}
+
+fn enforce_contract_creation_with_allowlist(
+    request: &TempoTransactionRequest,
+    caller: Address,
+    allowlist: &[Address],
+) -> Result<(), JsonRpcError> {
+    if allowlist.contains(&caller) {
+        return Ok(());
+    }
+
+    enforce_no_contract_creation(request)
+}
+
+/// Reject every create-style request, regardless of caller.
+///
+/// The forwarding proxy uses this stricter compatibility policy because it
+/// does not expose the protocol deployer path.
 pub fn enforce_no_contract_creation(request: &TempoTransactionRequest) -> Result<(), JsonRpcError> {
     let outer_create = request.inner.to.is_some_and(|to| to.is_create());
     let implicit_plain_create = request.calls.is_empty() && request.inner.to.is_none();
     let tempo_create = request.calls.iter().any(|call| call.to.is_create());
-
     if outer_create || implicit_plain_create || tempo_create {
         return Err(JsonRpcError::invalid_params(
-            CONTRACT_CREATION_NOT_SUPPORTED,
+            "contract creation not supported on zones",
         ));
     }
 
     Ok(())
+}
+
+async fn enforce_zone_inbox_refund_call_privacy<F>(
+    request: &TempoTransactionRequest,
+    auth: &AuthContext,
+    is_sequencer: F,
+) -> Result<(), JsonRpcError>
+where
+    F: Future<Output = Result<bool, JsonRpcError>>,
+{
+    if zone_inbox_refunds_mismatched_owner(request, auth.caller).is_none() {
+        return Ok(());
+    }
+
+    if is_sequencer.await? {
+        return Ok(());
+    }
+
+    Err(JsonRpcError::account_mismatch())
+}
+
+/// Finds a direct or nested `ZoneInbox.refunds(token, owner)` read where
+/// `owner` is not the authenticated caller.
+///
+/// Other calls, contract creations, and malformed calldata are ignored here.
+fn zone_inbox_refunds_mismatched_owner(
+    request: &TempoTransactionRequest,
+    caller: Address,
+) -> Option<Address> {
+    let refunds_owner_mismatch = |to: Option<Address>, input: Option<&Bytes>| {
+        if to != Some(ZONE_INBOX_ADDRESS) {
+            return None;
+        }
+
+        let input = input?;
+        if !input.starts_with(&ZoneInbox::refundsCall::SELECTOR) {
+            return None;
+        }
+
+        let owner = ZoneInbox::refundsCall::abi_decode(input).ok()?.owner;
+        (owner != caller).then_some(owner)
+    };
+
+    if let Some(owner) = refunds_owner_mismatch(
+        TransactionBuilder::to(request),
+        TransactionBuilder::input(request),
+    ) {
+        return Some(owner);
+    }
+
+    request.calls.iter().find_map(|call| {
+        let to = match call.to {
+            TxKind::Call(to) => Some(to),
+            TxKind::Create => None,
+        };
+        refunds_owner_mismatch(to, Some(&call.input))
+    })
 }
 
 /// Decode a raw transaction and verify the recovered sender matches the
@@ -75,10 +173,15 @@ mod tests {
     use alloy_rpc_types_eth::{TransactionInput, TransactionRequest};
     use alloy_signer::SignerSync;
     use alloy_signer_local::PrivateKeySigner;
+    use alloy_sol_types::SolCall;
     use tempo_alloy::rpc::TempoTransactionRequest;
     use tempo_primitives::{TempoTxEnvelope, transaction::Call};
+    use tempo_zone_contracts::{ZONE_INBOX_ADDRESS, ZONE_TOKEN_ADDRESS, ZoneInbox};
 
-    use super::{enforce_no_contract_creation, verify_raw_tx_sender};
+    use super::{
+        enforce_contract_creation, enforce_contract_creation_with_allowlist, verify_raw_tx_sender,
+        zone_inbox_refunds_mismatched_owner,
+    };
     use crate::auth::AuthContext;
 
     fn call_target(byte: u8) -> TxKind {
@@ -96,30 +199,48 @@ mod tests {
         }
     }
 
+    fn zone_inbox_refunds_request(owner: Address) -> TempoTransactionRequest {
+        TempoTransactionRequest {
+            inner: TransactionRequest {
+                to: Some(TxKind::Call(ZONE_INBOX_ADDRESS)),
+                input: TransactionInput::new(
+                    ZoneInbox::refundsCall {
+                        token: ZONE_TOKEN_ADDRESS,
+                        owner,
+                    }
+                    .abi_encode()
+                    .into(),
+                ),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
     #[test]
-    fn no_create_allows_standard_call_request() {
+    fn contract_creation_policy_allows_standard_call_request() {
         let request = call_request(Some(call_target(0x11)));
-        assert!(enforce_no_contract_creation(&request).is_ok());
+        assert!(enforce_contract_creation(&request, Address::repeat_byte(0x01)).is_ok());
     }
 
     #[test]
-    fn no_create_rejects_plain_create_request() {
+    fn contract_creation_policy_rejects_plain_create_request() {
         let request = call_request(None);
-        let err = enforce_no_contract_creation(&request).unwrap_err();
+        let err = enforce_contract_creation(&request, Address::repeat_byte(0x01)).unwrap_err();
         assert_eq!(err.code, -32602);
         assert_eq!(err.message, "contract creation not supported on zones");
     }
 
     #[test]
-    fn no_create_rejects_explicit_outer_create_request() {
+    fn contract_creation_policy_rejects_explicit_outer_create_request() {
         let request = call_request(Some(TxKind::Create));
-        let err = enforce_no_contract_creation(&request).unwrap_err();
+        let err = enforce_contract_creation(&request, Address::repeat_byte(0x01)).unwrap_err();
         assert_eq!(err.code, -32602);
         assert_eq!(err.message, "contract creation not supported on zones");
     }
 
     #[test]
-    fn no_create_allows_tempo_calls_without_outer_to() {
+    fn contract_creation_policy_allows_tempo_calls_without_outer_to() {
         let mut request = call_request(None);
         request.calls = vec![Call {
             to: call_target(0x22),
@@ -127,7 +248,7 @@ mod tests {
             input: Bytes::default(),
         }];
 
-        assert!(enforce_no_contract_creation(&request).is_ok());
+        assert!(enforce_contract_creation(&request, Address::repeat_byte(0x01)).is_ok());
     }
 
     fn sign_eip1559_tx(signer: &PrivateKeySigner) -> Vec<u8> {
@@ -156,6 +277,7 @@ mod tests {
         let auth = AuthContext {
             caller: signer.address(),
             expires_at: u64::MAX,
+            keychain_key_id: None,
         };
 
         verify_raw_tx_sender(&encoded, &auth).expect("matching sender accepted");
@@ -168,6 +290,7 @@ mod tests {
         let auth = AuthContext {
             caller: Address::repeat_byte(0xff),
             expires_at: u64::MAX,
+            keychain_key_id: None,
         };
 
         let err = verify_raw_tx_sender(&encoded, &auth).unwrap_err();
@@ -180,6 +303,7 @@ mod tests {
         let auth = AuthContext {
             caller: Address::repeat_byte(0xaa),
             expires_at: u64::MAX,
+            keychain_key_id: None,
         };
 
         let err = verify_raw_tx_sender(b"not-a-tx", &auth).unwrap_err();
@@ -188,7 +312,7 @@ mod tests {
     }
 
     #[test]
-    fn no_create_rejects_tempo_create_call() {
+    fn contract_creation_policy_rejects_tempo_create_call() {
         let mut request = call_request(None);
         request.calls = vec![Call {
             to: TxKind::Create,
@@ -196,8 +320,74 @@ mod tests {
             input: Bytes::default(),
         }];
 
-        let err = enforce_no_contract_creation(&request).unwrap_err();
+        let err = enforce_contract_creation(&request, Address::repeat_byte(0x01)).unwrap_err();
         assert_eq!(err.code, -32602);
         assert_eq!(err.message, "contract creation not supported on zones");
+    }
+
+    #[test]
+    fn contract_creation_policy_allows_designated_deployer() {
+        let caller = Address::repeat_byte(0x11);
+        let request = call_request(None);
+
+        assert!(enforce_contract_creation_with_allowlist(&request, caller, &[]).is_err());
+        assert!(enforce_contract_creation_with_allowlist(&request, caller, &[caller]).is_ok());
+    }
+
+    #[test]
+    fn zone_inbox_refunds_mismatched_owner_detects_outer_call() {
+        let caller = Address::repeat_byte(0x11);
+        let owner = Address::repeat_byte(0x22);
+        let request = zone_inbox_refunds_request(owner);
+
+        assert_eq!(
+            zone_inbox_refunds_mismatched_owner(&request, caller),
+            Some(owner)
+        );
+    }
+
+    #[test]
+    fn zone_inbox_refunds_mismatched_owner_allows_own_outer_call() {
+        let caller = Address::repeat_byte(0x11);
+        let request = zone_inbox_refunds_request(caller);
+
+        assert_eq!(zone_inbox_refunds_mismatched_owner(&request, caller), None);
+    }
+
+    #[test]
+    fn zone_inbox_refunds_mismatched_owner_detects_nested_tempo_call() {
+        let caller = Address::repeat_byte(0x11);
+        let owner = Address::repeat_byte(0x22);
+        let mut request = TempoTransactionRequest {
+            inner: TransactionRequest {
+                to: Some(TxKind::Call(Address::repeat_byte(0x33))),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        request.calls.push(Call {
+            to: TxKind::Call(ZONE_INBOX_ADDRESS),
+            value: U256::ZERO,
+            input: ZoneInbox::refundsCall {
+                token: ZONE_TOKEN_ADDRESS,
+                owner,
+            }
+            .abi_encode()
+            .into(),
+        });
+
+        assert_eq!(
+            zone_inbox_refunds_mismatched_owner(&request, caller),
+            Some(owner)
+        );
+    }
+
+    #[test]
+    fn zone_inbox_refunds_mismatched_owner_ignores_other_calls() {
+        let caller = Address::repeat_byte(0x11);
+        let mut request = zone_inbox_refunds_request(Address::repeat_byte(0x22));
+        request.inner.to = Some(TxKind::Call(Address::repeat_byte(0x33)));
+
+        assert_eq!(zone_inbox_refunds_mismatched_owner(&request, caller), None);
     }
 }

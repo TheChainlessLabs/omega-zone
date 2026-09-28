@@ -12,9 +12,8 @@
 //!   without repeated TIP-20 transfers. Withdrawals push tokens back to the
 //!   user's TIP-20 wallet.
 //!
-//! `bestBid` / `bestAsk` are exposed as temporary aggregate alpha-readiness
-//! helpers. Strict darkpool/privacy claims should not rely on public
-//! top-of-book visibility.
+//! `bestBid` / `bestAsk` expose aggregate market readiness. Strict
+//! darkpool/privacy claims should not rely on public top-of-book visibility.
 //!
 //! Matching happens eagerly on placement: a new bid matches against the best
 //! ask first (and vice versa), with price improvement refunded to the taker
@@ -40,6 +39,41 @@ pub const DARKPOOL_ADDRESS: Address = Address::new([
 /// Minimum order quantity to prevent dust spam.
 pub const MIN_ORDER_AMOUNT: u128 = 100;
 
+/// Number of fractional decimal places used by all darkpool prices.
+pub const PRICE_DECIMALS: u8 = 6;
+
+/// Fixed-point denominator for quote-per-base prices.
+pub const PRICE_SCALE: u128 = 1_000_000;
+pub const TIME_IN_FORCE_GTC: u8 = 0;
+pub const TIME_IN_FORCE_IOC: u8 = 1;
+pub const TIME_IN_FORCE_FOK: u8 = 2;
+pub const ORDER_KIND_LIMIT: u8 = 0;
+pub const ORDER_KIND_MARKET: u8 = 1;
+pub const CANCEL_REASON_USER: u8 = 0;
+pub const CANCEL_REASON_IOC_REMAINDER: u8 = 1;
+
+/// Calculate the executed quote amount, rounding toward the quote-token owner.
+///
+/// Intermediate multiplication is deliberately performed at 256-bit precision:
+/// both operands are `u128`, but their product can exceed `u128` even when the
+/// scaled result still fits in the orderbook's balance representation.
+pub fn quote_amount(base_amount: u128, scaled_price: u128) -> Option<u128> {
+    let product = U256::from(base_amount).checked_mul(U256::from(scaled_price))?;
+    let quote = product / U256::from(PRICE_SCALE);
+    let quote = u128::try_from(quote).ok()?;
+    (quote != 0).then_some(quote)
+}
+
+/// Calculate the conservative quote reserve required by a resting bid.
+pub fn bid_escrow(base_amount: u128, scaled_price: u128) -> Option<u128> {
+    if base_amount == 0 || scaled_price == 0 {
+        return None;
+    }
+    let product = U256::from(base_amount).checked_mul(U256::from(scaled_price))?;
+    let rounded = product.checked_add(U256::from(PRICE_SCALE - 1))?;
+    u128::try_from(rounded / U256::from(PRICE_SCALE)).ok()
+}
+
 alloy_sol_types::sol! {
     #[derive(Debug)]
     event OrderSubmitted(
@@ -48,8 +82,10 @@ alloy_sol_types::sol! {
         address base,
         address quote,
         uint128 amount,
-        uint128 price,
-        bool isBid
+        uint128 priceLimit,
+        bool isBid,
+        uint8 orderKind,
+        uint8 timeInForce
     );
 
     #[derive(Debug)]
@@ -65,19 +101,10 @@ alloy_sol_types::sol! {
 
     #[derive(Debug)]
     event OrderFilled(
-        uint128 indexed orderId,
+        uint128 indexed makerOrderId,
         address indexed maker,
         address indexed taker,
-        uint128 amountFilled,
-        uint128 price
-    );
-
-    #[derive(Debug)]
-    event OrderMatched(
-        uint128 indexed makerOrderId,
-        uint128 indexed takerOrderId,
-        address indexed maker,
-        address taker,
+        uint128 takerOrderId,
         uint128 amountFilled,
         uint128 price
     );
@@ -85,7 +112,9 @@ alloy_sol_types::sol! {
     #[derive(Debug)]
     event OrderCancelled(
         uint128 indexed orderId,
-        address indexed maker
+        address indexed maker,
+        uint128 cancelledAmount,
+        uint8 reason
     );
 
     #[derive(Debug)]
@@ -97,9 +126,18 @@ alloy_sol_types::sol! {
         bool isBid;
         uint128 price;
         uint128 quantity;
+        uint8 orderKind;
+        uint8 timeInForce;
     }
 
-    function place(address base, uint128 amount, uint128 price, bool isBid)
+    function place(
+        address base,
+        address quote,
+        uint128 amount,
+        uint128 price,
+        bool isBid,
+        uint8 timeInForce
+    )
         external returns (uint128 orderId);
     function cancel(uint128 orderId) external;
     function getOrder(uint128 orderId) external view returns (OrderView memory);
@@ -108,14 +146,27 @@ alloy_sol_types::sol! {
     function balanceOf(address user, address token) external view returns (uint128);
     function availableBalanceOf(address user, address token) external view returns (uint128);
     function pairKey(address base, address quote) external pure returns (bytes32);
-    function createPair(address base) external returns (bytes32);
-    function bestBid(address base) external view returns (uint128 price, uint128 quantity);
-    function bestAsk(address base) external view returns (uint128 price, uint128 quantity);
+    function createPair(address base, address quote) external returns (bytes32);
+    function pairCount() external view returns (uint256);
+    function pairAt(uint256 index) external view returns (address base, address quote);
+    function pairExists(address base, address quote) external view returns (bool);
+    function bestBid(address base, address quote) external view returns (uint128 price, uint128 quantity);
+    function bestAsk(address base, address quote) external view returns (uint128 price, uint128 quantity);
     function MIN_ORDER_AMOUNT() external pure returns (uint128);
-    function marketBuy(address base, uint128 amount, uint128 maxQuoteIn)
-        external returns (uint128 quoteSpent);
-    function marketSell(address base, uint128 amount, uint128 minQuoteOut)
-        external returns (uint128 quoteReceived);
+    function marketBuy(
+        address base,
+        address quote,
+        uint128 amount,
+        uint128 maxPrice,
+        uint8 timeInForce
+    ) external returns (uint128 orderId, uint128 filledAmount, uint128 quoteSpent);
+    function marketSell(
+        address base,
+        address quote,
+        uint128 amount,
+        uint128 minPrice,
+        uint8 timeInForce
+    ) external returns (uint128 orderId, uint128 filledAmount, uint128 quoteReceived);
 
     error OrderDoesNotExist();
     error Unauthorized();
@@ -126,6 +177,7 @@ alloy_sol_types::sol! {
     error InsufficientBalance();
     error AmountBelowMinimum();
     error CannotMatchSelf();
+    error InvalidTimeInForce();
 }
 
 /// One side limit order stored in the doubly-linked price-time queue.
@@ -257,11 +309,15 @@ impl DarkpoolOrderbook {
             let order = self.orders[order_id].read()?;
             if order.maker == user {
                 let amount = if is_bid_side {
-                    order.quantity.saturating_mul(order.price)
+                    bid_escrow(order.quantity, order.price).ok_or_else(
+                        tempo_precompiles::error::TempoPrecompileError::under_overflow,
+                    )?
                 } else {
                     order.quantity
                 };
-                reserved = reserved.saturating_add(amount);
+                reserved = reserved
+                    .checked_add(amount)
+                    .ok_or_else(tempo_precompiles::error::TempoPrecompileError::under_overflow)?;
             }
             order_id = order.next;
         }
@@ -285,7 +341,12 @@ impl DarkpoolOrderbook {
         amount: u128,
     ) -> tempo_precompiles::Result<()> {
         let cur = self.balance_of(user, token)?;
-        self.set_balance(user, token, cur.saturating_add(amount))
+        self.set_balance(
+            user,
+            token,
+            cur.checked_add(amount)
+                .ok_or_else(tempo_precompiles::error::TempoPrecompileError::under_overflow)?,
+        )
     }
 
     fn decrement_balance(
@@ -295,14 +356,46 @@ impl DarkpoolOrderbook {
         amount: u128,
     ) -> tempo_precompiles::Result<()> {
         let cur = self.balance_of(user, token)?;
-        self.set_balance(user, token, cur.saturating_sub(amount))
+        self.set_balance(
+            user,
+            token,
+            cur.checked_sub(amount)
+                .ok_or_else(tempo_precompiles::error::TempoPrecompileError::under_overflow)?,
+        )
+    }
+
+    fn ensure_internal_balance(
+        &mut self,
+        user: Address,
+        token: Address,
+        required: u128,
+    ) -> tempo_precompiles::Result<()> {
+        let available = self.available_balance_of(user, token)?;
+        if available >= required {
+            return Ok(());
+        }
+
+        let missing = required - available;
+        let mut tip20 = TIP20Token::from_address(token)?;
+        tip20.system_transfer_from(self.address, user, U256::from(missing))?;
+        self.increment_balance(user, token, missing)
     }
 
     // ── pair management ───────────────────────────────────────────────────
 
-    fn validate_or_create_pair(&mut self, base: Address) -> tempo_precompiles::Result<B256> {
-        let tip20 = TIP20Token::from_address(base)?;
-        let quote = tip20.quote_token()?;
+    fn validate_pair_tokens(&self, base: Address, quote: Address) -> tempo_precompiles::Result<()> {
+        // Reading initialized token storage rejects arbitrary TIP-20-shaped addresses.
+        TIP20Token::from_address(base)?.quote_token()?;
+        TIP20Token::from_address(quote)?.quote_token()?;
+        Ok(())
+    }
+
+    fn validate_or_create_pair(
+        &mut self,
+        base: Address,
+        quote: Address,
+    ) -> tempo_precompiles::Result<B256> {
+        self.validate_pair_tokens(base, quote)?;
         let book_key = compute_book_key(base, quote);
         let book = self.books[book_key].read()?;
         if book.base == Address::ZERO {
@@ -317,9 +410,11 @@ impl DarkpoolOrderbook {
         Ok(book_key)
     }
 
-    pub fn create_pair(&mut self, base: Address) -> PrecompileResult {
-        let tip20 = try_storage!(TIP20Token::from_address(base));
-        let quote = try_storage!(tip20.quote_token());
+    pub fn create_pair(&mut self, base: Address, quote: Address) -> PrecompileResult {
+        if base == quote {
+            revert!(InvalidToken {});
+        }
+        try_storage!(self.validate_pair_tokens(base, quote));
         let book_key = compute_book_key(base, quote);
         let book = try_storage!(self.books[book_key].read());
         if book.base != Address::ZERO {
@@ -335,11 +430,39 @@ impl DarkpoolOrderbook {
         Ok(StorageCtx.success_output(book_key.abi_encode().into()))
     }
 
+    pub fn pair_count(&self) -> PrecompileResult {
+        let len = try_storage!(self.book_keys.len());
+        Ok(StorageCtx.success_output(U256::from(len).abi_encode().into()))
+    }
+
+    pub fn pair_at(&self, index: U256) -> PrecompileResult {
+        let Ok(index) = usize::try_from(index) else {
+            return Ok(StorageCtx.revert_output(Bytes::new()));
+        };
+        let len = try_storage!(self.book_keys.len());
+        if index >= len {
+            return Ok(StorageCtx.revert_output(Bytes::new()));
+        }
+        let book_key = try_storage!(self.book_keys[index].read());
+        let book = try_storage!(self.books[book_key].read());
+        Ok(StorageCtx.success_output((book.base, book.quote).abi_encode().into()))
+    }
+
+    pub fn pair_exists(&self, base: Address, quote: Address) -> PrecompileResult {
+        let book_key = compute_book_key(base, quote);
+        let book = try_storage!(self.books[book_key].read());
+        Ok(StorageCtx.success_output(
+            (book.base == base && book.quote == quote)
+                .abi_encode()
+                .into(),
+        ))
+    }
+
     // ── deposit / withdraw ────────────────────────────────────────────────
 
     pub fn deposit(&mut self, sender: Address, token: Address, amount: u128) -> PrecompileResult {
         let mut tip20 = try_storage!(TIP20Token::from_address(token));
-        try_storage!(tip20.system_transfer_from(sender, self.address, U256::from(amount),));
+        try_storage!(tip20.system_transfer_from(self.address, sender, U256::from(amount),));
         try_storage!(self.increment_balance(sender, token, amount));
         Ok(StorageCtx.success_output(Bytes::new()))
     }
@@ -367,38 +490,35 @@ impl DarkpoolOrderbook {
         &mut self,
         sender: Address,
         base: Address,
+        quote: Address,
         amount: u128,
         price: u128,
         is_bid: bool,
+        time_in_force: u8,
     ) -> PrecompileResult {
+        if time_in_force != TIME_IN_FORCE_GTC {
+            revert!(InvalidTimeInForce {});
+        }
+        if base == quote {
+            revert!(InvalidToken {});
+        }
         if amount < MIN_ORDER_AMOUNT {
             revert!(AmountBelowMinimum {});
         }
-        if price == 0 {
+        if price == 0 || quote_amount(amount, price).is_none() {
             revert!(PriceOutOfRange {});
         }
 
-        let mut tip20 = try_storage!(TIP20Token::from_address(base));
-        let quote = try_storage!(tip20.quote_token());
-        let book_key = try_storage!(self.validate_or_create_pair(base));
+        let book_key = try_storage!(self.validate_or_create_pair(base, quote));
 
         if is_bid {
-            let escrow = match amount.checked_mul(price) {
+            let escrow = match bid_escrow(amount, price) {
                 Some(v) => v,
                 None => revert!(PriceOutOfRange {}),
             };
-            // Pull quote tokens directly from user to ob.
-            let mut tip20_quote = try_storage!(TIP20Token::from_address(quote));
-            try_storage!(tip20_quote.system_transfer_from(
-                sender,
-                self.address,
-                U256::from(escrow),
-            ));
-            try_storage!(self.increment_balance(sender, quote, escrow));
+            try_storage!(self.ensure_internal_balance(sender, quote, escrow));
         } else {
-            // Pull base tokens directly from user to ob.
-            try_storage!(tip20.system_transfer_from(sender, self.address, U256::from(amount),));
-            try_storage!(self.increment_balance(sender, base, amount));
+            try_storage!(self.ensure_internal_balance(sender, base, amount));
         }
 
         let order_id = try_storage!(self.next_order_id_val());
@@ -409,8 +529,10 @@ impl DarkpoolOrderbook {
             base,
             quote,
             amount,
-            price,
+            priceLimit: price,
             isBid: is_bid,
+            orderKind: ORDER_KIND_LIMIT,
+            timeInForce: time_in_force,
         }));
 
         let mut remaining = amount;
@@ -488,10 +610,8 @@ impl DarkpoolOrderbook {
                 break;
             }
             let fill = (*remaining).min(ask.quantity);
-            let quote_amount = U256::from(fill)
-                .checked_mul(U256::from(ask.price))
-                .and_then(|v| v.try_into().ok())
-                .unwrap_or(0u128);
+            let quote_amount = quote_amount(fill, ask.price)
+                .ok_or_else(tempo_precompiles::error::TempoPrecompileError::under_overflow)?;
 
             // Taker (bidder) pays quote at maker's ask price.
             self.decrement_balance(taker, quote, quote_amount)?;
@@ -503,17 +623,10 @@ impl DarkpoolOrderbook {
             self.increment_balance(ask.maker, quote, quote_amount)?;
 
             self.emit_event(OrderFilled {
-                orderId: ask.order_id,
-                maker: ask.maker,
-                taker,
-                amountFilled: fill,
-                price: ask.price,
-            })?;
-            self.emit_event(OrderMatched {
                 makerOrderId: ask.order_id,
-                takerOrderId: taker_order_id,
                 maker: ask.maker,
                 taker,
+                takerOrderId: taker_order_id,
                 amountFilled: fill,
                 price: ask.price,
             })?;
@@ -554,10 +667,8 @@ impl DarkpoolOrderbook {
                 break;
             }
             let fill = (*remaining).min(bid.quantity);
-            let quote_amount = U256::from(fill)
-                .checked_mul(U256::from(bid.price))
-                .and_then(|v| v.try_into().ok())
-                .unwrap_or(0u128);
+            let quote_amount = quote_amount(fill, bid.price)
+                .ok_or_else(tempo_precompiles::error::TempoPrecompileError::under_overflow)?;
 
             // Taker (asker) gives base.
             self.decrement_balance(taker, base, fill)?;
@@ -569,17 +680,10 @@ impl DarkpoolOrderbook {
             self.increment_balance(bid.maker, base, fill)?;
 
             self.emit_event(OrderFilled {
-                orderId: bid.order_id,
-                maker: bid.maker,
-                taker,
-                amountFilled: fill,
-                price: bid.price,
-            })?;
-            self.emit_event(OrderMatched {
                 makerOrderId: bid.order_id,
-                takerOrderId: taker_order_id,
                 maker: bid.maker,
                 taker,
+                takerOrderId: taker_order_id,
                 amountFilled: fill,
                 price: bid.price,
             })?;
@@ -715,92 +819,158 @@ impl DarkpoolOrderbook {
         try_storage!(self.emit_event(OrderCancelled {
             orderId: order_id,
             maker: sender,
+            cancelledAmount: order.quantity,
+            reason: CANCEL_REASON_USER,
         }));
         Ok(StorageCtx.success_output(Bytes::new()))
     }
 
     // ── market orders ────────────────────────────────────────────────────
 
-    /// Market buy: purchase `amount` base at best available ask prices.
-    /// Pulls `max_quote_in` from sender; unused quote stays in internal balance.
-    /// Reverts if the book cannot fill the full `amount` or if it would cost
-    /// more than `max_quote_in`.  Returns `quote_spent`.
+    /// Market buy: purchase up to `amount` base at ask prices no greater than
+    /// `max_price`. FOK reverts unless the entire amount fills; IOC keeps any
+    /// immediate fill and cancels the remainder.
     pub fn market_buy(
         &mut self,
         sender: Address,
         base: Address,
+        quote: Address,
         amount: u128,
-        max_quote_in: u128,
+        max_price: u128,
+        time_in_force: u8,
     ) -> PrecompileResult {
+        if time_in_force != TIME_IN_FORCE_IOC && time_in_force != TIME_IN_FORCE_FOK {
+            revert!(InvalidTimeInForce {});
+        }
+        if base == quote {
+            revert!(InvalidToken {});
+        }
         if amount < MIN_ORDER_AMOUNT {
             revert!(AmountBelowMinimum {});
         }
+        let max_quote_in = match bid_escrow(amount, max_price) {
+            Some(value) => value,
+            None => revert!(PriceOutOfRange {}),
+        };
 
-        let tip20 = try_storage!(TIP20Token::from_address(base));
-        let quote = try_storage!(tip20.quote_token());
-        let _book_key = try_storage!(self.validate_or_create_pair(base));
+        let _book_key = try_storage!(self.validate_or_create_pair(base, quote));
+        try_storage!(self.ensure_internal_balance(sender, quote, max_quote_in));
 
-        let mut tip20_quote = try_storage!(TIP20Token::from_address(quote));
-        try_storage!(tip20_quote.system_transfer_from(
-            sender,
-            self.address,
-            U256::from(max_quote_in),
-        ));
-        try_storage!(self.increment_balance(sender, quote, max_quote_in));
+        let order_id = try_storage!(self.next_order_id_val());
+        try_storage!(self.increment_next_order_id());
+        try_storage!(self.emit_event(OrderSubmitted {
+            orderId: order_id,
+            maker: sender,
+            base,
+            quote,
+            amount,
+            priceLimit: max_price,
+            isBid: true,
+            orderKind: ORDER_KIND_MARKET,
+            timeInForce: time_in_force,
+        }));
 
         let (filled, spent) =
-            try_storage!(self.fill_asks_market(sender, base, quote, amount, max_quote_in));
+            try_storage!(self.fill_asks_market(order_id, sender, base, quote, amount, max_price,));
 
-        if filled < amount {
+        if filled < amount && time_in_force == TIME_IN_FORCE_FOK {
             revert!(InsufficientLiquidity {});
         }
+        if filled < amount {
+            try_storage!(self.emit_event(OrderCancelled {
+                orderId: order_id,
+                maker: sender,
+                cancelledAmount: amount - filled,
+                reason: CANCEL_REASON_IOC_REMAINDER,
+            }));
+        }
 
-        Ok(StorageCtx.success_output(U256::from(spent).abi_encode().into()))
+        Ok(StorageCtx.success_output(
+            (U256::from(order_id), U256::from(filled), U256::from(spent))
+                .abi_encode()
+                .into(),
+        ))
     }
 
-    /// Market sell: sell `amount` base at best available bid prices.
-    /// Pulls `amount` base tokens from sender; received quote stays in
-    /// internal balance.  Reverts if the book cannot fill the full `amount`
-    /// or if the received quote is below `min_quote_out`.
-    /// Returns `quote_received`.
+    /// Market sell: sell up to `amount` base at bid prices no less than
+    /// `min_price`. FOK reverts unless the entire amount fills; IOC keeps any
+    /// immediate fill and cancels the remainder.
     pub fn market_sell(
         &mut self,
         sender: Address,
         base: Address,
+        quote: Address,
         amount: u128,
-        min_quote_out: u128,
+        min_price: u128,
+        time_in_force: u8,
     ) -> PrecompileResult {
+        if time_in_force != TIME_IN_FORCE_IOC && time_in_force != TIME_IN_FORCE_FOK {
+            revert!(InvalidTimeInForce {});
+        }
+        if base == quote {
+            revert!(InvalidToken {});
+        }
         if amount < MIN_ORDER_AMOUNT {
             revert!(AmountBelowMinimum {});
         }
+        // A zero minimum is a valid unbounded market-sell guard. Nonzero
+        // guards must still produce a representable quote amount.
+        if min_price != 0 && quote_amount(amount, min_price).is_none() {
+            revert!(PriceOutOfRange {});
+        }
 
-        let mut tip20 = try_storage!(TIP20Token::from_address(base));
-        let quote = try_storage!(tip20.quote_token());
-        let _book_key = try_storage!(self.validate_or_create_pair(base));
+        let _book_key = try_storage!(self.validate_or_create_pair(base, quote));
+        try_storage!(self.ensure_internal_balance(sender, base, amount));
 
-        try_storage!(tip20.system_transfer_from(sender, self.address, U256::from(amount),));
-        try_storage!(self.increment_balance(sender, base, amount));
+        let order_id = try_storage!(self.next_order_id_val());
+        try_storage!(self.increment_next_order_id());
+        try_storage!(self.emit_event(OrderSubmitted {
+            orderId: order_id,
+            maker: sender,
+            base,
+            quote,
+            amount,
+            priceLimit: min_price,
+            isBid: false,
+            orderKind: ORDER_KIND_MARKET,
+            timeInForce: time_in_force,
+        }));
 
-        let (filled, received) = try_storage!(self.fill_bids_market(sender, base, quote, amount));
+        let (filled, received) =
+            try_storage!(self.fill_bids_market(order_id, sender, base, quote, amount, min_price,));
 
-        if filled < amount {
+        if filled < amount && time_in_force == TIME_IN_FORCE_FOK {
             revert!(InsufficientLiquidity {});
         }
-        if received < min_quote_out {
-            revert!(InsufficientBalance {});
+        if filled < amount {
+            try_storage!(self.emit_event(OrderCancelled {
+                orderId: order_id,
+                maker: sender,
+                cancelledAmount: amount - filled,
+                reason: CANCEL_REASON_IOC_REMAINDER,
+            }));
         }
 
-        Ok(StorageCtx.success_output(U256::from(received).abi_encode().into()))
+        Ok(StorageCtx.success_output(
+            (
+                U256::from(order_id),
+                U256::from(filled),
+                U256::from(received),
+            )
+                .abi_encode()
+                .into(),
+        ))
     }
 
-    /// Cross asks without a price limit (market buy).  Returns `(filled, quote_spent)`.
+    /// Cross asks up to `max_price`. Returns `(filled, quote_spent)`.
     fn fill_asks_market(
         &mut self,
+        taker_order_id: u128,
         taker: Address,
         base: Address,
         quote: Address,
         mut remaining: u128,
-        max_quote: u128,
+        max_price: u128,
     ) -> tempo_precompiles::Result<(u128, u128)> {
         let book_key = compute_book_key(base, quote);
         let mut total_spent: u128 = 0;
@@ -815,19 +985,13 @@ impl DarkpoolOrderbook {
                 break;
             }
             let ask = self.orders[book.best_ask_id].read()?;
-            if ask.maker == taker {
+            if ask.price > max_price {
                 break;
             }
 
             let fill = remaining.min(ask.quantity);
-            let quote_amount = U256::from(fill)
-                .checked_mul(U256::from(ask.price))
-                .and_then(|v| v.try_into().ok())
-                .unwrap_or(0u128);
-
-            if total_spent + quote_amount > max_quote {
-                break;
-            }
+            let quote_amount = quote_amount(fill, ask.price)
+                .ok_or_else(tempo_precompiles::error::TempoPrecompileError::under_overflow)?;
 
             self.decrement_balance(taker, quote, quote_amount)?;
             self.increment_balance(taker, base, fill)?;
@@ -835,14 +999,17 @@ impl DarkpoolOrderbook {
             self.increment_balance(ask.maker, quote, quote_amount)?;
 
             self.emit_event(OrderFilled {
-                orderId: ask.order_id,
+                makerOrderId: ask.order_id,
                 maker: ask.maker,
                 taker,
+                takerOrderId: taker_order_id,
                 amountFilled: fill,
                 price: ask.price,
             })?;
 
-            total_spent += quote_amount;
+            total_spent = total_spent
+                .checked_add(quote_amount)
+                .ok_or_else(tempo_precompiles::error::TempoPrecompileError::under_overflow)?;
             remaining -= fill;
             total_filled += fill;
 
@@ -858,13 +1025,15 @@ impl DarkpoolOrderbook {
         Ok((total_filled, total_spent))
     }
 
-    /// Cross bids without a price limit (market sell).  Returns `(filled, quote_received)`.
+    /// Cross bids down to `min_price`. Returns `(filled, quote_received)`.
     fn fill_bids_market(
         &mut self,
+        taker_order_id: u128,
         taker: Address,
         base: Address,
         quote: Address,
         mut remaining: u128,
+        min_price: u128,
     ) -> tempo_precompiles::Result<(u128, u128)> {
         let book_key = compute_book_key(base, quote);
         let mut total_received: u128 = 0;
@@ -879,15 +1048,13 @@ impl DarkpoolOrderbook {
                 break;
             }
             let bid = self.orders[book.best_bid_id].read()?;
-            if bid.maker == taker {
+            if bid.price < min_price {
                 break;
             }
 
             let fill = remaining.min(bid.quantity);
-            let quote_amount = U256::from(fill)
-                .checked_mul(U256::from(bid.price))
-                .and_then(|v| v.try_into().ok())
-                .unwrap_or(0u128);
+            let quote_amount = quote_amount(fill, bid.price)
+                .ok_or_else(tempo_precompiles::error::TempoPrecompileError::under_overflow)?;
 
             self.decrement_balance(taker, base, fill)?;
             self.increment_balance(taker, quote, quote_amount)?;
@@ -895,14 +1062,17 @@ impl DarkpoolOrderbook {
             self.increment_balance(bid.maker, base, fill)?;
 
             self.emit_event(OrderFilled {
-                orderId: bid.order_id,
+                makerOrderId: bid.order_id,
                 maker: bid.maker,
                 taker,
+                takerOrderId: taker_order_id,
                 amountFilled: fill,
                 price: bid.price,
             })?;
 
-            total_received += quote_amount;
+            total_received = total_received
+                .checked_add(quote_amount)
+                .ok_or_else(tempo_precompiles::error::TempoPrecompileError::under_overflow)?;
             remaining -= fill;
             total_filled += fill;
 
@@ -937,13 +1107,13 @@ impl DarkpoolOrderbook {
             isBid: order.is_bid,
             price: order.price,
             quantity: order.quantity,
+            orderKind: ORDER_KIND_LIMIT,
+            timeInForce: TIME_IN_FORCE_GTC,
         };
         Ok(StorageCtx.success_output(view.abi_encode().into()))
     }
 
-    pub fn best_bid(&self, base: Address) -> PrecompileResult {
-        let tip20 = try_storage!(TIP20Token::from_address(base));
-        let quote = try_storage!(tip20.quote_token());
+    pub fn best_bid(&self, base: Address, quote: Address) -> PrecompileResult {
         let book_key = compute_book_key(base, quote);
         let book = try_storage!(self.books[book_key].read());
         if book.best_bid_id == 0 {
@@ -957,9 +1127,7 @@ impl DarkpoolOrderbook {
         ))
     }
 
-    pub fn best_ask(&self, base: Address) -> PrecompileResult {
-        let tip20 = try_storage!(TIP20Token::from_address(base));
-        let quote = try_storage!(tip20.quote_token());
+    pub fn best_ask(&self, base: Address, quote: Address) -> PrecompileResult {
         let book_key = compute_book_key(base, quote);
         let book = try_storage!(self.books[book_key].read());
         if book.best_ask_id == 0 {
@@ -979,6 +1147,7 @@ impl DarkpoolOrderbook {
         cfg: &revm::context::CfgEnv<TempoHardfork>,
     ) -> alloy_evm::precompiles::DynPrecompile {
         let spec = cfg.spec;
+        let amsterdam_eip8037_enabled = cfg.enable_amsterdam_eip8037;
         let gas_params = cfg.gas_params.clone();
         alloy_evm::precompiles::DynPrecompile::new_stateful(
             PrecompileId::Custom("DarkpoolOrderbook".into()),
@@ -996,6 +1165,7 @@ impl DarkpoolOrderbook {
                     input.gas,
                     input.reservoir,
                     spec,
+                    amsterdam_eip8037_enabled,
                     input.is_static,
                     gas_params.clone(),
                 );
@@ -1026,7 +1196,15 @@ impl TempoPrecompile for DarkpoolOrderbook {
                 let Ok(call) = placeCall::abi_decode(calldata) else {
                     return Ok(StorageCtx.revert_output(Bytes::new()));
                 };
-                self.place(msg_sender, call.base, call.amount, call.price, call.isBid)
+                self.place(
+                    msg_sender,
+                    call.base,
+                    call.quote,
+                    call.amount,
+                    call.price,
+                    call.isBid,
+                    call.timeInForce,
+                )
             }
             s if s == cancelCall::SELECTOR => {
                 let Ok(call) = cancelCall::abi_decode(calldata) else {
@@ -1083,19 +1261,32 @@ impl TempoPrecompile for DarkpoolOrderbook {
                 let Ok(call) = createPairCall::abi_decode(calldata) else {
                     return Ok(StorageCtx.revert_output(Bytes::new()));
                 };
-                self.create_pair(call.base)
+                self.create_pair(call.base, call.quote)
+            }
+            s if s == pairCountCall::SELECTOR => self.pair_count(),
+            s if s == pairAtCall::SELECTOR => {
+                let Ok(call) = pairAtCall::abi_decode(calldata) else {
+                    return Ok(StorageCtx.revert_output(Bytes::new()));
+                };
+                self.pair_at(call.index)
+            }
+            s if s == pairExistsCall::SELECTOR => {
+                let Ok(call) = pairExistsCall::abi_decode(calldata) else {
+                    return Ok(StorageCtx.revert_output(Bytes::new()));
+                };
+                self.pair_exists(call.base, call.quote)
             }
             s if s == bestBidCall::SELECTOR => {
                 let Ok(call) = bestBidCall::abi_decode(calldata) else {
                     return Ok(StorageCtx.revert_output(Bytes::new()));
                 };
-                self.best_bid(call.base)
+                self.best_bid(call.base, call.quote)
             }
             s if s == bestAskCall::SELECTOR => {
                 let Ok(call) = bestAskCall::abi_decode(calldata) else {
                     return Ok(StorageCtx.revert_output(Bytes::new()));
                 };
-                self.best_ask(call.base)
+                self.best_ask(call.base, call.quote)
             }
             s if s == MIN_ORDER_AMOUNTCall::SELECTOR => {
                 Ok(StorageCtx.success_output(U256::from(MIN_ORDER_AMOUNT).abi_encode().into()))
@@ -1104,13 +1295,27 @@ impl TempoPrecompile for DarkpoolOrderbook {
                 let Ok(call) = marketBuyCall::abi_decode(calldata) else {
                     return Ok(StorageCtx.revert_output(Bytes::new()));
                 };
-                self.market_buy(msg_sender, call.base, call.amount, call.maxQuoteIn)
+                self.market_buy(
+                    msg_sender,
+                    call.base,
+                    call.quote,
+                    call.amount,
+                    call.maxPrice,
+                    call.timeInForce,
+                )
             }
             s if s == marketSellCall::SELECTOR => {
                 let Ok(call) = marketSellCall::abi_decode(calldata) else {
                     return Ok(StorageCtx.revert_output(Bytes::new()));
                 };
-                self.market_sell(msg_sender, call.base, call.amount, call.minQuoteOut)
+                self.market_sell(
+                    msg_sender,
+                    call.base,
+                    call.quote,
+                    call.amount,
+                    call.minPrice,
+                    call.timeInForce,
+                )
             }
             _ => Ok(StorageCtx.revert_output(Bytes::new())),
         }
@@ -1144,7 +1349,7 @@ mod tests {
 
     use alloc::string::ToString;
 
-    use super::MIN_ORDER_AMOUNT;
+    use super::{MIN_ORDER_AMOUNT, PRICE_DECIMALS, PRICE_SCALE, bid_escrow, quote_amount};
     use crate::refprice::{GuardrailRejection, ReferencePrice, ReferencePriceGuard};
 
     fn alpha_reference(price: u128, as_of_timestamp: u64) -> ReferencePrice {
@@ -1168,6 +1373,37 @@ mod tests {
         // Sanity guard against accidental tuning of the darkpool dust floor
         // while landing the reference-price guardrails.
         assert_eq!(MIN_ORDER_AMOUNT, 100);
+    }
+
+    #[test]
+    fn fixed_point_prices_support_realistic_crypto_and_stablecoin_quotes() {
+        assert_eq!(PRICE_DECIMALS, 6);
+        assert_eq!(PRICE_SCALE, 1_000_000);
+        assert_eq!(
+            quote_amount(1_000_000, 79_096_730_000),
+            Some(79_096_730_000)
+        );
+        assert_eq!(quote_amount(250_000, 79_096_730_000), Some(19_774_182_500));
+        assert_eq!(quote_amount(1_000_000, 97_480_000), Some(97_480_000));
+        assert_eq!(quote_amount(1_000_000, 999_900), Some(999_900));
+        assert_eq!(quote_amount(1_000_000, 1_000_100), Some(1_000_100));
+    }
+
+    #[test]
+    fn bid_escrow_rounds_up_while_execution_rounds_down() {
+        assert_eq!(quote_amount(101, 1_000_001), Some(101));
+        assert_eq!(bid_escrow(101, 1_000_001), Some(102));
+        assert_eq!(bid_escrow(100, PRICE_SCALE), Some(100));
+    }
+
+    #[test]
+    fn fixed_point_quote_rejects_zero_and_overflow() {
+        assert_eq!(quote_amount(100, 1), None);
+        assert_eq!(quote_amount(1, 999_999), None);
+        assert_eq!(quote_amount(u128::MAX, u128::MAX), None);
+        assert_eq!(bid_escrow(0, PRICE_SCALE), None);
+        assert_eq!(bid_escrow(1, 0), None);
+        assert_eq!(bid_escrow(u128::MAX, u128::MAX), None);
     }
 
     #[test]

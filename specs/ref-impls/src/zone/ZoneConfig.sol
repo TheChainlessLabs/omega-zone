@@ -8,7 +8,7 @@ import {
     PORTAL_PENDING_SEQUENCER_SLOT,
     PORTAL_SEQUENCER_SLOT,
     PORTAL_TOKEN_CONFIGS_SLOT
-} from "./IZone.sol";
+} from "../interfaces/IZone.sol";
 
 /// @title ZoneConfig
 /// @notice Central zone metadata and L1 state references

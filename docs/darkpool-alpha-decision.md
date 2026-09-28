@@ -44,7 +44,7 @@ Issue #9 framed the choice as A vs. B:
 |---|---|---|
 | Storage persistence fix | One small diff, already in PR #1 | N/A — Solidity uses normal account storage |
 | Wallet / tooling predictability | Custom precompile address, custom call semantics | Standard contract, walkable in any explorer / wallet |
-| Owner-scoped history feasibility | Already emits `OrderSubmitted`, `OrderPlaced`, `OrderFilled`, `OrderMatched`, `OrderCancelled` with maker / taker indexed | Identical events possible (same shape) |
+| Owner-scoped history feasibility | Emits `OrderSubmitted`, `OrderPlaced`, `OrderFilled`, and `OrderCancelled`; fills carry both maker and taker order IDs while maker / taker remain indexed | Identical events possible (same shape) |
 | Frontend integration cost from here | Adopt new `zone_getMy*` methods, remove localStorage cache | Reimplement Rust precompile in Solidity, redeploy, then adopt new RPC methods anyway |
 | Gas / latency | Native precompile speed | Solidity is the slower path; matters once volume is non-trivial |
 | Audit surface | Existing Rust code, integration tests, sequencer-only TEE assumption | New Solidity contract requires its own review |
@@ -111,10 +111,10 @@ Canonical write selectors:
 |---|---|---|
 | `0xb3fb6564` | `deposit(address,uint128)` | Pulls `amount` of `token` into the caller's internal darkpool balance. |
 | `0x08fab167` | `withdraw(address,uint128)` | Withdraws available internal balance back to the caller's zone TIP-20 wallet. |
-| `0xee60dde5` | `place(address,uint128,uint128,bool)` | Places a limit order for `base, amount, price, isBid`; returns the accepted order id. |
+| `0xa47ce1ad` | `place(address,address,uint128,uint128,bool,uint8)` | Places a limit order for `base, quote, amount, price, isBid, timeInForce`; currently accepts GTC (`0`) and returns the accepted order id. |
 | `0x81649d06` | `cancel(uint128)` | Cancels a resting order owned by the caller. |
-| `0x7345f144` | `marketBuy(address,uint128,uint128)` | Buys exact `amount` of base, spending up to `maxQuoteIn`. |
-| `0xf005c804` | `marketSell(address,uint128,uint128)` | Sells exact `amount` of base, receiving at least `minQuoteOut`. |
+| `0x61eb79f9` | `marketBuy(address,address,uint128,uint128,uint8)` | Buys up to `amount` of base at or below the per-unit `maxPrice`; accepts IOC (`1`) or FOK (`2`). |
+| `0x809dac94` | `marketSell(address,address,uint128,uint128,uint8)` | Sells up to `amount` of base at or above the per-unit `minPrice`; accepts IOC (`1`) or FOK (`2`). |
 
 Canonical read selectors:
 
@@ -124,28 +124,36 @@ Canonical read selectors:
 | `0xf7888aec` | `balanceOf(address,address)` | Owner-scoped total internal balance. |
 | `0x2a7575ee` | `availableBalanceOf(address,address)` | Owner-scoped internal balance minus resting-order escrow. |
 | `0xcd27ca82` | `pairKey(address,address)` | Pure pair-key helper. |
-| `0x9ccb0744` | `createPair(address)` | Explicit pair creation; `place` also lazily creates pairs. |
-| `0x835801d7` | `bestBid(address)` | Aggregate top bid for alpha readiness only. |
-| `0x64d5a61c` | `bestAsk(address)` | Aggregate top ask for alpha readiness only. |
+| `0xc9c65396` | `createPair(address,address)` | Explicit pair creation; `place` also lazily creates pairs. |
+| `0x9def6d50` | `bestBid(address,address)` | Aggregate top bid for the requested pair. |
+| `0x26dc90cc` | `bestAsk(address,address)` | Aggregate top ask for the requested pair. |
 | `0x40bf2aa4` | `MIN_ORDER_AMOUNT()` | Dust floor, currently `100`. |
 
-Prices are raw integer quote-per-base units. The precompile does not apply
-token decimals; callers and frontends format decimals at the edge. For the
-alpha OALPHA/pathUSD pair, `base` is OALPHA and `quote` is pathUSD.
+Prices are six-decimal fixed-point quote-per-base integers:
+`quoteAmount = floor(baseAmount * price / 1_000_000)`. Callers and frontends
+convert decimal prices at the edge. For the alpha OALPHA/pathUSD pair, `base`
+is OALPHA and `quote` is pathUSD.
 
 Collateral is reserved by side:
 
-- Bid escrow: `amount * price` in quote token.
+- Bid escrow: `ceil(amount * price / 1_000_000)` in quote token.
 - Ask escrow: `amount` in base token.
 - Filled bid takers pay the resting maker's price, not necessarily their
   submitted limit price.
 - `availableBalanceOf` excludes all resting escrow. Cancelling a partially
   filled order releases only the unfilled residual.
 
-Accepted limit orders emit `OrderSubmitted` before matching. Residual resting
-orders additionally emit `OrderPlaced`. Each consumed resting leg emits
-`OrderFilled`, and limit-order matches also emit `OrderMatched` to link the
-maker order id and taker submission id for owner-scoped history.
+Every accepted limit or market order receives an order id and emits
+`OrderSubmitted` before matching. Residual GTC limit orders additionally emit
+`OrderPlaced`. Each consumed resting leg emits one `OrderFilled` carrying both
+the maker and taker order ids. IOC remainders emit `OrderCancelled` with the
+cancelled amount and `iocRemainder` reason; user cancellations use `user`.
+FOK failures revert atomically, including the order-id allocation and all logs.
+
+Stable time-in-force values are GTC `0`, IOC `1`, and FOK `2`. Market protection
+is a per-unit worst price, not a total quote budget. IOC orders may fill fully,
+partially, or not at all; FOK remains the default market behavior and must fill
+the entire amount inside the protection price.
 
 ## Top-of-book stance for alpha
 

@@ -39,7 +39,7 @@ pub struct ReferencePriceProviderConfig {
 pub enum ReferencePriceProviderKind {
     /// A statically configured price (alpha default).
     Static {
-        /// Raw integer price; same units as the orderbook precompile.
+        /// Six-decimal fixed-point price; same units as the orderbook.
         price: u128,
         /// Origin tag surfaced to clients (e.g. `"static:alpha"`).
         source: String,

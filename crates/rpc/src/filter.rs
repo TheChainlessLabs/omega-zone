@@ -10,6 +10,8 @@ use alloy_primitives::{Address, B256, b256};
 use alloy_rpc_types_eth::{Filter, FilterSet, Log};
 use tempo_alloy::rpc::TempoTransactionReceipt;
 
+use crate::types::JsonRpcError;
+
 /// `Transfer(address,address,uint256)`
 pub const TRANSFER_TOPIC: B256 =
     b256!("0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef");
@@ -38,6 +40,10 @@ pub const WHITELISTED_TOPICS: [B256; 5] = [
     MINT_TOPIC,
     BURN_TOPIC,
 ];
+
+const TWO_PARTY_TOPICS: [B256; 3] = [TRANSFER_TOPIC, APPROVAL_TOPIC, TRANSFER_WITH_MEMO_TOPIC];
+const CALLER_SCOPED_FILTER_ERROR: &str =
+    "private log filter must include authenticated caller in topic1 or topic2";
 
 /// Returns `true` if `caller` appears in an eligible indexed-topic position
 /// for the log's event type.
@@ -73,27 +79,81 @@ pub fn is_caller_eligible(log: &Log, caller: &Address) -> bool {
 /// A log is included only when **both** of the following hold:
 /// 1. Its topic0 is one of the [`WHITELISTED_TOPICS`].
 /// 2. The `caller` is eligible per [`is_caller_eligible`].
-///
-/// TODO: once the enabled-token registry is plumbed through, also filter
-/// by emitting contract address (only logs from enabled TIP-20 tokens).
 pub fn is_log_visible(log: &Log, caller: &Address) -> bool {
-    log.topic0().is_some_and(|t| WHITELISTED_TOPICS.contains(t)) && is_caller_eligible(log, caller)
+    (log.topic0().is_some_and(|t| WHITELISTED_TOPICS.contains(t))
+        && is_caller_eligible(log, caller))
+        || (log.address() == crate::darkpool::DARKPOOL_ADDRESS
+            && crate::darkpool::caller_is_party(log, caller))
 }
 
-/// Filters logs to only those the caller is allowed to see.
+/// Renumbers ordering fields on a sequence of logs so that
+/// `(transactionHash, logIndex)` is stable and per-tx, without leaking
+/// how many other logs preceded them.
+///
+/// `logIndex` restarts at `0` for each new tx and increments for each
+/// subsequent log within that same tx.
+/// `transactionIndex` is always zeroed to hide ordering within the block.
+#[derive(Default)]
+pub struct LogOrderingRedactor {
+    current_tx: Option<B256>,
+    next_index: u64,
+}
+
+impl LogOrderingRedactor {
+    /// Redact the ordering fields of a single already-visible log.
+    pub fn redact(&mut self, mut log: Log) -> Log {
+        if self.current_tx != log.transaction_hash {
+            self.current_tx = log.transaction_hash;
+            self.next_index = 0;
+        }
+        log.transaction_index = Some(0);
+        log.log_index = Some(self.next_index);
+        self.next_index += 1;
+        log
+    }
+}
+
+/// Filters logs to only those the caller is allowed to see, renumbering the
+/// `log_index` via [`LogOrderingRedactor`].
 pub fn filter_logs(logs: Vec<Log>, caller: &Address) -> Vec<Log> {
+    let mut redactor = LogOrderingRedactor::default();
     logs.into_iter()
         .filter(|log| is_log_visible(log, caller))
+        .map(|log| redactor.redact(log))
         .collect()
 }
 
 /// Filters a receipt's logs for its sender and recomputes `logsBloom`.
 pub fn filter_receipt_logs(mut receipt: TempoTransactionReceipt) -> TempoTransactionReceipt {
     let caller = receipt.from();
+    receipt.inner.transaction_index = Some(0);
+    receipt.inner.inner.receipt.cumulative_gas_used = receipt.inner.gas_used;
     let logs = core::mem::take(&mut receipt.inner.inner.receipt.logs);
     receipt.inner.inner.receipt.logs = filter_logs(logs, &caller);
     receipt.inner.inner.logs_bloom = receipt.inner.inner.receipt.bloom();
     receipt
+}
+
+/// Scopes a user-supplied filter to only match enabled zone token addresses.
+pub fn scope_filter_addresses(
+    filter: &mut Filter,
+    zone_tokens: &[Address],
+) -> Result<(), JsonRpcError> {
+    let requested_addresses: Vec<Address> = filter.address.iter().copied().collect();
+
+    if requested_addresses.is_empty() {
+        filter.address = FilterSet::from(zone_tokens.to_vec());
+        return Ok(());
+    }
+
+    if requested_addresses
+        .iter()
+        .all(|address| zone_tokens.contains(address))
+    {
+        Ok(())
+    } else {
+        Err(JsonRpcError::invalid_params("invalid filter address"))
+    }
 }
 
 /// Scopes a user-supplied filter to only match whitelisted TIP-20 event topics.
@@ -104,9 +164,6 @@ pub fn filter_receipt_logs(mut receipt: TempoTransactionReceipt) -> TempoTransac
 ///
 /// The post-filter in [`filter_logs`] remains the actual privacy enforcement;
 /// this pre-filter reduces DB scan volume and timing side-channels.
-///
-/// TODO: once the enabled-token registry is plumbed through, also scope the
-/// filter's `address` field to only match enabled TIP-20 token addresses.
 pub fn scope_filter(filter: &mut Filter) {
     // --- Topic0 scoping ---
     let user_topic0: Vec<B256> = filter.topics[0].iter().copied().collect();
@@ -128,6 +185,37 @@ pub fn scope_filter(filter: &mut Filter) {
     } else {
         filter.topics[0] = FilterSet::from(scoped_topic0);
     }
+}
+
+/// Scopes a user-supplied filter to whitelisted event topics and requires the
+/// authenticated caller to appear in an eligible indexed topic before backend
+/// log retrieval.
+pub fn scope_filter_for_caller(filter: &mut Filter, caller: &Address) -> Result<(), JsonRpcError> {
+    scope_filter(filter);
+    if filter.topics[0].len() == 1 && filter.topics[0].contains(&B256::ZERO) {
+        return Ok(());
+    }
+
+    let caller_word = B256::left_padding_from(caller.as_slice());
+    if filter.topics[1].contains(&caller_word) {
+        filter.topics[1] = FilterSet::from(caller_word);
+        return Ok(());
+    }
+
+    if filter.topics[2].contains(&caller_word) {
+        let topic0 = filter.topics[0]
+            .iter()
+            .copied()
+            .filter(|topic| TWO_PARTY_TOPICS.contains(topic))
+            .collect::<Vec<_>>();
+        if !topic0.is_empty() {
+            filter.topics[0] = FilterSet::from(topic0);
+            filter.topics[2] = FilterSet::from(caller_word);
+            return Ok(());
+        }
+    }
+
+    Err(JsonRpcError::invalid_params(CALLER_SCOPED_FILTER_ERROR))
 }
 
 #[cfg(test)]
@@ -154,6 +242,16 @@ mod tests {
             log_index: None,
             removed: false,
         }
+    }
+
+    /// Build a test `Log` carrying real (pre-redaction) ordering metadata so
+    /// tests can assert the ordering fields are actually rewritten.
+    fn make_log_in_tx(emitter: Address, topics: Vec<B256>, tx_hash: B256, log_index: u64) -> Log {
+        let mut log = make_log(emitter, topics);
+        log.transaction_hash = Some(tx_hash);
+        log.transaction_index = Some(42);
+        log.log_index = Some(log_index);
+        log
     }
 
     fn caller_word(addr: &Address) -> B256 {
@@ -412,7 +510,10 @@ mod tests {
         let result = filter_logs(logs, &caller);
 
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0], eligible);
+        let mut expected = eligible;
+        expected.transaction_index = Some(0);
+        expected.log_index = Some(0);
+        assert_eq!(result[0], expected);
     }
 
     #[test]
@@ -420,6 +521,119 @@ mod tests {
         let caller = address!("0x0000000000000000000000000000000000000001");
         let result = filter_logs(vec![], &caller);
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn filter_logs_renumbers_log_index_per_transaction() {
+        let zone_token = address!("0x000000000000000000000000000000000000aaaa");
+        let caller = address!("0x0000000000000000000000000000000000000001");
+        let other = address!("0x0000000000000000000000000000000000000002");
+
+        let tx_a = B256::with_last_byte(0xaa);
+        let tx_b = B256::with_last_byte(0xbb);
+
+        // tx A: two caller-visible logs separated by one the caller can't see.
+        // Real (block-global) log indices are non-contiguous and must be erased.
+        let a_visible_0 = make_log_in_tx(
+            zone_token,
+            vec![TRANSFER_TOPIC, caller_word(&caller), caller_word(&other)],
+            tx_a,
+            7,
+        );
+        let a_hidden = make_log_in_tx(
+            zone_token,
+            vec![TRANSFER_TOPIC, caller_word(&other), caller_word(&other)],
+            tx_a,
+            8,
+        );
+        let a_visible_1 = make_log_in_tx(
+            zone_token,
+            vec![APPROVAL_TOPIC, caller_word(&caller), caller_word(&other)],
+            tx_a,
+            9,
+        );
+        // tx B: a single caller-visible log; numbering must restart at 0.
+        let b_visible_0 = make_log_in_tx(
+            zone_token,
+            vec![TRANSFER_TOPIC, caller_word(&other), caller_word(&caller)],
+            tx_b,
+            3,
+        );
+
+        let result = filter_logs(
+            vec![a_visible_0, a_hidden, a_visible_1, b_visible_0],
+            &caller,
+        );
+
+        // Only the caller's three logs survive, in order.
+        let ordering: Vec<_> = result
+            .iter()
+            .map(|log| (log.transaction_hash, log.transaction_index, log.log_index))
+            .collect();
+        assert_eq!(
+            ordering,
+            vec![
+                // tx A: renumbered 0, 1 among the caller's visible logs.
+                (Some(tx_a), Some(0), Some(0)),
+                (Some(tx_a), Some(0), Some(1)),
+                // tx B: restarts at 0.
+                (Some(tx_b), Some(0), Some(0)),
+            ]
+        );
+    }
+
+    #[test]
+    fn log_ordering_is_consistent_between_batch_and_stream() {
+        // The same visible logs numbered once via `filter_logs` (the batch
+        // `eth_getLogs` path) and once by driving `LogOrderingRedactor` a log at a
+        // time (the `eth_subscribe("logs")` stream path) must agree, so a log's
+        // `(transactionHash, logIndex)` is identical regardless of which RPC
+        // surfaced it.
+        let caller = address!("0x0000000000000000000000000000000000000001");
+        let other = address!("0x0000000000000000000000000000000000000002");
+        let tx_a = B256::with_last_byte(0xaa);
+        let tx_b = B256::with_last_byte(0xbb);
+
+        let visible = vec![
+            make_log_in_tx(
+                Address::ZERO,
+                vec![TRANSFER_TOPIC, caller_word(&caller), caller_word(&other)],
+                tx_a,
+                5,
+            ),
+            make_log_in_tx(
+                Address::ZERO,
+                vec![APPROVAL_TOPIC, caller_word(&caller), caller_word(&other)],
+                tx_a,
+                6,
+            ),
+            make_log_in_tx(
+                Address::ZERO,
+                vec![TRANSFER_TOPIC, caller_word(&other), caller_word(&caller)],
+                tx_b,
+                9,
+            ),
+        ];
+
+        let batch = filter_logs(visible.clone(), &caller);
+
+        // Mirror the WS stream: filter, then feed survivors one at a time.
+        let mut redactor = LogOrderingRedactor::default();
+        let streamed: Vec<Log> = visible
+            .into_iter()
+            .filter(|log| is_log_visible(log, &caller))
+            .map(|log| redactor.redact(log))
+            .collect();
+
+        assert_eq!(batch, streamed);
+        let indices: Vec<_> = batch
+            .iter()
+            .map(|log| (log.transaction_index, log.log_index))
+            .collect();
+        assert_eq!(
+            indices,
+            vec![(Some(0), Some(0)), (Some(0), Some(1)), (Some(0), Some(0))]
+        );
     }
 
     #[test]
@@ -448,7 +662,19 @@ mod tests {
             ],
         ));
 
-        assert_eq!(filtered.inner.logs(), std::slice::from_ref(&visible));
+        let mut expected_visible = visible;
+        expected_visible.transaction_index = Some(0);
+        expected_visible.log_index = Some(0);
+
+        assert_eq!(
+            filtered.inner.logs(),
+            std::slice::from_ref(&expected_visible)
+        );
+        assert_eq!(filtered.inner.transaction_index, Some(0));
+        assert_eq!(
+            filtered.inner.inner.receipt.cumulative_gas_used,
+            filtered.inner.gas_used
+        );
         assert_eq!(
             filtered.inner.inner.logs_bloom,
             alloy_primitives::logs_bloom(filtered.inner.logs().iter().map(|log| log.as_ref())),
@@ -456,7 +682,7 @@ mod tests {
         assert_ne!(
             filtered.inner.inner.logs_bloom,
             alloy_primitives::logs_bloom(
-                [visible, hidden_transfer, hidden_event]
+                [expected_visible, hidden_transfer, hidden_event]
                     .iter()
                     .map(|log| log.as_ref())
             ),
@@ -495,5 +721,121 @@ mod tests {
         filter.topics[0] = FilterSet::from(bogus);
         scope_filter(&mut filter);
         assert_eq!(filter.topics[0], FilterSet::from(B256::ZERO));
+    }
+
+    #[test]
+    fn scope_filter_for_caller_rejects_broad_filter() {
+        let caller = address!("0x0000000000000000000000000000000000000001");
+        let mut filter = Filter::default();
+
+        let err = scope_filter_for_caller(&mut filter, &caller).unwrap_err();
+
+        assert_eq!(err.code, JsonRpcError::invalid_params("").code);
+        assert_eq!(err.message, CALLER_SCOPED_FILTER_ERROR);
+    }
+
+    #[test]
+    fn scope_filter_for_caller_scopes_topic1_caller() {
+        let caller = address!("0x0000000000000000000000000000000000000001");
+        let other = address!("0x0000000000000000000000000000000000000002");
+        let caller_topic = caller_word(&caller);
+        let other_topic = caller_word(&other);
+        let mut filter = Filter::default();
+        filter.topics[1] = FilterSet::from(vec![caller_topic, other_topic]);
+        filter.topics[2] = FilterSet::from(other_topic);
+
+        scope_filter_for_caller(&mut filter, &caller).unwrap();
+
+        assert_eq!(filter.topics[0].len(), WHITELISTED_TOPICS.len());
+        assert_eq!(filter.topics[1], FilterSet::from(caller_topic));
+        assert_eq!(filter.topics[2], FilterSet::from(other_topic));
+    }
+
+    #[test]
+    fn scope_filter_for_caller_scopes_topic2_caller_for_two_party_events() {
+        let caller = address!("0x0000000000000000000000000000000000000001");
+        let other = address!("0x0000000000000000000000000000000000000002");
+        let caller_topic = caller_word(&caller);
+        let other_topic = caller_word(&other);
+        let mut filter = Filter::default();
+        filter.topics[0] = FilterSet::from(vec![TRANSFER_TOPIC, MINT_TOPIC]);
+        filter.topics[1] = FilterSet::from(other_topic);
+        filter.topics[2] = FilterSet::from(vec![caller_topic, caller_word(&other)]);
+
+        scope_filter_for_caller(&mut filter, &caller).unwrap();
+
+        assert_eq!(filter.topics[0], FilterSet::from(TRANSFER_TOPIC));
+        assert_eq!(filter.topics[1], FilterSet::from(other_topic));
+        assert_eq!(filter.topics[2], FilterSet::from(caller_topic));
+    }
+
+    #[test]
+    fn scope_filter_for_caller_rejects_wrong_caller() {
+        let caller = address!("0x0000000000000000000000000000000000000001");
+        let a = address!("0x0000000000000000000000000000000000000002");
+        let b = address!("0x0000000000000000000000000000000000000003");
+        let mut filter = Filter::default();
+        filter.topics[0] = FilterSet::from(TRANSFER_TOPIC);
+        filter.topics[1] = FilterSet::from(caller_word(&a));
+        filter.topics[2] = FilterSet::from(caller_word(&b));
+
+        let err = scope_filter_for_caller(&mut filter, &caller).unwrap_err();
+
+        assert_eq!(err.code, JsonRpcError::invalid_params("").code);
+        assert_eq!(err.message, CALLER_SCOPED_FILTER_ERROR);
+    }
+
+    #[test]
+    fn scope_filter_for_caller_rejects_topic2_only_for_one_party_events() {
+        let caller = address!("0x0000000000000000000000000000000000000001");
+        let mut filter = Filter::default();
+        filter.topics[0] = FilterSet::from(MINT_TOPIC);
+        filter.topics[2] = FilterSet::from(caller_word(&caller));
+
+        let err = scope_filter_for_caller(&mut filter, &caller).unwrap_err();
+
+        assert_eq!(err.code, JsonRpcError::invalid_params("").code);
+        assert_eq!(err.message, CALLER_SCOPED_FILTER_ERROR);
+    }
+
+    #[test]
+    fn scope_filter_addresses_scopes_omitted_address() {
+        let token_a = address!("0x00000000000000000000000000000000000000aa");
+        let token_b = address!("0x00000000000000000000000000000000000000bb");
+        let mut filter = Filter::default();
+
+        scope_filter_addresses(&mut filter, &[token_a, token_b]).unwrap();
+
+        assert!(filter.address.contains(&token_a));
+        assert!(filter.address.contains(&token_b));
+        assert_eq!(filter.address.len(), 2);
+    }
+
+    #[test]
+    fn scope_filter_addresses_allows_enabled_token_address() {
+        let token = address!("0x00000000000000000000000000000000000000aa");
+        let mut filter = Filter {
+            address: FilterSet::from(token),
+            ..Default::default()
+        };
+
+        scope_filter_addresses(&mut filter, &[token]).unwrap();
+
+        assert_eq!(filter.address, FilterSet::from(token));
+    }
+
+    #[test]
+    fn scope_filter_addresses_rejects_non_zone_token_address() {
+        let token = address!("0x00000000000000000000000000000000000000aa");
+        let other = address!("0x00000000000000000000000000000000000000cc");
+        let mut filter = Filter {
+            address: FilterSet::from(vec![token, other]),
+            ..Default::default()
+        };
+
+        let err = scope_filter_addresses(&mut filter, &[token]).unwrap_err();
+
+        assert_eq!(err.code, JsonRpcError::invalid_params("").code);
+        assert_eq!(err.message, "invalid filter address");
     }
 }
