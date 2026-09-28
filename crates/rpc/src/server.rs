@@ -16,7 +16,7 @@ use axum::{
 };
 use std::{
     sync::Arc,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 use tempo_contracts::precompiles::account_keychain::IAccountKeychain::{
     KeyInfo, SignatureType as KeyInfoSignatureType,
@@ -25,7 +25,6 @@ use tempo_primitives::transaction::{
     SignatureType as TempoSignatureType,
     tt_signature::{KeychainSignature, TempoSignature},
 };
-use tokio::sync::Semaphore;
 use tracing::info;
 
 use crate::{
@@ -95,145 +94,6 @@ pub async fn start_private_rpc(
     });
 
     Ok(local_addr)
-}
-
-/// Read-only zone RPC methods served anonymously by the public RPC server.
-/// These are aggregate / market-data reads whose handlers ignore the caller
-/// (`_auth`), so an anonymous context is safe; every other method is rejected.
-pub const PUBLIC_RPC_METHODS: &[&str] = &[
-    "zone_listBatches",
-    "zone_getBatch",
-    "zone_searchBatch",
-    "zone_getTopOfBook",
-    "zone_getMidpointHistory",
-];
-
-struct PublicRpcState {
-    api: Arc<dyn ZoneRpcApi>,
-    permits: Semaphore,
-    deadline: Duration,
-}
-
-/// Start the public (anonymous, read-only) zone RPC server.
-///
-/// Unlike [`start_private_rpc`] this performs NO authentication: it serves the
-/// fixed allowlist [`PUBLIC_RPC_METHODS`] with an anonymous [`AuthContext`] and
-/// rejects everything else with method-not-found, so wallet-free surfaces
-/// (the public batches explorer, the trade midpoint poll) can read the zone
-/// without an authorization token.
-pub async fn start_public_rpc(
-    listen_addr: std::net::SocketAddr,
-    api: Arc<dyn ZoneRpcApi>,
-) -> eyre::Result<std::net::SocketAddr> {
-    let state = Arc::new(PublicRpcState {
-        api,
-        permits: Semaphore::new(8),
-        deadline: Duration::from_secs(10),
-    });
-    let app = Router::new()
-        .route("/", post(handle_public_rpc))
-        .with_state(state);
-    let listener = tokio::net::TcpListener::bind(listen_addr).await?;
-    let local_addr = listener.local_addr()?;
-    info!(target: "zone::rpc", %local_addr, "Starting public (read-only) zone RPC server");
-    tokio::spawn(async move {
-        if let Err(err) = axum::serve(listener, app).await {
-            tracing::error!(target: "zone::rpc", %err, "Public RPC server failed");
-        }
-    });
-    Ok(local_addr)
-}
-
-async fn handle_public_rpc(
-    State(state): State<Arc<PublicRpcState>>,
-    body: Bytes,
-) -> impl IntoResponse {
-    let body_str = match std::str::from_utf8(&body) {
-        Ok(s) => s,
-        Err(_) => return (StatusCode::BAD_REQUEST, "invalid UTF-8").into_response(),
-    };
-    let Ok(_permit) = state.permits.try_acquire() else {
-        return (StatusCode::TOO_MANY_REQUESTS, "public RPC busy").into_response();
-    };
-    let auth = AuthContext {
-        caller: alloy_primitives::Address::ZERO,
-        expires_at: u64::MAX,
-        keychain_key_id: None,
-    };
-    // One deadline covers the whole batch, including waits for shared query locks.
-    match tokio::time::timeout(
-        state.deadline,
-        process_public_rpc_text(body_str, &auth, state.api.as_ref()),
-    )
-    .await
-    {
-        Ok(result) => result.into_response(),
-        Err(_) => (StatusCode::GATEWAY_TIMEOUT, "public RPC timed out").into_response(),
-    }
-}
-
-/// Like `process_rpc_text`, but rejects any method not in `PUBLIC_RPC_METHODS`.
-async fn process_public_rpc_text(
-    text: &str,
-    auth: &AuthContext,
-    api: &dyn ZoneRpcApi,
-) -> RpcResult {
-    let trimmed = text.trim_start();
-    if trimmed.starts_with('[') {
-        match serde_json::from_str::<Vec<JsonRpcRequest>>(trimmed) {
-            Ok(requests) if requests.is_empty() => RpcResult::Single(JsonRpcResponse::error(
-                serde_json::Value::Null,
-                JsonRpcError::parse_error("empty batch"),
-            )),
-            Ok(requests) if requests.len() > MAX_BATCH_SIZE => {
-                RpcResult::Single(JsonRpcResponse::error(
-                    serde_json::Value::Null,
-                    JsonRpcError::invalid_params(format!(
-                        "batch too large ({} > {MAX_BATCH_SIZE})",
-                        requests.len()
-                    )),
-                ))
-            }
-            Ok(requests) => {
-                let mut responses = Vec::with_capacity(requests.len());
-                for req in &requests {
-                    responses.push(dispatch_public_request(req, auth, api).await);
-                }
-                RpcResult::Batch(responses)
-            }
-            Err(e) => RpcResult::Single(JsonRpcResponse::error(
-                serde_json::Value::Null,
-                JsonRpcError::parse_error(format!("parse error: {e}")),
-            )),
-        }
-    } else {
-        match serde_json::from_str::<JsonRpcRequest>(trimmed) {
-            Ok(request) => RpcResult::Single(dispatch_public_request(&request, auth, api).await),
-            Err(e) => RpcResult::Single(JsonRpcResponse::error(
-                serde_json::Value::Null,
-                JsonRpcError::parse_error(format!("parse error: {e}")),
-            )),
-        }
-    }
-}
-
-async fn dispatch_public_request(
-    req: &JsonRpcRequest,
-    auth: &AuthContext,
-    api: &dyn ZoneRpcApi,
-) -> JsonRpcResponse {
-    if !PUBLIC_RPC_METHODS.contains(&req.method.as_str()) {
-        return JsonRpcResponse::error(req.id.clone(), JsonRpcError::method_not_found());
-    }
-    let mut response = dispatch_request(req, auth, api).await;
-    if let Some(error) = &mut response.error {
-        // Provider failures can contain credentials, endpoint URLs or node internals.
-        error.data = None;
-        if !matches!(error.code, -32601 | -32602) {
-            *error = JsonRpcError::internal("public RPC unavailable");
-        }
-    }
-    response
 }
 
 /// Result of processing a JSON-RPC text payload (single or batch).
@@ -490,11 +350,7 @@ mod tests {
     const CHAIN_ID: u64 = 99;
     const PORTAL: Address = Address::repeat_byte(0x22);
 
-    #[derive(Default)]
     struct TestApi {
-        public_calls: std::sync::atomic::AtomicUsize,
-        public_error: bool,
-        public_pending: bool,
         key_infos: Mutex<HashMap<(Address, Address), KeyInfo>>,
     }
 
@@ -504,40 +360,8 @@ mod tests {
             key_infos.insert((account, key_id), key_info);
             Self {
                 key_infos: Mutex::new(key_infos),
-                ..Default::default()
             }
         }
-    }
-
-    impl TestApi {
-        fn public_result(&self, auth: crate::auth::AuthContext) -> BoxFut<'_> {
-            use std::sync::atomic::Ordering;
-            self.public_calls.fetch_add(1, Ordering::SeqCst);
-            Box::pin(async move {
-                assert_eq!(auth.caller, Address::ZERO);
-                assert_eq!(auth.expires_at, u64::MAX);
-                assert!(auth.keychain_key_id.is_none());
-                if self.public_pending {
-                    std::future::pending::<()>().await;
-                }
-                if self.public_error {
-                    return Err(JsonRpcError {
-                        code: -32603,
-                        message: "https://provider.invalid/secret-key".into(),
-                        data: Some(serde_json::json!({"secret": "credential"})),
-                    });
-                }
-                crate::types::to_raw(&true)
-            })
-        }
-    }
-
-    macro_rules! public_stub {
-        ($method:ident $(, $arg:ident : $ty:ty)*) => {
-            fn $method(&self $(, $arg: $ty)*, auth: crate::auth::AuthContext) -> BoxFut<'_> {
-                self.public_result(auth)
-            }
-        };
     }
 
     macro_rules! stub {
@@ -594,148 +418,13 @@ mod tests {
         stub!(zone_get_zone_info, _c: crate::auth::AuthContext);
         stub!(zone_get_deposit_status, _a: u64, _c: crate::auth::AuthContext);
         stub!(zone_get_market_config, _c: crate::auth::AuthContext);
-        public_stub!(zone_get_top_of_book, _a: Address, _b: Address);
-        public_stub!(zone_get_midpoint_history, _a: Address, _b: Address, _c: String, _d: u32, _e: Option<String>);
-        public_stub!(zone_list_batches, _a: crate::types::ListBatchesParams);
-        public_stub!(zone_get_batch, _a: u64);
-        public_stub!(zone_search_batch, _a: String);
+        stub!(zone_get_top_of_book, _a: alloy_primitives::Address, _b: alloy_primitives::Address, _c: crate::auth::AuthContext);
+        stub!(zone_get_midpoint_history, _a: alloy_primitives::Address, _b: alloy_primitives::Address, _c: String, _d: u32, _e: Option<String>, _f: crate::auth::AuthContext);
         stub!(zone_get_my_orders, _a: crate::darkpool::HistoryQuery, _c: crate::auth::AuthContext);
         stub!(zone_get_my_fills, _a: crate::darkpool::HistoryQuery, _c: crate::auth::AuthContext);
         stub!(zone_get_my_transfers, _a: crate::darkpool::TransferQuery, _c: crate::auth::AuthContext);
         stub!(zone_get_order, _a: u128, _c: crate::auth::AuthContext);
         stub!(zone_get_withdrawal_status, _a: crate::types::WithdrawalStatusQuery, _c: crate::auth::AuthContext);
-    }
-
-    fn public_state(api: std::sync::Arc<TestApi>) -> std::sync::Arc<super::PublicRpcState> {
-        std::sync::Arc::new(super::PublicRpcState {
-            api,
-            permits: tokio::sync::Semaphore::new(1),
-            deadline: std::time::Duration::from_millis(10),
-        })
-    }
-
-    async fn public_call(
-        state: std::sync::Arc<super::PublicRpcState>,
-        body: serde_json::Value,
-    ) -> (StatusCode, String) {
-        use axum::response::IntoResponse;
-        let response =
-            super::handle_public_rpc(axum::extract::State(state), body.to_string().into())
-                .await
-                .into_response();
-        let status = response.status();
-        let bytes = axum::body::to_bytes(response.into_body(), 100_000)
-            .await
-            .unwrap();
-        (status, String::from_utf8(bytes.to_vec()).unwrap())
-    }
-
-    fn public_request(method: &str, params: serde_json::Value) -> serde_json::Value {
-        serde_json::json!({"jsonrpc":"2.0", "id":7, "method":method, "params":params})
-    }
-
-    #[tokio::test]
-    async fn public_rpc_allows_only_five_aggregate_methods_with_anonymous_context() {
-        use serde_json::json;
-        let api = std::sync::Arc::new(TestApi::default());
-        let state = public_state(api.clone());
-        let pair = json!({"base":Address::repeat_byte(1), "quote":Address::repeat_byte(2)});
-        let calls = [
-            public_request("zone_listBatches", json!([])),
-            public_request("zone_getBatch", json!(["0x1"])),
-            public_request("zone_searchBatch", json!(["1"])),
-            public_request("zone_getTopOfBook", json!([pair])),
-            public_request("zone_getMidpointHistory", json!([pair, "1m"])),
-        ];
-        let (status, body) = public_call(state.clone(), json!(calls)).await;
-        assert_eq!(status, StatusCode::OK);
-        let responses: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
-        assert_eq!(responses.len(), 5);
-        assert!(
-            responses
-                .iter()
-                .all(|r| r["result"] == true && r["id"] == 7)
-        );
-        for method in [
-            "eth_getBalance",
-            "zone_getMyOrders",
-            "eth_sendRawTransaction",
-            "unknown",
-        ] {
-            let denied = public_request(method, json!([]));
-            let (_, body) = public_call(state.clone(), denied.clone()).await;
-            assert_eq!(
-                serde_json::from_str::<serde_json::Value>(&body).unwrap()["error"]["code"],
-                -32601
-            );
-            let (_, body) = public_call(state.clone(), json!([calls[0], denied])).await;
-            let mixed: serde_json::Value = serde_json::from_str(&body).unwrap();
-            assert_eq!(mixed[0]["result"], true);
-            assert_eq!(mixed[1]["error"]["code"], -32601);
-        }
-        assert_eq!(
-            api.public_calls.load(std::sync::atomic::Ordering::SeqCst),
-            9
-        );
-    }
-
-    #[tokio::test]
-    async fn public_rpc_rejects_invalid_batches_and_redacts_provider_errors() {
-        use serde_json::json;
-        let api = std::sync::Arc::new(TestApi {
-            public_error: true,
-            ..Default::default()
-        });
-        let state = public_state(api.clone());
-        let call = public_request("zone_listBatches", json!([]));
-        for body in [call.clone(), json!([call.clone()])] {
-            let (_, body) = public_call(state.clone(), body).await;
-            assert!(body.contains("public RPC unavailable"));
-            assert!(!body.contains("secret") && !body.contains("credential"));
-        }
-        for (body, code) in [(json!([]), -32700), (json!(vec![call; 101]), -32602)] {
-            let (_, body) = public_call(state.clone(), body).await;
-            assert_eq!(
-                serde_json::from_str::<serde_json::Value>(&body).unwrap()["error"]["code"],
-                code
-            );
-        }
-        assert_eq!(
-            api.public_calls.load(std::sync::atomic::Ordering::SeqCst),
-            2
-        );
-    }
-
-    #[tokio::test]
-    async fn public_rpc_bounds_concurrency_and_entire_batch_duration() {
-        use serde_json::json;
-        let api = std::sync::Arc::new(TestApi {
-            public_pending: true,
-            ..Default::default()
-        });
-        let state = public_state(api.clone());
-        let call = public_request("zone_listBatches", json!([]));
-        let permit = state.permits.acquire().await.unwrap();
-        assert_eq!(
-            public_call(state.clone(), call.clone()).await.0,
-            StatusCode::TOO_MANY_REQUESTS
-        );
-        assert_eq!(
-            api.public_calls.load(std::sync::atomic::Ordering::SeqCst),
-            0
-        );
-        drop(permit);
-        assert_eq!(
-            public_call(state.clone(), json!([call.clone(), call]))
-                .await
-                .0,
-            StatusCode::GATEWAY_TIMEOUT
-        );
-        assert_eq!(
-            api.public_calls.load(std::sync::atomic::Ordering::SeqCst),
-            1
-        );
-        assert_eq!(state.permits.available_permits(), 1);
     }
 
     fn test_config() -> PrivateRpcConfig {
@@ -764,7 +453,6 @@ mod tests {
         let token = alloy_primitives::hex::encode(blob);
         let api = TestApi {
             key_infos: Mutex::new(HashMap::new()),
-            ..Default::default()
         };
 
         let err = authenticate_token(&token, &config, &api)
@@ -795,7 +483,6 @@ mod tests {
         let token = alloy_primitives::hex::encode(blob);
         let api = TestApi {
             key_infos: Mutex::new(HashMap::new()),
-            ..Default::default()
         };
 
         let err = authenticate_token(&token, &config, &api)
@@ -824,7 +511,6 @@ mod tests {
         let token = alloy_primitives::hex::encode(blob);
         let api = TestApi {
             key_infos: Mutex::new(HashMap::new()),
-            ..Default::default()
         };
 
         let auth = authenticate_token(&token, &test_config(), &api)
