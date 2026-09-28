@@ -28,4 +28,5 @@ pub use provider::{ZoneProvider, ZoneProviderConfig};
 pub use proxy::ProxyZoneRpc;
 pub use refprice::{ReferencePriceProviderConfig, ReferencePriceProviderKind};
 pub use server::start_private_rpc;
+pub use server::start_public_rpc;
 pub use subscription::{BoxWsSubscriptionFut, WsSubscriptionStream};

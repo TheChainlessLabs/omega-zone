@@ -100,6 +100,18 @@ mod test_market {
     pub(super) const DISPLAY_LABEL: &str = "ALPHAUSD/PATHUSD";
 }
 
+/// Do not poll a historical scan for a batch that cannot yet exist.
+async fn bounded_batch_log(
+    number: u64,
+    latest: u64,
+    scan: impl std::future::Future<Output = Result<Vec<Log>, JsonRpcError>>,
+) -> Result<Option<Log>, JsonRpcError> {
+    if number == 0 || number > latest {
+        return Ok(None);
+    }
+    Ok(scan.await?.into_iter().next())
+}
+
 fn filter_not_found_error() -> JsonRpcError {
     JsonRpcError::invalid_params("filter not found")
 }
@@ -616,10 +628,14 @@ impl<Api: EthApiTypes + 'static> ZoneRpc<Api> {
         &self,
         batch_number: u64,
     ) -> Result<Option<alloy_rpc_types_eth::Log>, JsonRpcError> {
-        let logs = self
-            .fetch_batch_logs_by_topics(&[batch_number_topic(batch_number)])
-            .await?;
-        Ok(logs.into_iter().next())
+        let latest = self.latest_batch_number().await?;
+        let topics = [batch_number_topic(batch_number)];
+        bounded_batch_log(
+            batch_number,
+            latest,
+            self.fetch_batch_logs_by_topics(&topics),
+        )
+        .await
     }
 
     /// Fetch `BatchSubmitted` logs for inclusive batch range `[start, end]`.
@@ -3877,6 +3893,28 @@ fn l1_read_rpc_url(l1_rpc_url: &str) -> eyre::Result<url::Url> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn unavailable_batch_numbers_never_poll_historical_scan() {
+        for (number, latest) in [(0, 0), (1, 0), (11, 10), (u64::MAX, 10)] {
+            assert!(
+                bounded_batch_log(number, latest, async {
+                    panic!("impossible batch must not query historical logs")
+                })
+                .await
+                .unwrap()
+                .is_none()
+            );
+        }
+        for number in [1, 10] {
+            let error = bounded_batch_log(number, 10, async {
+                Err(JsonRpcError::internal("scan was polled"))
+            })
+            .await
+            .unwrap_err();
+            assert_eq!(error.message, "scan was polled");
+        }
+    }
 
     fn activity_entry(
         id: &str,
